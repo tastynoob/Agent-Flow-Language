@@ -45,7 +45,7 @@ Agent Flow Language（暂称 AFL）是一门行为描述与编排语言。
 - AI 决策型控制流 `freedom`；
 - 执行预算、权限和可观测性要求。
 
-语言源文件本身不直接实现模型调用。编译器或 elaborator 将其转换为规范化的 Flow IR，再由不同 runtime adapter 执行。
+语言源文件本身不直接实现模型调用。编译器或 elaborator 将其转换为规范化的 Flow IR，再由符合规范的 runtime 执行，并通过 adapter 连接模型、Agent、tool 和存储实现。
 
 ## 4. 核心设计原则
 
@@ -183,7 +183,7 @@ flow function 应支持依赖注入，例如将 worker、reviewer、prompt、mem
 - 一套语言无关、类型化的规范 Flow IR；
 - IR validator 和基础静态检查；
 - 一个 reference builder，用于快速构造和迭代 IR；
-- mock runtime / simulator；
+- 一个 reference runtime，包含 mock Agent / simulator；
 - trace 与固定输出 replay；
 - 本地 module、prompt function 和 flow function；
 - coder-reviewer、parallel research、freedom fallback、三省六部四个示例；
