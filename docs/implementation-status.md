@@ -24,8 +24,20 @@ IR v0.1 设计与 reference implementation 起步。
 - [x] TypeScript builder
 - [x] TypeScript reference runtime
 - [x] mock adapter 与核心测试
-- [ ] Python generator frontend
-- [ ] 跨语言一致性测试
+- [x] Python generator frontend
+- [x] 跨语言一致性测试
+
+## 验证记录
+
+2026-08-02：
+
+- TypeScript strict compile 通过；
+- Node test runner 的 validator、runtime 和 Python 跨语言测试通过；
+- Python frontend 4 项 pytest 通过；
+- CLI 对 `.aflir` 的 validate 和 run 通过；
+- Python 生成的并行 `forEach` flow 已由 TypeScript runtime 执行并得到预期结果。
+
+当前环境未提供 `update_proxy`，且 `/etc/proxychains.conf` 没有代理端点，因此还没有下载 npm 构建依赖或生成 `package-lock.json`。本轮使用 VS Code 内置 TypeScript 6.0.3 完成严格编译；仓库的正常安装入口仍是 `npm install`。
 
 ## 状态调整记录
 

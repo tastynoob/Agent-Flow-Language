@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "afl-lang"
+version = "0.1.0"
+description = "Python generator frontend for AFL Canonical Flow IR"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "AFL contributors" }]
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+afl = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

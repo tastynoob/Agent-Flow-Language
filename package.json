@@ -19,14 +19,14 @@
     "clean": "node scripts/clean.mjs",
     "build": "tsc -p tsconfig.json",
     "test:ts": "npm run build && node --test test/*.test.mjs",
-    "test:python": "python3 -m pytest python/tests",
-    "test": "npm run test:ts && npm run test:python"
+    "test:cli": "node bin/afl.mjs validate test/fixtures/echo.aflir && node bin/afl.mjs run test/fixtures/echo.aflir --input '\"hello\"' --run-id cli-test",
+    "test:python": "PYTHONPATH=python/src python3 -m pytest python/tests",
+    "test": "npm run test:ts && npm run test:cli && npm run test:python"
   },
   "engines": {
     "node": ">=18"
   },
   "devDependencies": {
-    "@types/node": "^20.0.0",
     "typescript": "^5.0.0"
   }
 }
