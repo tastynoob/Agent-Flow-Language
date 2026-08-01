@@ -4,7 +4,7 @@
 
 ## 当前阶段
 
-IR v0.1 设计与 reference implementation 起步。
+IR v0.1 原型已经完成，进入语义稳定与真实 flow 验证阶段。
 
 ## 已确认决策
 
@@ -40,6 +40,19 @@ IR v0.1 设计与 reference implementation 起步。
 - Python 生成的并行 `forEach` flow 已由 TypeScript runtime 执行并得到预期结果。
 
 当前环境未提供 `update_proxy`，且 `/etc/proxychains.conf` 没有代理端点，因此还没有下载 npm 构建依赖或生成 `package-lock.json`。本轮使用 VS Code 内置 TypeScript 6.0.3 完成严格编译；仓库的正常安装入口仍是 `npm install`。
+
+提供的 DeepSeek key 没有写入仓库、命令或 trace。OpenAI-compatible adapter 使用注入的 mock Fetch API 完成契约测试；由于代理端点不可用，本轮未执行 live API smoke test。
+
+## 后续范围
+
+以下项目不属于本轮四项原型交付，仍需在后续迭代完成：
+
+- 固定 JSON Schema、IR migration 和更完整的静态类型推导；
+- package/module/prompt function 的分发格式；
+- checkpoint resume 与固定 Agent 输出 replay；
+- 三省六部等更大规模真实 flow 的语义验证；
+- live provider conformance、streaming adapter 和长期运行 event transport；
+- 专用 AFL DSL 的需求评估。
 
 ## 状态调整记录
 
