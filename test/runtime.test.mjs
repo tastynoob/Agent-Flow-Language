@@ -228,6 +228,35 @@ test("timeout cancels an adapter and does not commit its isolated frame", async 
   });
 });
 
+test("late completion from a non-cooperative adapter cannot append trace after run failure", async () => {
+  const flow = {
+    input: s.null(),
+    output: s.null(),
+    body: n.timeout(
+      "deadline",
+      n.invoke("slow-call", "worker", "slow", e.literal(null)),
+      5,
+    ),
+  };
+  const mock = new MockAgentAdapter().on(
+    "worker",
+    "slow",
+    () => new Promise((resolve) => setTimeout(() => resolve(null), 20)),
+  );
+  const trace = new MemoryTraceSink();
+  const runtime = new AflRuntime(
+    oneFlowProgram(flow, { worker: { operations: { slow: anyAgentOperation } } }),
+    { agents: mock, trace },
+  );
+
+  await assert.rejects(runtime.run(null), (error) => error.code === "TIMEOUT");
+  const eventCount = trace.events.length;
+  assert.equal(trace.events.at(-1).type, "run.failed");
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(trace.events.length, eventCount);
+  assert.equal(trace.events.at(-1).type, "run.failed");
+});
+
 test("events and checkpoints stay behind adapters", async () => {
   const flow = {
     input: s.null(),

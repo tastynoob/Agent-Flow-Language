@@ -3,6 +3,7 @@ export * from "./builder.js";
 export * from "./errors.js";
 export * from "./expression.js";
 export * from "./ir.js";
+export * from "./openai-compatible.js";
 export * from "./runtime.js";
 export * from "./testing.js";
 export * from "./validation.js";

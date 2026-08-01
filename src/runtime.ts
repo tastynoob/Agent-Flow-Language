@@ -48,6 +48,7 @@ interface RunContext {
     steps: number;
     traceSequence: number;
     revisionSequence: number;
+    closed: boolean;
   };
 }
 
@@ -76,6 +77,7 @@ export class AflRuntime {
         steps: 0,
         traceSequence: 0,
         revisionSequence: 0,
+        closed: false,
       },
     };
     if (!Number.isInteger(context.maxSteps) || context.maxSteps <= 0) {
@@ -83,8 +85,8 @@ export class AflRuntime {
       throw new FlowRuntimeError("RUN_OPTIONS_INVALID", "maxSteps must be a positive integer");
     }
 
-    await this.trace(context, "run.started");
     try {
+      await this.trace(context, "run.started");
       const output = await this.executeFlow(this.program.entry, input, context);
       await this.trace(context, "run.completed");
       return { runId: context.runId, output };
@@ -93,6 +95,7 @@ export class AflRuntime {
       await this.trace(context, "run.failed", { error: runtimeError });
       throw runtimeError;
     } finally {
+      context.counters.closed = true;
       linked.dispose();
     }
   }
@@ -516,6 +519,7 @@ export class AflRuntime {
       return results;
     } catch (error) {
       linked.controller.abort(error);
+      await Promise.allSettled(workers);
       throw error;
     } finally {
       linked.dispose();
@@ -564,6 +568,7 @@ export class AflRuntime {
         linked.controller.abort(
           new FlowRuntimeError("CANCELLED", `parallel race won by '${winner.branch}'`),
         );
+        await Promise.allSettled(tasks);
         return { branch: winner.branch, value: winner.value };
       } catch (error) {
         if (error instanceof AggregateError) {
@@ -574,6 +579,7 @@ export class AflRuntime {
       }
     } catch (error) {
       linked.controller.abort(error);
+      await Promise.allSettled(tasks);
       throw error;
     } finally {
       linked.dispose();
@@ -725,6 +731,9 @@ export class AflRuntime {
       error?: FlowRuntimeError;
     } = {},
   ): Promise<void> {
+    if (context.counters.closed) {
+      return;
+    }
     context.counters.traceSequence += 1;
     const event: TraceEvent = {
       sequence: context.counters.traceSequence,

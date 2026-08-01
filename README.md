@@ -92,4 +92,5 @@ adapter module 必须显式导出 `RuntimeBindings`。portable IR 不会自动�
 - [项目目标](docs/project-goals.md)
 - [语言形态决策](docs/language-form.md)
 - [IR v0.1](docs/ir-v0.1.md)
+- [Runtime adapters](docs/runtime-adapters.md)
 - [实现状态](docs/implementation-status.md)
