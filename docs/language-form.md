@@ -1,279 +1,86 @@
 # Agent Flow Language 的语言形态
 
-状态：初步决策
+状态：当前设计分析
 日期：2026-08-02
 
-## 1. 要决策的问题
+## 1. 讨论范围
 
-Agent Flow Language 最终应采用哪种形式：
+AFL 需要同时回答两个不同问题：
 
-1. 设计独立的领域专用语言（DSL）；
-2. 直接提供 Python embedded DSL / generator；
-3. 直接提供 TypeScript embedded DSL / generator；
-4. 使用统一语义 IR，同时提供多种 authoring frontend。
+1. 使用者通过什么形式编写 flow；
+2. runtime 接收什么形式并据此执行。
 
-本决策必须同时考虑语义清晰度、实现成本、静态检查、package 生态、AI 生成体验、runtime 可移植性和长期演进。
+Python、TypeScript 和未来专用 DSL 都可以提供良好的 authoring 体验，但不适合各自拥有不同的运行语义。AFL 因此需要一层语言无关的 IR，作为 frontend、package、validator 和 runtime 之间的共同边界。
 
-## 2. 约束
-
-语言需要表达运行期分支、循环、并发、事件、失败恢复和 `freedom`。因此必须严格区分：
-
-- 编译期的代码生成；
-- 运行期的 Agent flow；
-- Agent 自己生成的 continuation flow。
-
-例如，宿主 TypeScript 的 `for` 可能表示“编译期生成六个部门”，而 AFL 的 `forEach` 表示“运行期遍历任务”。宿主 Python 的 `if` 在构造 IR 时就已执行，不能表示依赖 reviewer 结果的运行期分支。
-
-如果不明确区分这些阶段，代码看似简洁，实际语义会非常混乱。
-
-## 3. 方案 A：直接设计独立 DSL
-
-示意：
+## 2. 当前分层
 
 ```text
-flow review_loop<T>(task: Task, worker: Agent, reviewer: Agent) -> T {
-    let artifact = worker.do(task);
-
-    repeat 5 {
-        match reviewer.review(task, artifact) {
-            Approved => return artifact;
-            Changes(issues) => artifact = worker.revise(artifact, issues);
-        }
-    }
-
-    return freedom flow recovery using imported_patterns;
-}
+Python generator --------+
+TypeScript generator ----+--> AFL IR --> Validator --> TypeScript Runtime
+future AFL DSL ----------+                         --> Other Runtime
 ```
 
-优点：
+- **AFL IR**：描述 node、basic block、Agent 工作、Memory、Frag、dependency、控制流和 flow 组合；
+- **Frontend**：帮助用户构造 IR，可以提供宿主语言函数、类型检查和 package API；
+- **Validator**：检查语法、symbol、operand、resource dependency 和 runtime policy 边界；
+- **Runtime**：调度已经验证的 IR，并绑定 Agent、Memory、skill、MCP 和宿主脚本；
+- **Package**：发布 prompt、Agent interface、flow、formatter、schema 和 capability contract。
 
-- 可以为 Agent 行为设计准确、简洁的语法；
-- 编译期和运行期构造天然可区分；
-- 容易做静态分析、格式化、LSP、可视化和跨语言移植；
-- package 只包含受控语言结构，不必在安装或加载时执行任意宿主代码；
-- `freedom`、Agent interface、prompt function 可以成为真正的一等概念；
-- 长期最符合“语言而不是框架”的项目定位。
+文本形式是 AFL IR 的可读表示。Runtime 内部可以把它解析成 AST、图或其他结构，但内部编码不改变语言语义。
 
-缺点：
+## 3. 为什么不直接以 Python 或 TypeScript 为语义核心
 
-- parser、diagnostics、formatter、LSP 和文档成本高；
-- 语义尚未稳定时，语法会频繁推翻；
-- 与现有 Python/TypeScript 工具集成需要 FFI 或 adapter；
-- 过早设计语法容易把精力消耗在表面形式，而不是运行语义。
+宿主语言很适合生成 IR，但宿主控制流和 Agent flow 控制流处在不同阶段。例如 Python 的 `if` 在生成 IR 时执行，而 AFL 的 `jump` 在 Agent 工作产生结果后执行。若两者没有明确边界，同一段 frontend 代码很难判断是在生成 flow，还是正在运行 flow。
 
-结论：可以成为未来的高效率 authoring frontend，但不预设它一定是最终主要形态，也不适合成为验证语义的第一步。
+直接分发 Python 或 npm package 还意味着加载 flow 时执行宿主代码，不利于静态检查、能力审查和跨 runtime 移植。因此宿主 generator 可以生成 AFL IR，runtime 不应把 generator 源码当作 portable flow 执行。
 
-## 4. 方案 B：Python embedded DSL / generator
+这不妨碍 frontend 提供自然的函数、循环和模块 API。只要这些行为最终产生同一套 AFL IR，它们就属于 authoring convenience，而不是新的 runtime 语义。
 
-示意：
+## 4. 为什么先使用文本 IR
 
-```python
-review_loop = flow("review_loop").repeat(
-    limit=5,
-    body=call(reviewer, "review").match(...),
-).otherwise(freedom.flow(...))
-```
+当前最需要验证的是 Agent flow primitive，而不是完整通用 DSL。简洁的文本 IR 有几个实际作用：
 
-优点：
+- 可以直接检阅 `do`、`seqdo`、`jump`、`dispatch`、`fork` 和 `sync` 的组合效果；
+- 可以观察数据依赖与 Memory 依赖，而不被 builder API 隐藏；
+- 便于编写 conformance case，并作为不同 frontend 的共同输出；
+- grammar 规模较小，语义变化时修改成本相对可控。
 
-- Agent 与 LLM 生态成熟，原型和 runtime adapter 容易实现；
-- 开发者和 AI 熟悉 Python；
-- 可直接复用 Pydantic、asyncio、测试和模型 SDK；
-- 很适合快速探索 API 和语义。
+它仍然面向 flow，而不是模仿传统汇编。普通逻辑由 `oper` 或显式 script executor 承担；Agent 指令保留 `coder.do`、`reviewer.seqdo` 等形式；`fork` 可以组合 Memory 操作，而不要求使用者手工展开所有基础步骤。
 
-缺点：
+## 5. Runtime 实现语言
 
-- 动态类型使复杂 generic flow 的错误发现较晚；
-- native `if/while/for` 与运行期 flow 的同名概念容易混淆；
-- import package 会执行任意 Python，难以做安全的远程 flow 分发；
-- AST、闭包、lambda 和反射难以稳定序列化；
-- 容易逐步演变成“又一个 Python Agent framework”；
-- 浏览器编辑器、可视化和 package 静态分析较困难。
+TypeScript 暂定用于第一份 reference runtime，主要考虑 Node Agent 生态、类型工具、异步 I/O、CLI 和未来浏览器工具之间的组合。这个选择不表示 AFL IR 依赖 JavaScript，也不表示 Python 无法实现相同的并发语义。
 
-结论：适合作为 TypeScript 工具链之后优先补充的 frontend 和 SDK，不建议成为规范、唯一 authoring surface 或规范 runtime。
+Reference runtime 的价值是落实和检验语义。其他语言实现只要通过同一组 conformance tests，也可以执行 AFL IR。Provider URL、API key、模型 SDK 和 MCP transport 属于 runtime binding，不进入 portable IR。
 
-## 5. 方案 C：TypeScript builder 与 reference runtime
+## 6. Python 与 TypeScript Frontend
 
-示意：
-
-```ts
-export const reviewLoop = flow.fn("reviewLoop", ({ task, worker, reviewer }) =>
-  flow.repeat({
-    max: 5,
-    body: flow.match(call(reviewer, "review", { task })),
-  }).otherwise(freedom.flow({ planner: reviewer })),
-);
-```
-
-优点：
-
-- discriminated union、generic 和 exhaustive match 很适合定义 IR instruction、handle 和 validator；
-- Promise、AbortSignal、AsyncIterable、event 和 structured result 与以网络 I/O 为主的 Agent runtime 契合；
-- npm 可以快速承载早期私有 package；
-- 与浏览器、语言服务、可视化编辑器和 OpenClaw/Node 生态衔接较好；
-- 编译器与 builder 可以共享类型定义和 validator；
-- 相比 Python，更容易在开发期发现错误。
-
-缺点：
-
-- native JavaScript 控制流仍然会与 AFL 运行期语义混淆；
-- npm package 加载会执行代码，不是安全的可移植 flow 格式；
-- TypeScript 类型在运行时擦除，仍需要独立 schema validator；
-- 若直接把 builder API 当语言，最终仍是框架而不是独立规范；
-- 非 Node runtime 需要额外桥接。
-
-这里选择 TypeScript 是基于第一阶段的工程适配度，而不是声称它在语义上比 Python 更能表达异步或并行。Python 的 `asyncio` 同样可以实现这些能力；两者进行 CPU 并行时也都需要额外机制。TypeScript 的主要优势是当前 Node Agent 生态、类型工具、流式 I/O、CLI 和未来浏览器工具之间的组合更适合本项目起步。
-
-结论：TypeScript 最适合承载第一阶段的 builder、compiler、validator、simulator 和 reference runtime，但这些实现都不能成为 IR 规范本身。
-
-## 6. 建议：IR 核心 + 多前端
-
-推荐采用第四种方案：长期以语言无关的 Canonical Flow IR 为唯一语义核心，先建设 TypeScript 工具链，再增加 Python 等 frontend。专用 AFL DSL 是否建设以及何时建设，由真实使用需求决定。
+Python 和 TypeScript frontend 可以采用 generator 或 builder 形式：
 
 ```text
-TypeScript authoring --> TS builder/compiler --+
-Python authoring -----> Python frontend --------+--> Canonical Flow IR --> Validator
-未来 AFL DSL ---------> DSL compiler -----------+                          |
-可视化编辑器 ---------> editor compiler --------+                          v
-freedom continuation -> constrained compiler ---+                 TypeScript reference runtime
-                                                                       |-- Agent/Model adapters
-                                                                       |-- Tool/MCP adapters
-                                                                       `-- Trace/Checkpoint/Policy
+source code -> builder/generator -> AFL IR text or AST
 ```
 
-核心规范由三部分构成：
+Frontend 可以在生成阶段使用宿主语言的模块、常量、函数和循环，也可以把公共 flow 包装成函数。依赖 Agent 输出的运行期分支、循环和动态 Worker 数量必须保留为 AFL IR 指令，不能在生成阶段提前求值。
 
-1. 语义模型：每个构造在状态、事件、并发和失败方面意味着什么；
-2. Canonical Flow IR：语言无关、版本化、可序列化的 flow 指令与结构；
-3. Conformance tests：相同输入事件和固定 Agent 输出下应产生的状态与 trace。
+Frontend 生成的结果应能脱离原宿主进程完成验证、分发和执行。确实需要 Python、TypeScript 或 shell 的 flow 可以使用显式 script executor；这属于受 runtime policy 管理的执行边界，不是 generator 的隐式逃逸。
 
-文本 DSL、TypeScript builder、Python builder 和可视化编辑器都是 IR 的 frontend，不拥有独立语义。
+## 7. 专用 AFL DSL
 
-这里需要严格区分两个概念：
+专用 DSL 仍可能改善大型 flow 的编码效率、静态诊断和可读性，但没有必要在 primitive 尚未稳定时同时维护另一套高层 grammar。
 
-- Canonical Flow IR 没有“执行语言”，它是语言无关的规范数据与行为模型；
-- TypeScript 是第一份 reference runtime 的实现语言，用于证明和落实 IR 的执行语义。
+当文本 IR 和多个 frontend 已经暴露出稳定、重复的 authoring 模式时，可以基于这些模式设计 DSL。DSL 应当编译到 AFL IR，并尽量避免新增只有某个 compiler 才理解的隐藏语义。
 
-IR 可以暂时采用 JSON 等通用格式序列化为 `.aflir`，但序列化格式是交换载体，不代表 AFL 只能描述静态节点图。循环、动态分支、事件、并发、continuation 和状态迁移都由 IR 节点及其规范语义表达。
+## 8. 当前结论
 
-## 7. 三阶段工具链
+当前形态可以概括为：
 
-### 7.1 Authoring
+- AFL IR 是语言无关的 flow 语义边界；
+- 当前文本形式用于直接编写、检阅和交换 IR；
+- TypeScript 实现第一份 validator 与 reference runtime；
+- Python 和 TypeScript 可以提供 generator frontend；
+- Prompt 和通用 flow 通过 package/library 复用；
+- 专用 DSL 根据真实 authoring 经验再决定形态；
+- `freedom` 生成或选择的 child flow 同样需要形成可验证的 AFL IR。
 
-用户使用 TypeScript builder、Python generator 或未来的 AFL DSL 编写 flow。authoring frontend 可以使用宿主语言的函数、模块、循环和代码生成能力，但这些行为只用于构造 IR，不直接成为 AFL 的运行时语义。
-
-Python frontend 的典型使用方式是：
-
-```python
-flow = review_loop(
-    worker=agent("coder"),
-    reviewer=agent("reviewer"),
-)
-
-flow.emit("task.aflir")
-```
-
-### 7.2 Elaboration / Compilation
-
-frontend 执行生成器、展开 package 和 generic，最终输出规范化的 `.aflir`。宿主语言的 `if/for` 在这个阶段执行；依赖 reviewer 输出的 `branch/loop` 则必须保留为 IR 节点，留到运行期执行。
-
-生成的 IR 必须通过 Frag/schema 格式、symbol、控制流、capability、权限和预算检查。任何无法完整翻译成 Canonical Flow IR 的 Python 或 TypeScript 行为都属于宿主扩展，不是可移植 AFL flow。
-
-### 7.3 Execution
-
-TypeScript reference runtime 只接收通过验证的 Canonical Flow IR，不隐式执行 frontend 的 Python、TypeScript 或未来 DSL 源码：
-
-```text
-afl validate task.aflir
-afl run task.aflir
-```
-
-runtime 负责 scheduler、状态与事件、Agent 调用、并发和取消、adapter binding、checkpoint、trace 与 replay。具体模型 SDK、MCP、tool 和存储实现通过显式 adapter 或 capability 绑定。IR 中明确写出的 `python`、`typescript`、`shell` 指令是受 runtime policy 管理的宿主执行边界，不等同于加载并执行 frontend 源码。
-
-Agent 的普通业务结果在 Core IR 中使用 role-free `Frag(string)`。Flow 可以选择适合任务的字符串协议：简单 Reviewer 可以在完成时返回精确的 `finish`，有缺陷时返回文本列表；需要稳定字段时可以返回经过外部 schema 校验的 JSON 字符串。Role 只在 Frag 被传给 Agent 或写入 Memory 时确定。
-
-### 7.4 Dynamic continuation 与 self-modify
-
-`freedom` 是正式控制指令。它可以作为 `match` 的 default、所有候选分支失败后的 fallback，或显式的开放式规划点。
-
-动态流程遵循以下路径：
-
-```text
-freedom
-  -> 生成候选 continuation IR 或 IR patch
-  -> syntax/format/capability/budget validation
-  -> policy 检查与可选人工批准
-  -> 创建有作用域的子流程或新的 flow revision
-  -> 执行并记录 trace
-```
-
-普通的动态规划优先生成为有作用域的 child flow。只有确实需要改变后续长期行为时才生成 IR patch，并基于当前 flow 创建可追踪的新 revision。runtime 不应无记录地原地改写正在执行且已经验证的 IR。
-
-## 8. 为什么第一阶段采用 TypeScript
-
-第一阶段需要频繁修改语义结构。如果先写 parser，每次概念变化都要同步修改 grammar、AST、错误恢复和格式化器。TypeScript builder 可以利用宿主语言先验证：
-
-- 哪些 primitive 真正必要；
-- generic Agent 和 flow function 是否可表达；
-- `freedom flow` 生成的 IR 如何验证；
-- 并发、失败和 cancellation 的 AST 是否合理；
-- 三省六部等复杂案例是否需要 escape hatch。
-
-TypeScript reference runtime 还需要通过 conformance tests 明确并发分支的状态隔离、写冲突、join 顺序、失败传播和 structured cancellation。仅仅把节点交给 `Promise.all` 不足以定义 AFL 的并发语义。
-
-builder 必须坚持以下规则：
-
-- 所有运行期控制流都应生成显式 AFL IR 指令与 basic block；
-- native `if/for` 只允许用于编译期生成，并在文档中称为 elaboration；
-- builder 的结果必须可以完整序列化为 Canonical Flow IR；
-- 闭包内不得捕获无法序列化的运行时对象；
-- runtime 不执行原始 frontend 源，只执行验证后的 IR；IR 内显式宿主脚本按部署 policy 处理；
-- package 的可移植产物是 IR、prompt 和 manifest，不是 npm 模块本身。
-
-## 9. Package 的两层形式
-
-建议区分 authoring package 与 portable flow package。
-
-### 9.1 Authoring package
-
-早期可以使用 npm 发布 builder、类型、compiler plugin 和 adapter。Python frontend 加入后可以通过 Python package 发布对应 generator。authoring package 在构建阶段执行，因此必须按普通代码依赖处理。
-
-### 9.2 Portable flow package
-
-由编译器输出，仅包含：
-
-- manifest 和 language/IR version；
-- Canonical Flow IR；
-- prompt、schema、test 和静态资源；
-- capability 与 permission 声明；
-- 依赖范围、lock information 和内容哈希；
-- 可选签名。
-
-portable package 可以禁止内联 Python、JavaScript 或 shell，只允许显式 adapter/FFI capability。需要宿主脚本的环境绑定 package 应在 manifest 中声明运行环境和权限，不能伪装成跨 runtime 可移植 flow。
-
-## 10. 专用 DSL 的启动条件
-
-专用 AFL DSL 是可选的后续 frontend。满足以下条件后再评估和固定文本语法：
-
-1. 核心 IR 已能表达至少五个代表性 flow；
-2. coder-reviewer、parallel research、freedom fallback、三省六部均可运行；
-3. 连续两个 IR 版本没有推翻顶层语义模型；
-4. flow function、prompt function、generic 和 package import 已有真实用例；
-5. TypeScript 与 Python frontend 已暴露出重复、冗长或容易误用的模式；
-6. simulator 和至少一个真实 runtime 对同一 IR 通过 conformance tests。
-
-届时应根据实际 authoring 经验判断专用 DSL 能否显著提高编码效率、可读性和静态诊断质量，而不是先假设项目一定需要自有语法。即使增加专用 DSL，它也只是新的 frontend，不改变 Canonical Flow IR、package 格式和 runtime contract。
-
-## 11. 当前决策
-
-当前决定为：
-
-- **长期规范核心**：语言无关的语义说明、Canonical Flow IR 和 conformance tests；
-- **第一套工具链**：TypeScript 类型模型、builder/compiler、validator、simulator 和 reference runtime；
-- **运行边界**：reference runtime 只执行通过验证的 IR，通过 adapter 连接具体 Agent、模型、MCP、tool 和存储；
-- **下一类 frontend**：Python generator，以及根据需求增加的可视化编辑器和其他语言 SDK；
-- **专用 DSL**：不作为当前前置目标，在 IR 和真实 authoring 模式稳定后按收益决定；
-- **分发格式**：不执行宿主代码的 portable flow package；
-- **动态修改**：`freedom` 生成受验证、受策略约束且可追踪的 child flow 或 flow revision。
-
-这条路线允许项目先借助 TypeScript 生态验证运行语义，同时保证 Python 和未来 DSL 只是可替换的 frontend，不会让 AFL 退化成只能在某一种宿主语言中使用的 Agent framework。
+这些选择为当前设计提供方向，不限制后续根据实现和案例结果调整 frontend 或 runtime。

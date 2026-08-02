@@ -2,7 +2,7 @@
   "name": "@afl-lang/core",
   "version": "0.1.0",
   "private": true,
-  "description": "Canonical AFL IR, validator, builder, and reference runtime",
+  "description": "Legacy Structured HIR prototype retained during AFL IR redesign",
   "type": "module",
   "main": "./dist/src/index.js",
   "types": "./dist/src/index.d.ts",

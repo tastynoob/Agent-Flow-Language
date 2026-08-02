@@ -5,7 +5,7 @@
 
 ## 1. 已明确的方向
 
-以下内容来自目前的需求讨论，是 Core IR 重写的基础：
+以下内容来自目前的需求讨论，是 AFL IR 当前设计的基础：
 
 - AFL IR 服务于 Agent flow，不是普通配置文件；
 - 它接近 Verilog 式的连接和依赖描述，而不是只按源码行顺序执行；
@@ -19,7 +19,7 @@
 - Agent 默认绑定 memory，flow 可以 append Frag、copy memory，或把 memory apply 到新的 Agent；
 - 普通业务结果统一为 role-free Frag，Frag 的可见内容是字符串；
 - `prompt` 和 `input` 只产生 Frag，role 在使用 Frag 时决定；
-- `freedom move` 与 `freedom flow` 是开放式 fallback 指令，不只是一个全局权限开关；
+- `freedom.move` 与 `freedom.flow` 是开放式 fallback 指令，不只是一个全局权限开关；
 - Prompt 和公共 flow 应能通过 package/library 传播与复用。
 
 ## 2. 从具体例子向通用模型扩展

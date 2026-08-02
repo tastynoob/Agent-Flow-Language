@@ -26,8 +26,7 @@ AFL IR 是面向 Agent flow 的中间表示。它借用 basic block、指令、�
 - [Memory 规则](core-ir-memory.md)：规定 Agent 与 memory 的默认关系和复制行为；
 - [示例](core-ir-examples.md)：展示完整 flow；
 - [Parallel Voting 案例](afl-case-study-parallel-voting.md)：检验 list dispatch、batch dispatch 与结果汇合；
-- [设计说明](core-ir-design-notes.md)：记录当前方案的推导、取舍和待验证问题；
-- [Structured HIR Prototype](ir-v0.1.md)：记录仓库中已经实现的旧高层模型。
+- [设计说明](core-ir-design-notes.md)：记录当前方案的推导、取舍和待验证问题。
 
 语法、语义和设计分析分开维护，避免把示例写法误当成已经定案的语言规则。
 
@@ -168,4 +167,4 @@ Python / TypeScript generator / future AFL DSL
              Agent / Memory / Capability adapter
 ```
 
-当前仓库中的 `AflProgram/FlowNode` 已实现模型继续作为 Structured HIR prototype 保留。新的 AFL IR 草案通过检阅后，再决定 lowering、validator 和 runtime 的实现方式。
+当前文本草案尚未绑定 parser、validator 或 runtime 的内部数据结构。实现应以收敛后的语法和语义为输入，而不是从历史代码接口反推语言设计。

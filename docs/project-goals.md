@@ -45,7 +45,7 @@ Agent Flow Language（暂称 AFL）是一门行为描述与编排语言。
 - AI 决策型控制流 `freedom`；
 - 执行预算、权限和可观测性要求。
 
-语言源文件本身不直接实现模型调用。编译器或 elaborator 将其转换为规范化的 Flow IR，再由符合规范的 runtime 执行，并通过 adapter 连接模型、Agent、tool 和存储实现。
+语言源文件本身不直接实现模型调用。Frontend 将其转换为 AFL IR，再由符合语义约定的 runtime 执行，并通过 binding 连接模型、Agent、tool 和存储实现。
 
 ## 4. 核心设计原则
 
@@ -90,8 +90,8 @@ prompt、Agent、move 和 flow 都应具有可声明的接口，可以作为参�
 
 语言应区分两个层级：
 
-- `freedom move`：从当前暴露的 move、Agent 或子流程中选择下一步；
-- `freedom flow`：组合或生成一个临时的 continuation flow。
+- `freedom.move`：从当前暴露的 move、Agent 或子流程中选择下一步；
+- `freedom.flow`：组合或生成一个临时的 continuation flow。
 
 `freedom` 至少接收以下上下文：
 
@@ -100,7 +100,7 @@ prompt、Agent、move 和 flow 都应具有可声明的接口，可以作为参�
 - 可用 Agent、move、flow package 和 tool；
 - 剩余预算、deadline、权限和必须保持的约束。
 
-`freedom flow` 的结果应当是可解析、可验证的 AFL IR，而不是不可检查的自然语言计划。生成结果在执行前需要经过 symbol、格式、能力、预算和 policy 验证，并作为有作用域的子流程运行。
+`freedom.flow` 的结果应当是可解析、可验证的 AFL IR，而不是不可检查的自然语言计划。生成结果在执行前需要经过 symbol、格式、能力、预算和 policy 验证，并作为有作用域的子流程运行。
 
 ## 6. 语言能力范围
 
@@ -113,7 +113,7 @@ prompt、Agent、move 和 flow 都应具有可声明的接口，可以作为参�
 | 并发 | parallel、race、join、map、reduce、structured cancellation |
 | 事件 | on、emit、timer、external trigger、human input |
 | 可靠性 | retry、timeout、recover、compensate、checkpoint |
-| 动态性 | freedom move、freedom flow、受控 spawn |
+| 动态性 | `freedom.move`、`freedom.flow`、受控 child flow |
 | 组合 | function、pattern、module、generic、import/export |
 | 工程化 | trace、replay、test、mock、visualize、lint |
 
@@ -164,7 +164,7 @@ flow function 应支持依赖注入，例如将 worker、reviewer、prompt、mem
 
 1. coder 完成任务，reviewer 反复审核并打回，直到通过或超限；
 2. 多个 researcher 并行调查，synthesizer 汇总，失败分支互不污染；
-3. router 处理已知任务，未知任务进入 `default => freedom flow`；
+3. router 处理已知任务，未知任务进入 `freedom.flow` fallback；
 4. 多个候选 flow 依次或并行尝试，全部失败后由 freedom 恢复；
 5. 三省六部：分拣、规划、审核封驳、派发、部门并行执行、回奏和审计；
 6. OpenClaw 式长期助手：由 channel、timer 和外部事件唤醒，使用持久 memory；
@@ -175,23 +175,7 @@ flow function 应支持依赖注入，例如将 worker、reviewer、prompt、mem
 
 如果某个场景必须依靠 runtime 中未声明的自定义 orchestration 代码才能成立，说明语言核心仍缺少语义。
 
-## 10. 第一阶段交付范围
-
-第一阶段目标不是立即建设完整平台，而是验证语义内核：
-
-- 一份版本化的核心语义说明；
-- 一套语言无关、版本化且可验证的规范 Flow IR；
-- IR validator 和基础静态检查；
-- 一个 reference builder，用于快速构造和迭代 IR；
-- 一个 reference runtime，包含 mock Agent / simulator；
-- trace 与固定输出 replay；
-- 本地 module、prompt function 和 flow function；
-- coder-reviewer、parallel research、freedom fallback、三省六部四个示例；
-- 至少一个真实 Agent runtime adapter 的概念验证。
-
-具体 authoring frontend、公共 registry、完整 IDE、可视化编辑器和多语言 SDK 不属于第一阶段，但核心设计不能阻止这些能力后续加入。
-
-## 11. 非目标
+## 10. 非目标
 
 - 不重新定义模型 API、MCP 或 A2A 等已有通信协议；
 - 不保证不同模型或 runtime 产生相同业务输出；
@@ -201,7 +185,7 @@ flow function 应支持依赖注入，例如将 worker、reviewer、prompt、mem
 - 不以覆盖所有厂商私有特性为代价无限扩大核心语言；
 - 不在语义尚未稳定时优先建设 package registry 或复杂 UI。
 
-## 12. 相关项目与借鉴方向
+## 11. 相关项目与借鉴方向
 
 - [OpenProse](https://github.com/openprose/prose)：可移植 Agent workflow、function、pattern、test 和 runtime contract；
 - [OpenClaw](https://github.com/openclaw/openclaw)：长期运行 Agent、skills、sessions、channels、tools 和多 Agent routing；
