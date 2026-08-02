@@ -1,931 +1,1059 @@
 import type {
-  AgentInvokeRequest,
+  AgentRunRequest,
+  FreedomPlan,
+  PromptArgument,
+  RuntimeArgument,
   RuntimeBindings,
   TraceEvent,
   TraceEventType,
 } from "./adapters.js";
-import { FlowRuntimeError, normalizeRuntimeError } from "./errors.js";
-import { evaluateExpr, type EvaluationFrame } from "./expression.js";
-import type {
-  AflProgram,
-  FlowDefinition,
-  FlowNode,
-  FreedomPlan,
-  JsonValue,
-  SlotTarget,
-} from "./ir.js";
+import { linkedController, ResourceLocks, Semaphore, throwIfAborted } from "./concurrency.js";
+import { buildInstructionDependencies, instructionDestination } from "./dependencies.js";
 import {
-  assertValidProgram,
-  validateFreedomPlan,
-  type ValidationIssue,
-} from "./validation.js";
-import { cloneJson, isJsonValue, isRecord, validateDataValue } from "./value.js";
+  asAgent,
+  asCompute,
+  asFrag,
+  asMemory,
+  asSymbol,
+  asTaskGroup,
+  evaluateOper,
+  evaluateValue,
+  formatCompute,
+} from "./evaluator.js";
+import { FlowRuntimeError, normalizeRuntimeError } from "./errors.js";
+import {
+  frag,
+  isComputeValue,
+  isFrag,
+  symbol,
+  type AflBlock,
+  type AflInstruction,
+  type AflModule,
+  type AflNode,
+  type ComputeValue,
+  type FlowCallExpr,
+  type FlowTarget,
+  type Frag,
+  type SourceSpan,
+  type SymbolExpr,
+  type SymbolRef,
+  type ValueExpr,
+} from "./ir.js";
+import { parseAfl } from "./parser.js";
+import {
+  isAgentHandle,
+  isMemoryHandle,
+  isSymbolRef,
+  type AgentHandle,
+  type MemoryHandle,
+  type RuntimeValue,
+  type TaskGroupHandle,
+} from "./runtime-values.js";
+import { assertValidModule } from "./validation.js";
 
 export interface RunOptions {
-  runId?: string;
-  signal?: AbortSignal;
-  maxSteps?: number;
+  readonly runId?: string;
+  readonly signal?: AbortSignal;
+  readonly maxSteps?: number;
 }
 
 export interface RunResult {
-  runId: string;
-  output: JsonValue;
+  readonly runId: string;
+  readonly output: RuntimeValue;
 }
 
-interface MutableFrame extends EvaluationFrame {
-  flowId: string;
-  definition: FlowDefinition;
-  input: JsonValue;
-  state: Record<string, JsonValue | undefined>;
-  locals: Record<string, JsonValue | undefined>;
+interface MutableFrame {
+  readonly module: AflModule;
+  readonly node: AflNode;
+  readonly values: Map<string, RuntimeValue>;
+  readonly taskGroups: Set<TaskGroupHandle>;
 }
 
 interface RunContext {
-  runId: string;
-  signal: AbortSignal;
-  maxSteps: number;
-  counters: {
+  readonly runId: string;
+  readonly signal: AbortSignal;
+  readonly maxSteps: number;
+  readonly external: Semaphore;
+  readonly locks: ResourceLocks;
+  readonly counters: {
     steps: number;
-    traceSequence: number;
-    revisionSequence: number;
-    closed: boolean;
+    trace: number;
+    handles: number;
   };
 }
 
-type NodeResult = { type: "normal" } | { type: "return"; value: JsonValue };
-
-const NORMAL: NodeResult = { type: "normal" };
+interface TraceLocation {
+  readonly node?: string;
+  readonly block?: string;
+  readonly instruction?: number;
+}
 
 let runSequence = 0;
 
 export class AflRuntime {
-  readonly program: AflProgram;
+  readonly module: AflModule;
   readonly bindings: RuntimeBindings;
 
-  constructor(program: unknown, bindings: RuntimeBindings) {
-    this.program = assertValidProgram(program);
+  constructor(module: AflModule, bindings: RuntimeBindings) {
+    this.module = assertValidModule(module);
     this.bindings = bindings;
   }
 
-  async run(input: JsonValue, options: RunOptions = {}): Promise<RunResult> {
+  static fromSource(source: string, bindings: RuntimeBindings, sourceName?: string): AflRuntime {
+    return new AflRuntime(parseAfl(source, sourceName), bindings);
+  }
+
+  async run(
+    entry = "main",
+    args: readonly RuntimeArgument[] = [],
+    options: RunOptions = {},
+  ): Promise<RunResult> {
     const linked = linkedController(options.signal);
-    const context: RunContext = {
-      runId: options.runId ?? createRunId(),
-      signal: linked.controller.signal,
-      maxSteps: options.maxSteps ?? 100_000,
-      counters: {
-        steps: 0,
-        traceSequence: 0,
-        revisionSequence: 0,
-        closed: false,
-      },
-    };
-    if (!Number.isInteger(context.maxSteps) || context.maxSteps <= 0) {
+    const maxSteps = options.maxSteps ?? 100_000;
+    const maxConcurrency = this.bindings.policy?.maxConcurrency ?? 32;
+    if (!Number.isInteger(maxSteps) || maxSteps <= 0) {
       linked.dispose();
       throw new FlowRuntimeError("RUN_OPTIONS_INVALID", "maxSteps must be a positive integer");
     }
-
+    if (!Number.isInteger(maxConcurrency) || maxConcurrency <= 0) {
+      linked.dispose();
+      throw new FlowRuntimeError("RUNTIME_POLICY_INVALID", "maxConcurrency must be a positive integer");
+    }
+    const context: RunContext = {
+      runId: options.runId ?? createRunId(),
+      signal: linked.controller.signal,
+      maxSteps,
+      external: new Semaphore(maxConcurrency),
+      locks: new ResourceLocks(),
+      counters: { steps: 0, trace: 0, handles: 0 },
+    };
     try {
-      await this.trace(context, "run.started");
-      const output = await this.executeFlow(this.program.entry, input, context);
-      await this.trace(context, "run.completed");
+      await this.trace(context, "run.started", {}, { entry });
+      const output = await this.executeNode(this.module, entry, [...args], context);
+      await this.trace(context, "run.completed", {}, { entry });
       return { runId: context.runId, output };
     } catch (error) {
       const runtimeError = normalizeRuntimeError(error);
-      await this.trace(context, "run.failed", { error: runtimeError });
+      await this.trace(context, "run.failed", {}, undefined, runtimeError);
       throw runtimeError;
     } finally {
-      context.counters.closed = true;
+      linked.controller.abort(new FlowRuntimeError("RUN_CLOSED", "AFL run has closed"));
       linked.dispose();
-    }
-  }
-
-  private async executeFlow(
-    flowId: string,
-    input: JsonValue,
-    context: RunContext,
-    definition = this.program.flows[flowId],
-  ): Promise<JsonValue> {
-    if (definition === undefined) {
-      throw new FlowRuntimeError("FLOW_UNKNOWN", `flow '${flowId}' is not declared`);
-    }
-    this.assertSchema(input, definition.input, `input for flow '${flowId}'`);
-    const frame: MutableFrame = {
-      flowId,
-      definition,
-      input: cloneJson(input),
-      state: initializeSlots(definition.state),
-      locals: initializeSlots(definition.locals),
-    };
-    await this.trace(context, "flow.started", { flowId });
-    try {
-      const result = await this.executeNode(definition.body, frame, context);
-      const output = result.type === "return" ? result.value : null;
-      this.assertSchema(output, definition.output, `output from flow '${flowId}'`);
-      await this.trace(context, "flow.completed", { flowId });
-      return cloneJson(output);
-    } catch (error) {
-      const runtimeError = normalizeRuntimeError(error);
-      await this.trace(context, "flow.failed", { flowId, error: runtimeError });
-      throw runtimeError;
     }
   }
 
   private async executeNode(
-    node: FlowNode,
-    frame: MutableFrame,
+    module: AflModule,
+    nodeName: string,
+    args: readonly RuntimeValue[],
     context: RunContext,
-  ): Promise<NodeResult> {
-    throwIfCancelled(context.signal);
+    invocationSignal: AbortSignal = context.signal,
+  ): Promise<RuntimeValue> {
+    throwIfAborted(invocationSignal);
+    this.takeStep(context, `node '${nodeName}'`, invocationSignal);
+    const node = module.nodes.find((candidate) => candidate.name === nodeName);
+    if (node === undefined) {
+      throw new FlowRuntimeError("FLOW_UNKNOWN", `node '${nodeName}' is not declared`);
+    }
+    if (args.length !== node.parameters.length) {
+      throw new FlowRuntimeError(
+        "CALL_ARITY",
+        `node '${nodeName}' expects ${node.parameters.length} arguments, received ${args.length}`,
+        { span: node.span },
+      );
+    }
+    const frame: MutableFrame = {
+      module,
+      node,
+      values: new Map(node.parameters.map((parameter, index) => [parameter, cloneRuntimeValue(args[index]!)])),
+      taskGroups: new Set(),
+    };
+    await this.trace(context, "node.started", { node: node.name });
+    try {
+      const blocks = new Map(node.blocks.map((block) => [block.name, block]));
+      let blockName = "entry";
+      for (;;) {
+        const block = blocks.get(blockName);
+        if (block === undefined) {
+          throw new FlowRuntimeError("BLOCK_UNKNOWN", `block '${blockName}' is not declared`, { span: node.span });
+        }
+        this.takeStep(context, `block '${node.name}.${block.name}'`, invocationSignal);
+        await this.executeBlock(frame, block, context, invocationSignal);
+        const terminator = block.terminator;
+        if (terminator.op === "ret") {
+          this.assertNoOutstandingGroups(frame, terminator.span);
+          const output = terminator.value === undefined ? frag("") : evaluateValue(terminator.value, frame);
+          await this.trace(context, "node.completed", { node: node.name });
+          return output;
+        }
+        if (terminator.op === "fail") {
+          const value = evaluateValue(terminator.error, frame);
+          throw new FlowRuntimeError("FLOW_FAILED", failureMessage(value), { span: terminator.span });
+        }
+        if (terminator.condition === undefined) {
+          blockName = terminator.trueTarget;
+        } else {
+          const condition = asCompute(evaluateValue(terminator.condition, frame), terminator.span, "jump condition");
+          if (typeof condition !== "boolean") {
+            throw new FlowRuntimeError("JUMP_CONDITION_NOT_BOOLEAN", "jump condition must be boolean", {
+              span: terminator.span,
+            });
+          }
+          blockName = condition ? terminator.trueTarget : terminator.falseTarget!;
+        }
+      }
+    } catch (error) {
+      for (const group of frame.taskGroups) group.controller.abort(error);
+      if (frame.taskGroups.size > 0) {
+        await Promise.allSettled([...frame.taskGroups].flatMap((group) => group.tasks));
+      }
+      const runtimeError = normalizeRuntimeError(error, node.span);
+      await this.trace(context, "node.failed", { node: node.name }, undefined, runtimeError);
+      throw runtimeError;
+    }
+  }
+
+  private async executeBlock(
+    frame: MutableFrame,
+    block: AflBlock,
+    context: RunContext,
+    invocationSignal: AbortSignal,
+  ): Promise<void> {
+    await this.trace(context, "block.started", { node: frame.node.name, block: block.name });
+    const linked = linkedController(invocationSignal);
+    try {
+      const dependencies = buildInstructionDependencies(block);
+      this.addRuntimeResourceDependencies(block, frame, dependencies);
+      const dependents = new Map<number, number[]>();
+      const remaining = dependencies.map((items) => items.size);
+      dependencies.forEach((items, consumer) => {
+        for (const producer of items) {
+          const consumers = dependents.get(producer) ?? [];
+          consumers.push(consumer);
+          dependents.set(producer, consumers);
+        }
+      });
+      await new Promise<void>((resolve, reject) => {
+        let active = 0;
+        let completed = 0;
+        let failure: FlowRuntimeError | undefined;
+        const started = new Set<number>();
+
+        const settle = (): void => {
+          if (failure !== undefined && active === 0) reject(failure);
+          else if (completed === block.instructions.length) resolve();
+        };
+        const launchReady = (): void => {
+          if (failure !== undefined) return;
+          for (let index = 0; index < block.instructions.length; index += 1) {
+            if (started.has(index) || remaining[index] !== 0) continue;
+            started.add(index);
+            active += 1;
+            const instruction = block.instructions[index]!;
+            void this.executeInstruction(frame, block, instruction, index, context, linked.controller.signal)
+              .then((value) => {
+                const destination = instructionDestination(instruction);
+                if (destination !== undefined && value !== undefined) frame.values.set(destination, value);
+                completed += 1;
+                active -= 1;
+                for (const consumer of dependents.get(index) ?? []) remaining[consumer]! -= 1;
+                launchReady();
+                settle();
+              })
+              .catch((error: unknown) => {
+                if (failure === undefined) {
+                  failure = normalizeRuntimeError(error, instruction.span);
+                  linked.controller.abort(failure);
+                }
+                active -= 1;
+                settle();
+              });
+          }
+          if (active === 0 && completed < block.instructions.length && failure === undefined) {
+            failure = new FlowRuntimeError("DEPENDENCY_DEADLOCK", `block '${block.name}' cannot make progress`, {
+              span: block.span,
+            });
+            settle();
+          }
+        };
+        launchReady();
+        settle();
+      });
+      await this.trace(context, "block.completed", { node: frame.node.name, block: block.name });
+    } finally {
+      linked.dispose();
+    }
+  }
+
+  private async executeInstruction(
+    frame: MutableFrame,
+    block: AflBlock,
+    instruction: AflInstruction,
+    index: number,
+    context: RunContext,
+    signal: AbortSignal,
+  ): Promise<RuntimeValue | undefined> {
+    throwIfAborted(signal);
+    this.takeStep(context, `instruction '${instruction.op}'`, signal);
+    const location = { node: frame.node.name, block: block.name, instruction: index };
+    await this.trace(context, "instruction.started", location, { op: instruction.op });
+    try {
+      const value = await this.executeInstructionInner(frame, instruction, context, location, signal);
+      await this.trace(context, "instruction.completed", location, { op: instruction.op });
+      return value;
+    } catch (error) {
+      const runtimeError = normalizeRuntimeError(error, instruction.span);
+      await this.trace(context, "instruction.failed", location, { op: instruction.op }, runtimeError);
+      throw runtimeError;
+    }
+  }
+
+  private async executeInstructionInner(
+    frame: MutableFrame,
+    instruction: AflInstruction,
+    context: RunContext,
+    location: Required<TraceLocation>,
+    signal: AbortSignal,
+  ): Promise<RuntimeValue | undefined> {
+    switch (instruction.op) {
+      case "agent": {
+        const memory = instruction.memory === undefined
+          ? this.createMemory(context)
+          : asMemory(evaluateValue(instruction.memory, frame), instruction.memory.span);
+        return context.locks.use([{ key: memory.id, mode: "write" }], signal, () => {
+          if (memory.owner !== undefined) {
+            throw new FlowRuntimeError("MEMORY_ALREADY_BOUND", "Memory is already bound to an Agent", {
+              span: instruction.span,
+            });
+          }
+          const agent = this.createAgent(context, { kind: "symbol", name: instruction.agent.name }, memory);
+          memory.owner = agent.id;
+          return agent;
+        });
+      }
+      case "agent.sysprompt": {
+        const agent = asAgent(evaluateValue(instruction.agent, frame), instruction.agent.span);
+        const prompt = await this.renderPrompt(instruction.prompt, [], frame, signal);
+        await context.locks.use([{ key: agent.id, mode: "write" }], signal, () => {
+          agent.systemPrompt = prompt.content;
+        });
+        return undefined;
+      }
+      case "agent.do":
+      case "agent.seqdo": {
+        const agent = asAgent(evaluateValue(instruction.agent, frame), instruction.agent.span);
+        const input = asFrag(evaluateValue(instruction.input, frame), instruction.input.span, "Agent input");
+        return this.runAgent(
+          agent,
+          instruction.mode,
+          instruction.role ?? "user",
+          input,
+          instruction.schema,
+          context,
+          location,
+          signal,
+        );
+      }
+      case "prompt":
+        return this.renderPrompt(instruction.source, instruction.args, frame, signal);
+      case "input": {
+        if (this.bindings.input === undefined) {
+          throw new FlowRuntimeError("INPUT_ADAPTER_MISSING", "input requires an Input binding", {
+            span: instruction.span,
+          });
+        }
+        const prompt = await this.renderPrompt(instruction.prompt, [], frame, signal);
+        const content = await this.bindings.input.read({
+          runId: context.runId,
+          node: location.node,
+          block: location.block,
+          prompt: prompt.content,
+          ...(instruction.schema === undefined ? {} : { schema: toSymbol(instruction.schema) }),
+          signal,
+        });
+        if (typeof content !== "string") {
+          throw new FlowRuntimeError("INPUT_RESULT_INVALID", "Input binding returned a non-string value", {
+            span: instruction.span,
+          });
+        }
+        await this.validateSchema(content, instruction.schema, signal);
+        return frag(content);
+      }
+      case "oper":
+        return evaluateOper(instruction.expression, frame);
+      case "script": {
+        if (this.bindings.scripts === undefined) {
+          throw new FlowRuntimeError("SCRIPT_ADAPTER_MISSING", `${instruction.language} requires a Script binding`, {
+            span: instruction.span,
+          });
+        }
+        const args = instruction.args.map((argument) => asCompute(
+          evaluateValue(argument, frame),
+          argument.span,
+          "script argument",
+        ));
+        const result = await context.external.use(signal, () => Promise.resolve(this.bindings.scripts!.execute({
+          language: instruction.language,
+          source: instruction.source,
+          args,
+          signal,
+        })));
+        if (!isComputeValue(result)) {
+          throw new FlowRuntimeError("SCRIPT_RESULT_INVALID", "Script binding returned a non-compute value", {
+            span: instruction.span,
+          });
+        }
+        return structuredClone(result);
+      }
+      case "call": {
+        const args = instruction.args.map((argument) => evaluateValue(argument, frame));
+        return normalizeFlowResult(
+          await this.invokeFlow(frame.module, instruction.target, args, context, signal),
+          instruction.span,
+        );
+      }
+      case "dispatch.list": {
+        const calls = instruction.calls.map((call) => ({
+          target: call.target,
+          args: call.args.map((argument) => evaluateValue(argument, frame)),
+          span: call.span,
+        }));
+        return this.startDispatch(frame, calls, context, location, signal);
+      }
+      case "dispatch.batch": {
+        const count = asCompute(evaluateValue(instruction.count, frame), instruction.count.span, "dispatch count");
+        if (!Number.isInteger(count) || typeof count !== "number" || count < 0) {
+          throw new FlowRuntimeError("DISPATCH_COUNT_INVALID", "dispatch count must be a non-negative integer", {
+            span: instruction.count.span,
+          });
+        }
+        const task = evaluateValue(instruction.task, frame);
+        const calls = Array.from({ length: count }, () => ({
+          target: instruction.target,
+          args: [cloneRuntimeValue(task)],
+          span: instruction.span,
+        }));
+        return this.startDispatch(frame, calls, context, location, signal);
+      }
+      case "sync": {
+        const group = asTaskGroup(evaluateValue(instruction.taskGroup, frame), instruction.taskGroup.span);
+        if (group.consumed) {
+          throw new FlowRuntimeError("TASK_GROUP_ALREADY_SYNCED", "TaskGroup has already been synced", {
+            span: instruction.span,
+          });
+        }
+        group.consumed = true;
+        frame.taskGroups.delete(group);
+        const settled = await Promise.allSettled(group.tasks);
+        group.dispose();
+        const failure = settled.find((item): item is PromiseRejectedResult => item.status === "rejected");
+        if (failure !== undefined) throw failure.reason;
+        const values = settled.map((item) => (item as PromiseFulfilledResult<Frag>).value);
+        const content = instruction.formatter === undefined
+          ? JSON.stringify(values.map((value) => value.content))
+          : await this.requireFormatter().format({
+              formatter: toSymbol(instruction.formatter),
+              values,
+              signal,
+            });
+        if (typeof content !== "string") {
+          throw new FlowRuntimeError("FORMATTER_RESULT_INVALID", "Formatter binding returned a non-string value", {
+            span: instruction.span,
+          });
+        }
+        await this.trace(context, "dispatch.completed", location, { taskGroup: group.id, count: values.length });
+        return frag(content);
+      }
+      case "fork": {
+        const source = asAgent(evaluateValue(instruction.sourceAgent, frame), instruction.sourceAgent.span);
+        await this.trace(context, "fork.started", location, { source: source.id });
+        const snapshot = await context.locks.use(
+          [{ key: source.id, mode: "read" }, { key: source.memory.id, mode: "read" }],
+          signal,
+          () => ({
+            messages: cloneMessages(source.memory.messages),
+            systemPrompt: source.systemPrompt,
+            agent: source.agent,
+          }),
+        );
+        const memory = this.createMemory(context, snapshot.messages);
+        const branch = this.createAgent(context, snapshot.agent, memory);
+        memory.owner = branch.id;
+        if (snapshot.systemPrompt !== undefined) branch.systemPrompt = snapshot.systemPrompt;
+        const input = asFrag(evaluateValue(instruction.action.input, frame), instruction.action.input.span, "fork input");
+        await this.runAgent(
+          branch,
+          instruction.action.mode,
+          instruction.action.role ?? "user",
+          input,
+          instruction.action.schema,
+          context,
+          location,
+          signal,
+        );
+        await this.trace(context, "fork.completed", location, { source: source.id, branch: branch.id });
+        return branch;
+      }
+      case "invoke": {
+        if (this.bindings.capabilities === undefined) {
+          throw new FlowRuntimeError("CAPABILITY_ADAPTER_MISSING", "invoke requires a Capability binding", {
+            span: instruction.span,
+          });
+        }
+        const request = {
+          capability: toSymbol(instruction.capability),
+          args: instruction.args.map((argument) => this.toPromptArgument(evaluateValue(argument, frame), argument.span)),
+          signal,
+        };
+        const approved = await this.bindings.policy?.authorizeCapability?.(request);
+        if (approved === false) {
+          throw new FlowRuntimeError("CAPABILITY_DENIED", `capability '${request.capability.name}' was denied`, {
+            span: instruction.span,
+          });
+        }
+        const result = await context.external.use(signal, () => Promise.resolve(
+          this.bindings.capabilities!.invoke(request),
+        ));
+        if (typeof result === "string") return frag(result);
+        if (isFrag(result)) return result;
+        throw new FlowRuntimeError("CAPABILITY_RESULT_INVALID", "Capability binding returned an invalid value", {
+          span: instruction.span,
+        });
+      }
+      case "memory.append": {
+        const memory = asMemory(evaluateValue(instruction.memory, frame), instruction.memory.span);
+        const value = asFrag(evaluateValue(instruction.frag, frame), instruction.frag.span, "memory.append value");
+        await context.locks.use([{ key: memory.id, mode: "write" }], signal, () => {
+          memory.messages.push({ role: instruction.role, content: value.content });
+        });
+        return undefined;
+      }
+      case "memory.copy": {
+        const memory = asMemory(evaluateValue(instruction.memory, frame), instruction.memory.span);
+        const messages = await context.locks.use(
+          [{ key: memory.id, mode: "read" }],
+          signal,
+          () => cloneMessages(memory.messages),
+        );
+        return this.createMemory(context, messages);
+      }
+      case "memory.apply": {
+        const source = asAgent(evaluateValue(instruction.sourceAgent, frame), instruction.sourceAgent.span);
+        const memory = asMemory(evaluateValue(instruction.memory, frame), instruction.memory.span);
+        return context.locks.use(
+          [{ key: source.id, mode: "read" }, { key: memory.id, mode: "write" }],
+          signal,
+          () => {
+            if (memory.owner !== undefined) {
+              throw new FlowRuntimeError("MEMORY_ALREADY_BOUND", "Memory is already bound to an Agent", {
+                span: instruction.span,
+              });
+            }
+            const agent = this.createAgent(context, source.agent, memory);
+            if (source.systemPrompt !== undefined) agent.systemPrompt = source.systemPrompt;
+            memory.owner = agent.id;
+            return agent;
+          },
+        );
+      }
+      case "freedom.move":
+      case "freedom.flow":
+        return this.executeFreedom(frame, instruction, context, location, signal);
+    }
+  }
+
+  private async runAgent(
+    agent: AgentHandle,
+    mode: "do" | "seqdo",
+    role: string,
+    input: Frag,
+    schema: SymbolExpr | undefined,
+    context: RunContext,
+    location: Required<TraceLocation>,
+    signal: AbortSignal,
+  ): Promise<Frag> {
+    return context.locks.use(
+      [{ key: agent.id, mode: "write" }, { key: agent.memory.id, mode: "write" }],
+      signal,
+      async () => {
+        agent.memory.messages.push({ role, content: input.content });
+        const request: AgentRunRequest = {
+          runId: context.runId,
+          node: location.node,
+          block: location.block,
+          mode,
+          agent: agent.agent,
+          ...(agent.systemPrompt === undefined ? {} : { systemPrompt: agent.systemPrompt }),
+          messages: cloneMessages(agent.memory.messages),
+          ...(schema === undefined ? {} : { schema: toSymbol(schema) }),
+          signal,
+        };
+        const approved = await this.bindings.policy?.authorizeAgent?.(request);
+        if (approved === false) {
+          throw new FlowRuntimeError("AGENT_DENIED", `Agent '${agent.agent.name}' was denied`);
+        }
+        await this.trace(context, "agent.started", location, { agent: agent.id, mode });
+        try {
+          const result = await context.external.use(signal, () => this.bindings.agents.run(request));
+          if (typeof result.output !== "string") {
+            throw new FlowRuntimeError("AGENT_OUTPUT_INVALID", "Agent adapter output must be a string");
+          }
+          await this.validateSchema(result.output, schema, signal);
+          for (const message of result.messages ?? []) {
+            if (typeof message.role !== "string" || typeof message.content !== "string") {
+              throw new FlowRuntimeError("AGENT_MESSAGES_INVALID", "Agent adapter returned an invalid Message");
+            }
+            agent.memory.messages.push({ role: message.role, content: message.content });
+          }
+          agent.memory.messages.push({ role: "assistant", content: result.output });
+          await this.trace(context, "agent.completed", location, { agent: agent.id, mode });
+          return frag(result.output);
+        } catch (error) {
+          const runtimeError = normalizeRuntimeError(error);
+          await this.trace(context, "agent.failed", location, { agent: agent.id, mode }, runtimeError);
+          throw runtimeError;
+        }
+      },
+    );
+  }
+
+  private async renderPrompt(
+    source: ValueExpr,
+    args: readonly ValueExpr[],
+    frame: MutableFrame,
+    signal: AbortSignal,
+  ): Promise<Frag> {
+    const sourceValue = evaluateValue(source, frame);
+    const values = args.map((argument) => this.toPromptArgument(evaluateValue(argument, frame), argument.span));
+    if (isSymbolRef(sourceValue)) {
+      if (this.bindings.prompts === undefined) {
+        throw new FlowRuntimeError("PROMPT_ADAPTER_MISSING", `prompt '${sourceValue.name}' requires a Prompt binding`, {
+          span: source.span,
+        });
+      }
+      throwIfAborted(signal);
+      const rendered = await this.bindings.prompts.render({ prompt: sourceValue, args: values, signal });
+      if (typeof rendered !== "string") {
+        throw new FlowRuntimeError("PROMPT_RESULT_INVALID", "Prompt binding returned a non-string value", {
+          span: source.span,
+        });
+      }
+      return frag(rendered);
+    }
+    const base = isFrag(sourceValue)
+      ? sourceValue.content
+      : isComputeValue(sourceValue)
+        ? formatCompute(sourceValue)
+        : undefined;
+    if (base === undefined) {
+      throw new FlowRuntimeError("PROMPT_SOURCE_INVALID", "prompt source cannot be a runtime handle", {
+        span: source.span,
+      });
+    }
+    return frag([base, ...values.map(formatPromptArgument)].join("\n\n"));
+  }
+
+  private async invokeFlow(
+    module: AflModule,
+    target: FlowTarget,
+    args: readonly RuntimeValue[],
+    context: RunContext,
+    signal: AbortSignal,
+  ): Promise<RuntimeValue> {
+    throwIfAborted(signal);
+    if (target.kind === "local") return this.executeNode(module, target.name, args, context, signal);
+    if (this.bindings.flows === undefined) {
+      throw new FlowRuntimeError("FLOW_ADAPTER_MISSING", `external flow '${target.name}' requires a Flow binding`, {
+        span: target.span,
+      });
+    }
+    const portable = args.map((value) => this.toRuntimeArgument(value, target.span));
+    return this.bindings.flows.invoke({ flow: symbol(target.name), args: portable, signal });
+  }
+
+  private async startDispatch(
+    frame: MutableFrame,
+    calls: readonly { readonly target: FlowTarget; readonly args: readonly RuntimeValue[]; readonly span: SourceSpan }[],
+    context: RunContext,
+    location: Required<TraceLocation>,
+    parentSignal: AbortSignal,
+  ): Promise<TaskGroupHandle> {
+    const maxWorkers = this.bindings.policy?.maxDispatchWorkers ?? 16;
+    const maxTasks = this.bindings.policy?.maxDispatchTasks ?? 10_000;
+    if (!Number.isInteger(maxWorkers) || maxWorkers <= 0) {
+      throw new FlowRuntimeError("RUNTIME_POLICY_INVALID", "maxDispatchWorkers must be a positive integer");
+    }
+    if (!Number.isInteger(maxTasks) || maxTasks < 0) {
+      throw new FlowRuntimeError("RUNTIME_POLICY_INVALID", "maxDispatchTasks must be a non-negative integer");
+    }
+    if (calls.length > maxTasks) {
+      throw new FlowRuntimeError(
+        "DISPATCH_TASK_LIMIT_EXCEEDED",
+        `dispatch requested ${calls.length} tasks, exceeding maxDispatchTasks=${maxTasks}`,
+      );
+    }
+    const linked = linkedController(parentSignal);
+    const workerLimit = new Semaphore(maxWorkers);
+    const id = this.nextHandle(context, "task-group");
+    const tasks = calls.map((call) => {
+      const task = workerLimit.use(linked.controller.signal, async () => normalizeFlowResult(
+        await this.invokeFlow(frame.module, call.target, call.args, context, linked.controller.signal),
+        call.span,
+      ));
+      void task.catch((error: unknown) => {
+        linked.controller.abort(error);
+      });
+      return task;
+    });
+    const group: TaskGroupHandle = {
+      kind: "taskGroup",
+      id,
+      tasks,
+      controller: linked.controller,
+      dispose: linked.dispose,
+      consumed: false,
+    };
+    frame.taskGroups.add(group);
+    await this.trace(context, "dispatch.started", location, { taskGroup: id, count: tasks.length });
+    return group;
+  }
+
+  private addRuntimeResourceDependencies(
+    block: AflBlock,
+    frame: MutableFrame,
+    dependencies: Array<Set<number>>,
+  ): void {
+    const lastWriter = new Map<string, number>();
+    const readers = new Map<string, Set<number>>();
+    block.instructions.forEach((instruction, index) => {
+      for (const access of this.runtimeResourceAccesses(instruction, frame)) {
+        const writer = lastWriter.get(access.key);
+        if (writer !== undefined) dependencies[index]!.add(writer);
+        if (access.mode === "write") {
+          for (const reader of readers.get(access.key) ?? []) dependencies[index]!.add(reader);
+          lastWriter.set(access.key, index);
+          readers.set(access.key, new Set());
+        } else {
+          const current = readers.get(access.key) ?? new Set<number>();
+          current.add(index);
+          readers.set(access.key, current);
+        }
+      }
+    });
+  }
+
+  private runtimeResourceAccesses(
+    instruction: AflInstruction,
+    frame: MutableFrame,
+  ): Array<{ key: string; mode: "read" | "write" }> {
+    const agent = (expression: ValueExpr, mode: "read" | "write") => {
+      if (expression.kind !== "name" || !frame.values.has(expression.name)) return [];
+      const handle = evaluateValue(expression, frame);
+      if (!isAgentHandle(handle)) return [];
+      return [
+        { key: handle.id, mode },
+        { key: handle.memory.id, mode },
+      ];
+    };
+    const memory = (expression: ValueExpr, mode: "read" | "write") => {
+      if (expression.kind !== "name" || !frame.values.has(expression.name)) return [];
+      const handle = evaluateValue(expression, frame);
+      return isMemoryHandle(handle) ? [{ key: handle.id, mode }] : [];
+    };
+    switch (instruction.op) {
+      case "agent":
+        return instruction.memory === undefined ? [] : memory(instruction.memory, "write");
+      case "agent.sysprompt":
+      case "agent.do":
+      case "agent.seqdo":
+        return agent(instruction.agent, "write");
+      case "sync": {
+        if (!frame.values.has(instruction.taskGroup.name)) return [];
+        const group = evaluateValue(instruction.taskGroup, frame);
+        return isTaskGroupLike(group) ? [{ key: group.id, mode: "write" }] : [];
+      }
+      case "fork":
+        return agent(instruction.sourceAgent, "read");
+      case "memory.append":
+        return memory(instruction.memory, "write");
+      case "memory.copy":
+        return memory(instruction.memory, "read");
+      case "memory.apply":
+        return [
+          ...agent(instruction.sourceAgent, "read"),
+          ...memory(instruction.memory, "write"),
+        ];
+      case "freedom.move":
+      case "freedom.flow":
+        return agent(instruction.planner, "read");
+      default:
+        return [];
+    }
+  }
+
+  private async executeFreedom(
+    frame: MutableFrame,
+    instruction: Extract<AflInstruction, { op: "freedom.move" | "freedom.flow" }>,
+    context: RunContext,
+    location: Required<TraceLocation>,
+    signal: AbortSignal,
+  ): Promise<Frag> {
+    if (this.bindings.freedom === undefined) {
+      throw new FlowRuntimeError("FREEDOM_ADAPTER_MISSING", `${instruction.op} requires a Freedom binding`, {
+        span: instruction.span,
+      });
+    }
+    const planner = asAgent(evaluateValue(instruction.planner, frame), instruction.planner.span);
+    const prompt = asFrag(evaluateValue(instruction.prompt, frame), instruction.prompt.span, "freedom prompt");
+    const contextValue = asFrag(evaluateValue(instruction.context, frame), instruction.context.span, "freedom context");
+    const moves = instruction.moves === undefined ? undefined : this.evaluateMoveCandidates(instruction.moves, frame);
+    const plan: unknown = await this.bindings.freedom.plan({
+      mode: instruction.mode,
+      planner: planner.agent,
+      ...(planner.systemPrompt === undefined ? {} : { systemPrompt: planner.systemPrompt }),
+      messages: cloneMessages(planner.memory.messages),
+      ...(moves === undefined ? {} : { moves }),
+      prompt,
+      context: contextValue,
+      signal,
+    });
+    validateFreedomPlanShape(plan, instruction.mode, instruction.span);
+    await this.trace(context, "freedom.planned", location, { kind: plan.kind });
+    const approved = await this.bindings.policy?.approveFreedom?.({
+      module: frame.module,
+      plan,
+      runId: context.runId,
+      node: frame.node.name,
+      block: location.block,
+    });
+    if (approved === false) {
+      await this.trace(context, "freedom.rejected", location, { kind: plan.kind });
+      throw new FlowRuntimeError("FREEDOM_DENIED", "freedom plan was denied by policy", {
+        span: instruction.span,
+      });
+    }
+    await this.trace(context, "freedom.approved", location, { kind: plan.kind });
+    const result = await this.executeFreedomPlan(frame.module, plan, moves, context, signal, instruction.span);
+    const output = normalizeFlowResult(result, instruction.span);
+    await this.validateSchema(output.content, instruction.schema, signal);
+    return output;
+  }
+
+  private async executeFreedomPlan(
+    module: AflModule,
+    plan: FreedomPlan,
+    candidates: readonly SymbolRef[] | undefined,
+    context: RunContext,
+    signal: AbortSignal,
+    span: SourceSpan,
+  ): Promise<RuntimeValue> {
+    if (plan.kind === "move") {
+      if (candidates === undefined || !candidates.some((candidate) => candidate.name === plan.move.name)) {
+        throw new FlowRuntimeError("FREEDOM_MOVE_OUT_OF_SCOPE", `move '${plan.move.name}' is not a candidate`, { span });
+      }
+      if (this.bindings.moves === undefined) {
+        throw new FlowRuntimeError("MOVE_ADAPTER_MISSING", "freedom move requires a Move binding", { span });
+      }
+      const result = await this.bindings.moves.execute({
+        move: plan.move,
+        args: plan.args ?? [],
+        signal,
+      });
+      if (typeof result === "string") return frag(result);
+      if (isFrag(result)) return result;
+      throw new FlowRuntimeError("MOVE_RESULT_INVALID", "Move binding returned an invalid value", { span });
+    }
+    if (plan.kind === "flow") {
+      if (this.bindings.flows === undefined) {
+        throw new FlowRuntimeError("FLOW_ADAPTER_MISSING", "freedom flow requires a Flow binding", { span });
+      }
+      return this.bindings.flows.invoke({ flow: plan.flow, args: plan.args ?? [], signal });
+    }
+    const generated = assertValidModule(parseAfl(plan.source, "<freedom-generated>"));
+    return this.executeNode(generated, plan.entry, [...(plan.args ?? [])], context, signal);
+  }
+
+  private evaluateMoveCandidates(expression: ValueExpr, frame: MutableFrame): SymbolRef[] {
+    if (expression.kind !== "list") {
+      throw new FlowRuntimeError("FREEDOM_MOVES_INVALID", "freedom.move candidates must be a symbol list", {
+        span: expression.span,
+      });
+    }
+    return expression.items.map((item) => asSymbol(evaluateValue(item, frame), item.span));
+  }
+
+  private toPromptArgument(value: RuntimeValue, span: SourceSpan): PromptArgument {
+    if (isFrag(value) || isComputeValue(value) || isSymbolRef(value)) return clonePortable(value);
+    throw new FlowRuntimeError("PROMPT_ARGUMENT_INVALID", "prompt argument cannot be a runtime handle", { span });
+  }
+
+  private toRuntimeArgument(value: RuntimeValue, span: SourceSpan): RuntimeArgument {
+    if (isFrag(value) || isComputeValue(value) || isSymbolRef(value)) return clonePortable(value);
+    throw new FlowRuntimeError("FLOW_ARGUMENT_INVALID", "external flow argument cannot be a runtime handle", { span });
+  }
+
+  private createMemory(context: RunContext, messages: readonly { role: string; content: string }[] = []): MemoryHandle {
+    return {
+      kind: "memory",
+      id: this.nextHandle(context, "memory"),
+      messages: cloneMessages(messages),
+    };
+  }
+
+  private createAgent(context: RunContext, agent: SymbolRef, memory: MemoryHandle): AgentHandle {
+    return { kind: "agent", id: this.nextHandle(context, "agent"), agent, memory };
+  }
+
+  private nextHandle(context: RunContext, prefix: string): string {
+    context.counters.handles += 1;
+    return `${context.runId}:${prefix}:${context.counters.handles}`;
+  }
+
+  private takeStep(context: RunContext, label: string, signal: AbortSignal = context.signal): void {
+    throwIfAborted(signal);
     context.counters.steps += 1;
     if (context.counters.steps > context.maxSteps) {
       throw new FlowRuntimeError(
         "RUN_STEP_BUDGET_EXCEEDED",
-        `run exceeded ${context.maxSteps} node executions`,
-        { nodeId: node.id },
+        `run exceeded ${context.maxSteps} steps while entering ${label}`,
       );
     }
-    await this.trace(context, "node.started", { flowId: frame.flowId, nodeId: node.id });
-    try {
-      const result = await this.executeNodeInner(node, frame, context);
-      await this.trace(context, "node.completed", {
-        flowId: frame.flowId,
-        nodeId: node.id,
-      });
-      return result;
-    } catch (error) {
-      const runtimeError = normalizeRuntimeError(error, node.id);
-      await this.trace(context, "node.failed", {
-        flowId: frame.flowId,
-        nodeId: node.id,
-        error: runtimeError,
-      });
-      throw runtimeError;
-    }
   }
 
-  private async executeNodeInner(
-    node: FlowNode,
-    frame: MutableFrame,
-    context: RunContext,
-  ): Promise<NodeResult> {
-    switch (node.kind) {
-      case "noop":
-        return NORMAL;
-      case "sequence":
-        for (const step of node.steps) {
-          const result = await this.executeNode(step, frame, context);
-          if (result.type === "return") {
-            return result;
-          }
-        }
-        return NORMAL;
-      case "assign":
-        this.writeTarget(frame, node.target, evaluateExpr(node.value, frame));
-        return NORMAL;
-      case "invoke": {
-        const output = await this.invokeAgent(
-          frame,
-          node.id,
-          node.agent,
-          node.operation,
-          evaluateExpr(node.input, frame),
-          context,
-        );
-        if (node.assign !== undefined) {
-          this.writeTarget(frame, node.assign, output);
-        }
-        return NORMAL;
-      }
-      case "callFlow": {
-        const output = await this.executeFlow(
-          node.flow,
-          evaluateExpr(node.input, frame),
-          context,
-        );
-        if (node.assign !== undefined) {
-          this.writeTarget(frame, node.assign, output);
-        }
-        return NORMAL;
-      }
-      case "branch":
-        for (const branchCase of node.cases) {
-          if (expectCondition(evaluateExpr(branchCase.when, frame), node.id)) {
-            return this.executeNode(branchCase.then, frame, context);
-          }
-        }
-        return node.default === undefined
-          ? NORMAL
-          : this.executeNode(node.default, frame, context);
-      case "loop":
-        for (let iteration = 0; iteration < node.maxIterations; iteration += 1) {
-          if (!expectCondition(evaluateExpr(node.condition, frame), node.id)) {
-            return NORMAL;
-          }
-          const result = await this.executeNode(node.body, frame, context);
-          if (result.type === "return") {
-            return result;
-          }
-        }
-        if (expectCondition(evaluateExpr(node.condition, frame), node.id)) {
-          throw new FlowRuntimeError(
-            "LOOP_LIMIT_EXCEEDED",
-            `loop reached maxIterations=${node.maxIterations}`,
-          );
-        }
-        return NORMAL;
-      case "forEach": {
-        const items = evaluateExpr(node.items, frame);
-        if (!Array.isArray(items)) {
-          throw new FlowRuntimeError("FOREACH_ITEMS_NOT_ARRAY", "forEach items must evaluate to an array");
-        }
-        const results = await this.executeForEach(node, items, frame, context);
-        if (node.assign !== undefined) {
-          this.writeTarget(frame, node.assign, results);
-        }
-        return NORMAL;
-      }
-      case "parallel": {
-        const output = await this.executeParallel(node, frame, context);
-        if (node.assign !== undefined) {
-          this.writeTarget(frame, node.assign, output);
-        }
-        return NORMAL;
-      }
-      case "retry":
-        return this.executeRetry(node, frame, context);
-      case "timeout":
-        return this.executeTimeout(node, frame, context);
-      case "try":
-        return this.executeTry(node, frame, context);
-      case "delay": {
-        const duration = evaluateExpr(node.durationMs, frame);
-        if (typeof duration !== "number" || !Number.isFinite(duration) || duration < 0) {
-          throw new FlowRuntimeError(
-            "DELAY_DURATION_INVALID",
-            "delay durationMs must evaluate to a non-negative finite number",
-          );
-        }
-        await cancellableDelay(duration, context.signal);
-        return NORMAL;
-      }
-      case "emit": {
-        if (this.bindings.events === undefined) {
-          throw new FlowRuntimeError("EVENT_ADAPTER_MISSING", "emit requires an event adapter");
-        }
-        const payload = evaluateExpr(node.payload, frame);
-        await this.bindings.events.emit({
-          runId: context.runId,
-          flowId: frame.flowId,
-          nodeId: node.id,
-          event: node.event,
-          payload,
-          signal: context.signal,
-        });
-        await this.trace(context, "event.emitted", {
-          flowId: frame.flowId,
-          nodeId: node.id,
-          details: { event: node.event },
-        });
-        return NORMAL;
-      }
-      case "awaitEvent": {
-        if (this.bindings.events === undefined) {
-          throw new FlowRuntimeError("EVENT_ADAPTER_MISSING", "awaitEvent requires an event adapter");
-        }
-        const wait = async (signal: AbortSignal): Promise<JsonValue> =>
-          this.bindings.events!.wait({
-            runId: context.runId,
-            flowId: frame.flowId,
-            nodeId: node.id,
-            event: node.event,
-            signal,
-          });
-        const payload = node.timeoutMs === undefined
-          ? await wait(context.signal)
-          : await promiseWithTimeout(wait, node.timeoutMs, context.signal, node.id);
-        if (!isJsonValue(payload)) {
-          throw new FlowRuntimeError("EVENT_PAYLOAD_NOT_JSON", "event adapter returned a non-JSON payload");
-        }
-        if (node.assign !== undefined) {
-          this.writeTarget(frame, node.assign, payload);
-        }
-        await this.trace(context, "event.received", {
-          flowId: frame.flowId,
-          nodeId: node.id,
-          details: { event: node.event },
-        });
-        return NORMAL;
-      }
-      case "checkpoint": {
-        if (this.bindings.checkpoints === undefined) {
-          throw new FlowRuntimeError(
-            "CHECKPOINT_ADAPTER_MISSING",
-            "checkpoint requires a checkpoint adapter",
-          );
-        }
-        await this.bindings.checkpoints.save({
-          runId: context.runId,
-          flowId: frame.flowId,
-          nodeId: node.id,
-          ...(node.label === undefined ? {} : { label: node.label }),
-          input: cloneJson(frame.input),
-          state: initializedValues(frame.state),
-          traceSequence: context.counters.traceSequence,
-          signal: context.signal,
-        });
-        await this.trace(context, "checkpoint.created", {
-          flowId: frame.flowId,
-          nodeId: node.id,
-          ...(node.label === undefined ? {} : { details: { label: node.label } }),
-        });
-        return NORMAL;
-      }
-      case "freedom": {
-        const rawPlan = await this.invokeAgent(
-          frame,
-          node.id,
-          node.planner,
-          node.operation,
-          evaluateExpr(node.context, frame),
-          context,
-        );
-        const result = validateFreedomPlan(
-          this.program,
-          frame.flowId,
-          rawPlan,
-          node.constraints,
-        );
-        const planHash = hashJson(rawPlan);
-        await this.trace(context, "freedom.plan.created", {
-          flowId: frame.flowId,
-          nodeId: node.id,
-          details: { planHash },
-        });
-        if (!result.ok) {
-          await this.trace(context, "freedom.plan.rejected", {
-            flowId: frame.flowId,
-            nodeId: node.id,
-            details: { planHash, issues: issuesAsJson(result.issues) },
-          });
-          throw new FlowRuntimeError(
-            "FREEDOM_PLAN_INVALID",
-            "freedom planner returned invalid or disallowed IR",
-            { details: { planHash, issues: issuesAsJson(result.issues) } },
-          );
-        }
-        const approved = await this.bindings.policy?.approveFreedom?.({
-          program: this.program,
-          runId: context.runId,
-          flowId: frame.flowId,
-          nodeId: node.id,
-          plan: result.value,
-          planHash,
-        });
-        if (approved === false) {
-          await this.trace(context, "freedom.plan.rejected", {
-            flowId: frame.flowId,
-            nodeId: node.id,
-            details: { planHash, reason: "policy" },
-          });
-          throw new FlowRuntimeError("FREEDOM_PLAN_DENIED", "freedom plan was denied by policy");
-        }
-        await this.trace(context, "freedom.plan.accepted", {
-          flowId: frame.flowId,
-          nodeId: node.id,
-          details: { planHash, kind: result.value.kind },
-        });
-        const output = await this.executeFreedomPlan(result.value, frame, context, node.id);
-        if (node.assign !== undefined) {
-          this.writeTarget(frame, node.assign, output);
-        }
-        return NORMAL;
-      }
-      case "return":
-        return { type: "return", value: evaluateExpr(node.value, frame) };
-      case "fail": {
-        const error = evaluateExpr(node.error, frame);
-        if (isRecord(error) && typeof error.code === "string" && typeof error.message === "string") {
-          throw new FlowRuntimeError(error.code, error.message, {
-            ...(isJsonValue(error.details) ? { details: error.details } : {}),
-          });
-        }
-        throw new FlowRuntimeError("FLOW_FAILED", "flow entered a fail node", { details: error });
-      }
-    }
-  }
-
-  private async invokeAgent(
-    frame: MutableFrame,
-    nodeId: string,
-    agentId: string,
-    operationId: string,
-    input: JsonValue,
-    context: RunContext,
-  ): Promise<JsonValue> {
-    const declaration = this.program.agents?.[agentId];
-    const operationDeclaration = declaration?.operations[operationId];
-    if (declaration === undefined || operationDeclaration === undefined) {
-      throw new FlowRuntimeError(
-        "AGENT_BINDING_INVALID",
-        `agent operation '${agentId}.${operationId}' is not declared`,
-      );
-    }
-    this.assertSchema(input, operationDeclaration.input, `input for '${agentId}.${operationId}'`);
-    const request: AgentInvokeRequest = {
-      runId: context.runId,
-      flowId: frame.flowId,
-      nodeId,
-      agent: agentId,
-      operation: operationId,
-      declaration,
-      operationDeclaration,
-      input: cloneJson(input),
-      signal: context.signal,
-    };
-    const authorized = await this.bindings.policy?.authorizeAgent?.(request);
-    if (authorized === false) {
-      throw new FlowRuntimeError(
-        "AGENT_CALL_DENIED",
-        `agent call '${agentId}.${operationId}' was denied by policy`,
-      );
-    }
-    await this.trace(context, "agent.started", {
-      flowId: frame.flowId,
-      nodeId,
-      details: { agent: agentId, operation: operationId },
-    });
-    try {
-      const output = await this.bindings.agents.invoke(request);
-      throwIfCancelled(context.signal);
-      if (!isJsonValue(output)) {
-        throw new FlowRuntimeError(
-          "AGENT_OUTPUT_NOT_JSON",
-          `agent '${agentId}.${operationId}' returned a non-JSON value`,
-        );
-      }
-      this.assertSchema(output, operationDeclaration.output, `output from '${agentId}.${operationId}'`);
-      await this.trace(context, "agent.completed", {
-        flowId: frame.flowId,
-        nodeId,
-        details: { agent: agentId, operation: operationId },
-      });
-      return cloneJson(output);
-    } catch (error) {
-      const runtimeError = normalizeRuntimeError(error, nodeId);
-      await this.trace(context, "agent.failed", {
-        flowId: frame.flowId,
-        nodeId,
-        details: { agent: agentId, operation: operationId },
-        error: runtimeError,
-      });
-      throw runtimeError;
-    }
-  }
-
-  private async executeForEach(
-    node: Extract<FlowNode, { kind: "forEach" }>,
-    items: JsonValue[],
-    frame: MutableFrame,
-    context: RunContext,
-  ): Promise<JsonValue[]> {
-    if (items.length === 0) {
-      return [];
-    }
-    const concurrency = Math.min(node.maxConcurrency ?? 1, items.length);
-    const results: JsonValue[] = new Array(items.length);
-    const linked = linkedController(context.signal);
-    const childContext = { ...context, signal: linked.controller.signal };
-    let cursor = 0;
-    const worker = async (): Promise<void> => {
-      while (true) {
-        const index = cursor;
-        cursor += 1;
-        if (index >= items.length) {
-          return;
-        }
-        const childFrame = cloneFrame(frame);
-        this.writeTarget(childFrame, { scope: "local", name: node.item }, items[index] as JsonValue);
-        if (node.index !== undefined) {
-          this.writeTarget(childFrame, { scope: "local", name: node.index }, index);
-        }
-        const result = await this.executeNode(node.body, childFrame, childContext);
-        results[index] = result.type === "return" ? result.value : null;
-      }
-    };
-    const workers = Array.from({ length: concurrency }, () => worker());
-    try {
-      await Promise.all(workers);
-      return results;
-    } catch (error) {
-      linked.controller.abort(error);
-      await Promise.allSettled(workers);
-      throw error;
-    } finally {
-      linked.dispose();
-    }
-  }
-
-  private async executeParallel(
-    node: Extract<FlowNode, { kind: "parallel" }>,
-    frame: MutableFrame,
-    context: RunContext,
-  ): Promise<JsonValue> {
-    const linked = linkedController(context.signal);
-    const childContext = { ...context, signal: linked.controller.signal };
-    const tasks = node.branches.map(async (branch) => {
-      const childFrame = cloneFrame(frame);
-      const result = await this.executeNode(branch.body, childFrame, childContext);
-      return {
-        branch: branch.id,
-        value: result.type === "return" ? result.value : null,
-      };
-    });
-    try {
-      if (node.mode === "all") {
-        const completed = await Promise.all(tasks);
-        return Object.fromEntries(completed.map((item) => [item.branch, item.value]));
-      }
-      if (node.mode === "allSettled") {
-        const settled = await Promise.allSettled(tasks);
-        return Object.fromEntries(
-          settled.map((item, index) => {
-            const branch = node.branches[index]!.id;
-            return item.status === "fulfilled"
-              ? [branch, { status: "fulfilled", value: item.value.value }]
-              : [
-                  branch,
-                  {
-                    status: "rejected",
-                    error: normalizeRuntimeError(item.reason).serialize(),
-                  },
-                ];
-          }),
-        ) as JsonValue;
-      }
-      try {
-        const winner = await Promise.any(tasks);
-        linked.controller.abort(
-          new FlowRuntimeError("CANCELLED", `parallel race won by '${winner.branch}'`),
-        );
-        await Promise.allSettled(tasks);
-        return { branch: winner.branch, value: winner.value };
-      } catch (error) {
-        if (error instanceof AggregateError) {
-          const first = error.errors[0];
-          throw normalizeRuntimeError(first ?? error);
-        }
-        throw error;
-      }
-    } catch (error) {
-      linked.controller.abort(error);
-      await Promise.allSettled(tasks);
-      throw error;
-    } finally {
-      linked.dispose();
-    }
-  }
-
-  private async executeRetry(
-    node: Extract<FlowNode, { kind: "retry" }>,
-    frame: MutableFrame,
-    context: RunContext,
-  ): Promise<NodeResult> {
-    let lastError: unknown;
-    for (let attempt = 1; attempt <= node.maxAttempts; attempt += 1) {
-      throwIfCancelled(context.signal);
-      const attemptFrame = cloneFrame(frame);
-      try {
-        const result = await this.executeNode(node.body, attemptFrame, context);
-        commitFrame(frame, attemptFrame);
-        return result;
-      } catch (error) {
-        const runtimeError = normalizeRuntimeError(error);
-        if (runtimeError.code === "CANCELLED") {
-          throw runtimeError;
-        }
-        lastError = runtimeError;
-        if (attempt < node.maxAttempts) {
-          await cancellableDelay(retryDelay(node, attempt), context.signal);
-        }
-      }
-    }
-    throw normalizeRuntimeError(lastError);
-  }
-
-  private async executeTimeout(
-    node: Extract<FlowNode, { kind: "timeout" }>,
-    frame: MutableFrame,
-    context: RunContext,
-  ): Promise<NodeResult> {
-    const childFrame = cloneFrame(frame);
-    const result = await promiseWithTimeout(
-      async (signal) => {
-        const childContext = { ...context, signal };
-        const childResult = await this.executeNode(node.body, childFrame, childContext);
-        return childResult;
-      },
-      node.timeoutMs,
-      context.signal,
-      node.id,
-    );
-    commitFrame(frame, childFrame);
-    return result;
-  }
-
-  private async executeTry(
-    node: Extract<FlowNode, { kind: "try" }>,
-    frame: MutableFrame,
-    context: RunContext,
-  ): Promise<NodeResult> {
-    let result: NodeResult = NORMAL;
-    let pendingError: unknown;
-    try {
-      result = await this.executeNode(node.body, frame, context);
-    } catch (error) {
-      const runtimeError = normalizeRuntimeError(error);
-      if (runtimeError.code === "CANCELLED" || node.catch === undefined) {
-        pendingError = runtimeError;
-      } else {
-        try {
-          this.writeTarget(
-            frame,
-            { scope: "local", name: node.catch.error },
-            runtimeError.serialize() as unknown as JsonValue,
-          );
-          result = await this.executeNode(node.catch.body, frame, context);
-        } catch (catchError) {
-          pendingError = catchError;
-        }
-      }
-    }
-
-    if (node.finally !== undefined) {
-      try {
-        const finalResult = await this.executeNode(node.finally, frame, context);
-        if (finalResult.type === "return") {
-          result = finalResult;
-          pendingError = undefined;
-        }
-      } catch (finalError) {
-        pendingError = finalError;
-      }
-    }
-    if (pendingError !== undefined) {
-      throw pendingError;
-    }
-    return result;
-  }
-
-  private async executeFreedomPlan(
-    plan: FreedomPlan,
-    frame: MutableFrame,
-    context: RunContext,
-    nodeId: string,
-  ): Promise<JsonValue> {
-    if (plan.kind === "continuation") {
-      const result = await this.executeNode(plan.body, frame, context);
-      return result.type === "return" ? result.value : null;
-    }
-    context.counters.revisionSequence += 1;
-    const revisionId = `${frame.flowId}#revision-${context.counters.revisionSequence}`;
-    await this.trace(context, "revision.created", {
-      flowId: frame.flowId,
-      nodeId,
-      details: { revisionId },
-    });
-    return this.executeFlow(revisionId, plan.input, context, plan.flow);
-  }
-
-  private writeTarget(frame: MutableFrame, target: SlotTarget, value: JsonValue): void {
-    const declaration = target.scope === "state"
-      ? frame.definition.state?.[target.name]
-      : frame.definition.locals?.[target.name];
-    if (declaration === undefined) {
-      throw new FlowRuntimeError(
-        "TARGET_UNKNOWN",
-        `${target.scope} slot '${target.name}' is not declared`,
-      );
-    }
-    this.assertSchema(value, declaration.schema, `${target.scope} slot '${target.name}'`);
-    const slots = target.scope === "state" ? frame.state : frame.locals;
-    slots[target.name] = cloneJson(value);
-  }
-
-  private assertSchema(value: unknown, schema: FlowDefinition["input"], label: string): void {
-    const issues = validateDataValue(value, schema, this.program.schemas);
-    if (issues.length > 0) {
-      throw new FlowRuntimeError("SCHEMA_VALUE_INVALID", `${label} does not match its schema`, {
-        details: { issues: issuesAsJson(issues) },
+  private assertNoOutstandingGroups(frame: MutableFrame, span: SourceSpan): void {
+    if (frame.taskGroups.size > 0) {
+      throw new FlowRuntimeError("TASK_GROUP_UNCONSUMED", "node cannot return before syncing every TaskGroup", {
+        span,
       });
     }
+  }
+
+  private requireFormatter() {
+    if (this.bindings.formatters === undefined) {
+      throw new FlowRuntimeError("FORMATTER_ADAPTER_MISSING", "explicit formatter requires a Formatter binding");
+    }
+    return this.bindings.formatters;
+  }
+
+  private async validateSchema(
+    content: string,
+    schema: SymbolExpr | undefined,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (schema === undefined) return;
+    if (this.bindings.schemas === undefined) {
+      throw new FlowRuntimeError("SCHEMA_ADAPTER_MISSING", `schema '${schema.name}' requires a Schema binding`, {
+        span: schema.span,
+      });
+    }
+    await this.bindings.schemas.validate({ schema: toSymbol(schema), content, signal });
   }
 
   private async trace(
     context: RunContext,
     type: TraceEventType,
-    options: {
-      flowId?: string;
-      nodeId?: string;
-      details?: JsonValue;
-      error?: FlowRuntimeError;
-    } = {},
+    location: TraceLocation = {},
+    details?: ComputeValue,
+    error?: FlowRuntimeError,
   ): Promise<void> {
-    if (context.counters.closed) {
-      return;
-    }
-    context.counters.traceSequence += 1;
+    if (this.bindings.trace === undefined) return;
+    context.counters.trace += 1;
     const event: TraceEvent = {
-      sequence: context.counters.traceSequence,
+      sequence: context.counters.trace,
       timestamp: new Date().toISOString(),
       runId: context.runId,
       type,
-      ...(options.flowId === undefined ? {} : { flowId: options.flowId }),
-      ...(options.nodeId === undefined ? {} : { nodeId: options.nodeId }),
-      ...(options.details === undefined ? {} : { details: options.details }),
-      ...(options.error === undefined ? {} : { error: options.error.serialize() }),
+      ...(location.node === undefined ? {} : { node: location.node }),
+      ...(location.block === undefined ? {} : { block: location.block }),
+      ...(location.instruction === undefined ? {} : { instruction: location.instruction }),
+      ...(details === undefined ? {} : { details }),
+      ...(error === undefined ? {} : { error: { code: error.code, message: error.message } }),
     };
-    await this.bindings.trace?.emit(event);
+    await this.bindings.trace.emit(event);
   }
 }
 
-function initializeSlots(
-  declarations: FlowDefinition["state"] | FlowDefinition["locals"],
-): Record<string, JsonValue | undefined> {
-  return Object.fromEntries(
-    Object.entries(declarations ?? {}).map(([name, declaration]) => [
-      name,
-      declaration.initial === undefined ? undefined : cloneJson(declaration.initial),
-    ]),
-  );
+function normalizeFlowResult(value: RuntimeValue, span: SourceSpan): Frag {
+  if (isFrag(value)) return value;
+  if (isComputeValue(value)) return frag(formatCompute(value));
+  throw new FlowRuntimeError("FLOW_RESULT_INVALID", "flow result must be Frag or compute data", { span });
 }
 
-function initializedValues(
-  slots: Readonly<Record<string, JsonValue | undefined>>,
-): Record<string, JsonValue> {
-  return Object.fromEntries(
-    Object.entries(slots)
-      .filter((entry): entry is [string, JsonValue] => entry[1] !== undefined)
-      .map(([name, value]) => [name, cloneJson(value)]),
-  );
+function failureMessage(value: RuntimeValue): string {
+  if (isFrag(value)) return value.content;
+  if (isComputeValue(value)) return formatCompute(value);
+  return "flow entered fail with a runtime handle";
 }
 
-function cloneFrame(frame: MutableFrame): MutableFrame {
-  return {
-    flowId: frame.flowId,
-    definition: frame.definition,
-    input: cloneJson(frame.input),
-    state: cloneSlots(frame.state),
-    locals: cloneSlots(frame.locals),
-  };
+function formatPromptArgument(value: PromptArgument): string {
+  if (isFrag(value)) return value.content;
+  if (isSymbolRef(value)) return value.name;
+  return formatCompute(value);
 }
 
-function cloneSlots(
-  slots: Readonly<Record<string, JsonValue | undefined>>,
-): Record<string, JsonValue | undefined> {
-  return Object.fromEntries(
-    Object.entries(slots).map(([name, value]) => [
-      name,
-      value === undefined ? undefined : cloneJson(value),
-    ]),
-  );
+function clonePortable<T extends RuntimeArgument>(value: T): T {
+  return structuredClone(value);
 }
 
-function commitFrame(target: MutableFrame, source: MutableFrame): void {
-  target.state = cloneSlots(source.state);
-  target.locals = cloneSlots(source.locals);
+function cloneRuntimeValue(value: RuntimeValue): RuntimeValue {
+  if (isAgentHandle(value) || isMemoryHandle(value) || isTaskGroupLike(value)) return value;
+  return clonePortable(value);
 }
 
-function expectCondition(value: JsonValue, nodeId: string): boolean {
-  if (typeof value !== "boolean") {
-    throw new FlowRuntimeError(
-      "CONDITION_NOT_BOOLEAN",
-      "branch and loop conditions must evaluate to boolean",
-      { nodeId },
-    );
+function isTaskGroupLike(value: RuntimeValue): value is TaskGroupHandle {
+  return typeof value === "object" && value !== null && "kind" in value && value.kind === "taskGroup";
+}
+
+function cloneMessages(messages: readonly { role: string; content: string }[]) {
+  return messages.map((message) => ({ role: message.role, content: message.content }));
+}
+
+function toSymbol(expression: SymbolExpr): SymbolRef {
+  return { kind: "symbol", name: expression.name };
+}
+
+function validateFreedomPlanShape(
+  plan: unknown,
+  mode: "move" | "flow",
+  span: SourceSpan,
+): asserts plan is FreedomPlan {
+  if (typeof plan !== "object" || plan === null || !("kind" in plan)) {
+    throw new FlowRuntimeError("FREEDOM_PLAN_INVALID", "Freedom binding returned an invalid plan", { span });
   }
-  return value;
-}
-
-function retryDelay(
-  node: Extract<FlowNode, { kind: "retry" }>,
-  failedAttempt: number,
-): number {
-  if (node.backoff === undefined) {
-    return 0;
+  const candidate = plan as Record<string, unknown>;
+  if (candidate.kind !== "move" && candidate.kind !== "flow" && candidate.kind !== "generated") {
+    throw new FlowRuntimeError("FREEDOM_PLAN_INVALID", "Freedom plan has an unknown kind", { span });
   }
-  const delay = node.backoff.kind === "fixed"
-    ? node.backoff.delayMs
-    : node.backoff.delayMs * 2 ** (failedAttempt - 1);
-  return Math.min(delay, node.backoff.maxDelayMs ?? delay);
-}
-
-async function promiseWithTimeout<T>(
-  operation: (signal: AbortSignal) => Promise<T>,
-  timeoutMs: number,
-  parentSignal: AbortSignal,
-  nodeId: string,
-): Promise<T> {
-  const linked = linkedController(parentSignal);
-  const timeoutError = new FlowRuntimeError(
-    "TIMEOUT",
-    `operation timed out after ${timeoutMs}ms`,
-    { nodeId },
-  );
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => {
-      linked.controller.abort(timeoutError);
-      reject(timeoutError);
-    }, timeoutMs);
-  });
-  try {
-    return await Promise.race([operation(linked.controller.signal), timeout]);
-  } finally {
-    if (timer !== undefined) {
-      clearTimeout(timer);
-    }
-    linked.dispose();
+  if (candidate.args !== undefined &&
+      (!Array.isArray(candidate.args) || !candidate.args.every(isRuntimeArgument))) {
+    throw new FlowRuntimeError("FREEDOM_PLAN_INVALID", "Freedom plan args are invalid", { span });
+  }
+  if (mode === "move" && candidate.kind !== "move") {
+    throw new FlowRuntimeError("FREEDOM_PLAN_KIND_INVALID", "freedom.move requires a move plan", { span });
+  }
+  if (mode === "flow" && candidate.kind === "move") {
+    throw new FlowRuntimeError("FREEDOM_PLAN_KIND_INVALID", "freedom.flow requires a flow plan", { span });
+  }
+  if (candidate.kind === "move" &&
+      (!isSymbolRef(candidate.move) || !candidate.move.name.startsWith("@move."))) {
+    throw new FlowRuntimeError("FREEDOM_PLAN_INVALID", "move plan requires an @move symbol", { span });
+  }
+  if (candidate.kind === "flow" &&
+      (!isSymbolRef(candidate.flow) || !candidate.flow.name.startsWith("@flow."))) {
+    throw new FlowRuntimeError("FREEDOM_PLAN_INVALID", "flow plan requires an @flow symbol", { span });
+  }
+  if (candidate.kind === "generated" &&
+      (typeof candidate.source !== "string" || candidate.source.trim().length === 0 ||
+       typeof candidate.entry !== "string" || candidate.entry.trim().length === 0)) {
+    throw new FlowRuntimeError("FREEDOM_PLAN_INVALID", "generated flow requires source and entry", { span });
   }
 }
 
-function cancellableDelay(durationMs: number, signal: AbortSignal): Promise<void> {
-  throwIfCancelled(signal);
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      signal.removeEventListener("abort", onAbort);
-      resolve();
-    }, durationMs);
-    const onAbort = (): void => {
-      clearTimeout(timer);
-      signal.removeEventListener("abort", onAbort);
-      reject(cancelledError(signal));
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-  });
-}
-
-function linkedController(parent?: AbortSignal): {
-  controller: AbortController;
-  dispose: () => void;
-} {
-  const controller = new AbortController();
-  const onAbort = (): void => controller.abort(parent?.reason);
-  if (parent?.aborted === true) {
-    controller.abort(parent.reason);
-  } else {
-    parent?.addEventListener("abort", onAbort, { once: true });
-  }
-  return {
-    controller,
-    dispose: () => parent?.removeEventListener("abort", onAbort),
-  };
-}
-
-function throwIfCancelled(signal: AbortSignal): void {
-  if (signal.aborted) {
-    throw cancelledError(signal);
-  }
-}
-
-function cancelledError(signal: AbortSignal): FlowRuntimeError {
-  return signal.reason instanceof FlowRuntimeError
-    ? signal.reason
-    : new FlowRuntimeError("CANCELLED", "run was cancelled", { cause: signal.reason });
-}
-
-function issuesAsJson(issues: ReadonlyArray<ValidationIssue>): JsonValue[] {
-  return issues.map((item) => ({
-    path: item.path,
-    code: item.code,
-    message: item.message,
-  }));
-}
-
-function hashJson(value: JsonValue): string {
-  const canonical = canonicalJson(value);
-  let hash = 0x811c9dc5;
-  for (let index = 0; index < canonical.length; index += 1) {
-    hash ^= canonical.charCodeAt(index);
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return `fnv1a32:${(hash >>> 0).toString(16).padStart(8, "0")}`;
-}
-
-function canonicalJson(value: JsonValue): string {
-  if (Array.isArray(value)) {
-    return `[${value.map(canonicalJson).join(",")}]`;
-  }
-  if (isRecord(value)) {
-    return `{${Object.keys(value)
-      .sort()
-      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key] as JsonValue)}`)
-      .join(",")}}`;
-  }
-  return JSON.stringify(value);
+function isRuntimeArgument(value: unknown): value is RuntimeArgument {
+  return isFrag(value) || isSymbolRef(value) || isComputeValue(value);
 }
 
 function createRunId(): string {
   runSequence += 1;
-  return `run-${Date.now().toString(36)}-${runSequence.toString(36)}`;
+  return `afl-${Date.now().toString(36)}-${runSequence.toString(36)}`;
 }

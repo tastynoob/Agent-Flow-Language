@@ -1,78 +1,57 @@
-import type { AgentAdapter, AgentInvokeRequest } from "./adapters.js";
+import type { AgentAdapter, AgentRunRequest, AgentRunResult, Message } from "./adapters.js";
 import { FlowRuntimeError } from "./errors.js";
-import type { JsonValue } from "./ir.js";
-import { isJsonValue, isRecord } from "./value.js";
 
-export interface ChatMessage {
-  role: "system" | "user" | "assistant";
-  content: string;
-}
-
-export type ChatOutputParser =
-  | "text"
-  | "json"
-  | ((content: string, response: JsonValue) => JsonValue | Promise<JsonValue>);
-
-export interface ChatOperationBinding {
-  model: string;
-  messages: (
-    input: JsonValue,
-    request: AgentInvokeRequest,
-  ) => ChatMessage[] | Promise<ChatMessage[]>;
-  output?: ChatOutputParser;
-  temperature?: number;
-  maxTokens?: number;
-  extraBody?: Record<string, JsonValue>;
+export interface OpenAICompatibleAgentBinding {
+  readonly model: string;
+  readonly temperature?: number;
+  readonly maxTokens?: number;
+  readonly jsonOutput?: boolean;
+  readonly extraBody?: Readonly<Record<string, unknown>>;
 }
 
 export interface OpenAICompatibleAdapterOptions {
-  baseUrl: string;
-  apiKey: string | (() => string);
-  operations: Record<string, ChatOperationBinding>;
-  headers?: Record<string, string>;
-  fetch?: typeof fetch;
+  readonly baseUrl: string;
+  readonly apiKey: string | (() => string);
+  readonly agents: Readonly<Record<string, OpenAICompatibleAgentBinding>>;
+  readonly headers?: Readonly<Record<string, string>>;
+  readonly fetch?: typeof fetch;
 }
 
 export class OpenAICompatibleAgentAdapter implements AgentAdapter {
   private readonly baseUrl: string;
   private readonly apiKey: string | (() => string);
-  private readonly operations: Readonly<Record<string, ChatOperationBinding>>;
+  private readonly agents: Readonly<Record<string, OpenAICompatibleAgentBinding>>;
   private readonly headers: Readonly<Record<string, string>>;
   private readonly fetchImplementation: typeof fetch;
 
   constructor(options: OpenAICompatibleAdapterOptions) {
-    if (options.baseUrl.trim().length === 0) {
-      throw new TypeError("baseUrl must be non-empty");
-    }
+    if (options.baseUrl.trim().length === 0) throw new TypeError("baseUrl must be non-empty");
     this.baseUrl = options.baseUrl.replace(/\/+$/u, "");
     this.apiKey = options.apiKey;
-    this.operations = options.operations;
+    this.agents = options.agents;
     this.headers = options.headers ?? {};
     this.fetchImplementation = options.fetch ?? globalThis.fetch;
-    if (this.fetchImplementation === undefined) {
-      throw new TypeError("a Fetch API implementation is required");
-    }
+    if (this.fetchImplementation === undefined) throw new TypeError("a Fetch API implementation is required");
   }
 
-  async invoke(request: AgentInvokeRequest): Promise<JsonValue> {
-    const binding = this.operations[`${request.agent}.${request.operation}`];
+  async run(request: AgentRunRequest): Promise<AgentRunResult> {
+    const binding = this.agents[request.agent.name];
     if (binding === undefined) {
       throw new FlowRuntimeError(
-        "AGENT_OPERATION_UNBOUND",
-        `no chat binding for '${request.agent}.${request.operation}'`,
+        "AGENT_SYMBOL_UNBOUND",
+        `no OpenAI-compatible binding for '${request.agent.name}'`,
       );
     }
-    const messages = await binding.messages(request.input, request);
-    validateMessages(messages);
-    const output = binding.output ?? "text";
-    const body: Record<string, JsonValue> = {
+    const messages = requestMessages(request);
+    const apiKey = resolveApiKey(this.apiKey);
+    const body = {
       ...(binding.extraBody ?? {}),
       model: binding.model,
-      messages: messages as unknown as JsonValue,
+      messages,
       stream: false,
       ...(binding.temperature === undefined ? {} : { temperature: binding.temperature }),
       ...(binding.maxTokens === undefined ? {} : { max_tokens: binding.maxTokens }),
-      ...(output === "json" ? { response_format: { type: "json_object" } } : {}),
+      ...(binding.jsonOutput === true ? { response_format: { type: "json_object" } } : {}),
     };
 
     let response: Response;
@@ -82,68 +61,52 @@ export class OpenAICompatibleAgentAdapter implements AgentAdapter {
         headers: {
           ...this.headers,
           "content-type": "application/json",
-          authorization: `Bearer ${resolveApiKey(this.apiKey)}`,
+          authorization: `Bearer ${apiKey}`,
         },
         body: JSON.stringify(body),
         signal: request.signal,
       });
     } catch (error) {
-      if (request.signal.aborted) {
-        throw request.signal.reason;
-      }
-      if (error instanceof FlowRuntimeError) {
-        throw error;
-      }
-      throw new FlowRuntimeError("LLM_TRANSPORT_ERROR", "chat completion request failed", {
-        cause: error,
-      });
+      if (request.signal.aborted) throw request.signal.reason;
+      throw new FlowRuntimeError("LLM_TRANSPORT_ERROR", "chat completion request failed", { cause: error });
     }
 
-    const responseText = await response.text();
+    const raw = await response.text();
+    const redacted = redact(raw, apiKey);
     let payload: unknown;
     try {
-      payload = JSON.parse(responseText);
+      payload = JSON.parse(raw);
     } catch (error) {
       throw new FlowRuntimeError("LLM_RESPONSE_NOT_JSON", "chat endpoint returned invalid JSON", {
-        details: { status: response.status, body: responseText.slice(0, 4096) },
+        details: { status: response.status, body: redacted.slice(0, 4096) },
         cause: error,
       });
     }
-    if (!isJsonValue(payload)) {
-      throw new FlowRuntimeError("LLM_RESPONSE_NOT_JSON", "chat endpoint returned a non-JSON value");
-    }
     if (!response.ok) {
-      throw new FlowRuntimeError(
-        "LLM_HTTP_ERROR",
-        `chat endpoint returned HTTP ${response.status}`,
-        { details: { status: response.status, body: payload } },
-      );
+      throw new FlowRuntimeError("LLM_HTTP_ERROR", `chat endpoint returned HTTP ${response.status}`, {
+        details: { status: response.status, body: safeResponseDetail(payload, apiKey) },
+      });
     }
-    const content = readAssistantContent(payload);
-    const parsed = await parseOutput(output, content, payload);
-    if (!isJsonValue(parsed)) {
-      throw new FlowRuntimeError("LLM_OUTPUT_NOT_JSON", "chat output parser returned a non-JSON value");
-    }
-    return parsed;
+    return { output: readAssistantContent(payload) };
   }
 }
 
-function validateMessages(messages: ChatMessage[]): void {
-  if (!Array.isArray(messages) || messages.length === 0) {
-    throw new FlowRuntimeError("LLM_MESSAGES_INVALID", "chat binding must produce messages");
-  }
-  for (const message of messages) {
-    if (
-      !isRecord(message) ||
-      !new Set(["system", "user", "assistant"]).has(message.role as string) ||
-      typeof message.content !== "string"
-    ) {
+function requestMessages(request: AgentRunRequest): Message[] {
+  const result: Message[] = [];
+  if (request.systemPrompt !== undefined) result.push({ role: "system", content: request.systemPrompt });
+  for (const message of request.messages) {
+    if (!new Set(["system", "user", "assistant", "tool"]).has(message.role)) {
       throw new FlowRuntimeError(
-        "LLM_MESSAGES_INVALID",
-        "chat messages require a supported role and string content",
+        "LLM_MESSAGE_ROLE_UNSUPPORTED",
+        `OpenAI-compatible chat does not support role '${message.role}'`,
       );
     }
+    result.push({ role: message.role, content: message.content });
   }
+  if (result.length === 0) {
+    throw new FlowRuntimeError("LLM_MESSAGES_INVALID", "chat completion requires at least one Message");
+  }
+  return result;
 }
 
 function resolveApiKey(apiKey: string | (() => string)): string {
@@ -154,10 +117,8 @@ function resolveApiKey(apiKey: string | (() => string)): string {
   return resolved;
 }
 
-function readAssistantContent(payload: JsonValue): string {
-  if (!isRecord(payload) || !Array.isArray(payload.choices)) {
-    throw invalidResponse();
-  }
+function readAssistantContent(payload: unknown): string {
+  if (!isRecord(payload) || !Array.isArray(payload.choices)) throw invalidResponse();
   const first = payload.choices[0];
   if (!isRecord(first) || !isRecord(first.message) || typeof first.message.content !== "string") {
     throw invalidResponse();
@@ -165,29 +126,20 @@ function readAssistantContent(payload: JsonValue): string {
   return first.message.content;
 }
 
-async function parseOutput(
-  parser: ChatOutputParser,
-  content: string,
-  response: JsonValue,
-): Promise<JsonValue> {
-  if (parser === "text") {
-    return content;
+function safeResponseDetail(value: unknown, secret: string): string {
+  try {
+    return redact(JSON.stringify(value), secret).slice(0, 4096);
+  } catch {
+    return "[unserializable response]";
   }
-  if (parser === "json") {
-    try {
-      const parsed: unknown = JSON.parse(content);
-      if (!isJsonValue(parsed)) {
-        throw new TypeError("parsed content is not JSON");
-      }
-      return parsed;
-    } catch (error) {
-      throw new FlowRuntimeError("LLM_CONTENT_NOT_JSON", "assistant content is not valid JSON", {
-        details: { content: content.slice(0, 4096) },
-        cause: error,
-      });
-    }
-  }
-  return parser(content, response);
+}
+
+function redact(value: string, secret: string): string {
+  return secret.length === 0 ? value : value.split(secret).join("[REDACTED]");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function invalidResponse(): FlowRuntimeError {

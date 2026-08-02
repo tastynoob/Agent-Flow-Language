@@ -1,317 +1,331 @@
-export type JsonPrimitive = null | boolean | number | string;
-
-export type JsonValue =
-  | JsonPrimitive
-  | JsonValue[]
-  | { [key: string]: JsonValue };
-
-export type DataSchema =
-  | { type: "any" }
-  | { type: "null" }
-  | { type: "boolean" }
-  | {
-      type: "number";
-      integer?: boolean;
-      minimum?: number;
-      maximum?: number;
-    }
-  | {
-      type: "string";
-      minLength?: number;
-      maxLength?: number;
-      pattern?: string;
-    }
-  | { type: "enum"; values: JsonPrimitive[] }
-  | {
-      type: "array";
-      items: DataSchema;
-      minItems?: number;
-      maxItems?: number;
-    }
-  | {
-      type: "object";
-      properties: Record<string, DataSchema>;
-      required?: string[];
-      additionalProperties?: boolean;
-    }
-  | { type: "oneOf"; variants: DataSchema[] }
-  | { type: "ref"; name: string };
-
-export interface AgentOperationDeclaration {
-  input: DataSchema;
-  output: DataSchema;
+export interface SourceSpan {
+  readonly line: number;
+  readonly column: number;
+  readonly endColumn: number;
 }
 
-export interface AgentDeclaration {
-  description?: string;
-  capabilities?: string[];
-  operations: Record<string, AgentOperationDeclaration>;
+export type PrimitiveValue = null | boolean | number | string;
+
+export type ComputeValue =
+  | PrimitiveValue
+  | ComputeValue[]
+  | { readonly [key: string]: ComputeValue };
+
+export interface Frag {
+  readonly kind: "frag";
+  readonly content: string;
 }
 
-export interface SlotDeclaration {
-  schema: DataSchema;
-  initial?: JsonValue;
+export interface SymbolRef {
+  readonly kind: "symbol";
+  readonly name: `@${string}`;
 }
 
-export type RefScope = "input" | "state" | "local";
+export type PathSegment = string | number;
 
-export type UnaryOperator = "not" | "negate" | "isNull";
-
-export type BinaryOperator =
-  | "eq"
-  | "neq"
-  | "lt"
-  | "lte"
-  | "gt"
-  | "gte"
-  | "and"
-  | "or"
-  | "add"
-  | "subtract"
-  | "multiply"
-  | "divide"
-  | "concat"
-  | "coalesce"
-  | "in";
-
-export type Expr =
-  | { kind: "literal"; value: JsonValue }
-  | {
-      kind: "ref";
-      scope: RefScope;
-      name?: string;
-      path?: Array<string | number>;
-    }
-  | { kind: "object"; entries: Record<string, Expr> }
-  | { kind: "array"; items: Expr[] }
-  | { kind: "unary"; op: UnaryOperator; value: Expr }
-  | { kind: "binary"; op: BinaryOperator; left: Expr; right: Expr };
-
-export interface SlotTarget {
-  scope: "state" | "local";
-  name: string;
+export interface LiteralExpr {
+  readonly kind: "literal";
+  readonly value: ComputeValue;
+  readonly span: SourceSpan;
 }
 
-export interface NodeBase {
-  id: string;
-  metadata?: Record<string, JsonValue>;
+export interface NameExpr {
+  readonly kind: "name";
+  readonly name: string;
+  readonly path: readonly PathSegment[];
+  readonly span: SourceSpan;
 }
 
-export interface NoopNode extends NodeBase {
-  kind: "noop";
+export interface SymbolExpr {
+  readonly kind: "symbol";
+  readonly name: `@${string}`;
+  readonly span: SourceSpan;
 }
 
-export interface SequenceNode extends NodeBase {
-  kind: "sequence";
-  steps: FlowNode[];
+export interface ListExpr {
+  readonly kind: "list";
+  readonly items: readonly ValueExpr[];
+  readonly span: SourceSpan;
 }
 
-export interface AssignNode extends NodeBase {
-  kind: "assign";
-  target: SlotTarget;
-  value: Expr;
+export interface RecordExpr {
+  readonly kind: "record";
+  readonly entries: Readonly<Record<string, ValueExpr>>;
+  readonly span: SourceSpan;
 }
 
-export interface InvokeNode extends NodeBase {
-  kind: "invoke";
-  agent: string;
-  operation: string;
-  input: Expr;
-  assign?: SlotTarget;
+export interface UnaryExpr {
+  readonly kind: "unary";
+  readonly operator: "!" | "-";
+  readonly operand: OperExpr;
+  readonly span: SourceSpan;
 }
 
-export interface CallFlowNode extends NodeBase {
-  kind: "callFlow";
-  flow: string;
-  input: Expr;
-  assign?: SlotTarget;
+export interface BinaryExpr {
+  readonly kind: "binary";
+  readonly operator:
+    | "|"
+    | "&"
+    | "=="
+    | "!="
+    | "<"
+    | "<="
+    | ">"
+    | ">="
+    | "+"
+    | "-"
+    | "*"
+    | "/";
+  readonly left: OperExpr;
+  readonly right: OperExpr;
+  readonly span: SourceSpan;
 }
 
-export interface BranchCase {
-  when: Expr;
-  then: FlowNode;
+export type ValueExpr = LiteralExpr | NameExpr | SymbolExpr | ListExpr | RecordExpr;
+export type OperExpr = ValueExpr | UnaryExpr | BinaryExpr;
+
+export interface FlowTarget {
+  readonly kind: "local" | "external";
+  readonly name: string;
+  readonly span: SourceSpan;
 }
 
-export interface BranchNode extends NodeBase {
-  kind: "branch";
-  cases: BranchCase[];
-  default?: FlowNode;
+export interface FlowCallExpr {
+  readonly target: FlowTarget;
+  readonly args: readonly ValueExpr[];
+  readonly span: SourceSpan;
 }
 
-export interface LoopNode extends NodeBase {
-  kind: "loop";
-  condition: Expr;
-  body: FlowNode;
-  maxIterations: number;
+interface InstructionBase {
+  readonly span: SourceSpan;
 }
 
-export interface ForEachNode extends NodeBase {
-  kind: "forEach";
-  items: Expr;
-  item: string;
-  index?: string;
-  body: FlowNode;
-  maxConcurrency?: number;
-  assign?: SlotTarget;
+export interface AgentInstruction extends InstructionBase {
+  readonly op: "agent";
+  readonly dst: string;
+  readonly agent: SymbolExpr;
+  readonly memory?: NameExpr;
 }
 
-export type ParallelMode = "all" | "allSettled" | "race";
-
-export interface ParallelBranch {
-  id: string;
-  body: FlowNode;
+export interface SystemPromptInstruction extends InstructionBase {
+  readonly op: "agent.sysprompt";
+  readonly agent: NameExpr;
+  readonly prompt: ValueExpr;
 }
 
-export interface ParallelNode extends NodeBase {
-  kind: "parallel";
-  branches: ParallelBranch[];
-  mode: ParallelMode;
-  assign?: SlotTarget;
+export type AgentWorkMode = "do" | "seqdo";
+
+export interface AgentWorkInstruction extends InstructionBase {
+  readonly op: "agent.do" | "agent.seqdo";
+  readonly dst: string;
+  readonly agent: NameExpr;
+  readonly mode: AgentWorkMode;
+  readonly role?: string;
+  readonly input: ValueExpr;
+  readonly schema?: SymbolExpr;
 }
 
-export interface RetryPolicy {
-  kind: "fixed" | "exponential";
-  delayMs: number;
-  maxDelayMs?: number;
+export interface PromptInstruction extends InstructionBase {
+  readonly op: "prompt";
+  readonly dst: string;
+  readonly source: ValueExpr;
+  readonly args: readonly ValueExpr[];
 }
 
-export interface RetryNode extends NodeBase {
-  kind: "retry";
-  body: FlowNode;
-  maxAttempts: number;
-  backoff?: RetryPolicy;
+export interface InputInstruction extends InstructionBase {
+  readonly op: "input";
+  readonly dst: string;
+  readonly prompt: ValueExpr;
+  readonly schema?: SymbolExpr;
 }
 
-export interface TimeoutNode extends NodeBase {
-  kind: "timeout";
-  body: FlowNode;
-  timeoutMs: number;
+export interface OperInstruction extends InstructionBase {
+  readonly op: "oper";
+  readonly dst: string;
+  readonly expression: OperExpr;
 }
 
-export interface CatchClause {
-  error: string;
-  body: FlowNode;
+export type ScriptLanguage = "python" | "typescript" | "shell";
+
+export interface ScriptInstruction extends InstructionBase {
+  readonly op: "script";
+  readonly dst: string;
+  readonly language: ScriptLanguage;
+  readonly source: string;
+  readonly args: readonly ValueExpr[];
 }
 
-export interface TryNode extends NodeBase {
-  kind: "try";
-  body: FlowNode;
-  catch?: CatchClause;
-  finally?: FlowNode;
+export interface CallInstruction extends InstructionBase {
+  readonly op: "call";
+  readonly dst: string;
+  readonly target: FlowTarget;
+  readonly args: readonly ValueExpr[];
 }
 
-export interface DelayNode extends NodeBase {
-  kind: "delay";
-  durationMs: Expr;
+export interface DispatchListInstruction extends InstructionBase {
+  readonly op: "dispatch.list";
+  readonly dst: string;
+  readonly calls: readonly FlowCallExpr[];
 }
 
-export interface EmitNode extends NodeBase {
-  kind: "emit";
-  event: string;
-  payload: Expr;
+export interface DispatchBatchInstruction extends InstructionBase {
+  readonly op: "dispatch.batch";
+  readonly dst: string;
+  readonly count: ValueExpr;
+  readonly target: FlowTarget;
+  readonly task: ValueExpr;
 }
 
-export interface AwaitEventNode extends NodeBase {
-  kind: "awaitEvent";
-  event: string;
-  assign?: SlotTarget;
-  timeoutMs?: number;
+export interface SyncInstruction extends InstructionBase {
+  readonly op: "sync";
+  readonly dst: string;
+  readonly taskGroup: NameExpr;
+  readonly formatter?: SymbolExpr;
 }
 
-export interface CheckpointNode extends NodeBase {
-  kind: "checkpoint";
-  label?: string;
+export interface ForkAction {
+  readonly mode: AgentWorkMode;
+  readonly role?: string;
+  readonly input: ValueExpr;
+  readonly schema?: SymbolExpr;
+  readonly span: SourceSpan;
 }
 
-export interface FreedomConstraints {
-  maxNodes: number;
-  maxDepth: number;
-  allowedNodeKinds?: FlowNode["kind"][];
-  allowedAgents?: string[];
-  allowedFlows?: string[];
-  allowRevision?: boolean;
+export interface ForkInstruction extends InstructionBase {
+  readonly op: "fork";
+  readonly dst: string;
+  readonly sourceAgent: NameExpr;
+  readonly actionReceiver: string;
+  readonly action: ForkAction;
 }
 
-export interface FreedomNode extends NodeBase {
-  kind: "freedom";
-  planner: string;
-  operation: string;
-  context: Expr;
-  constraints: FreedomConstraints;
-  assign?: SlotTarget;
+export interface InvokeInstruction extends InstructionBase {
+  readonly op: "invoke";
+  readonly dst: string;
+  readonly capability: SymbolExpr;
+  readonly args: readonly ValueExpr[];
 }
 
-export interface ReturnNode extends NodeBase {
-  kind: "return";
-  value: Expr;
+export interface MemoryAppendInstruction extends InstructionBase {
+  readonly op: "memory.append";
+  readonly memory: NameExpr;
+  readonly role: string;
+  readonly frag: ValueExpr;
 }
 
-export interface FailNode extends NodeBase {
-  kind: "fail";
-  error: Expr;
+export interface MemoryCopyInstruction extends InstructionBase {
+  readonly op: "memory.copy";
+  readonly dst: string;
+  readonly memory: NameExpr;
 }
 
-export type FlowNode =
-  | NoopNode
-  | SequenceNode
-  | AssignNode
-  | InvokeNode
-  | CallFlowNode
-  | BranchNode
-  | LoopNode
-  | ForEachNode
-  | ParallelNode
-  | RetryNode
-  | TimeoutNode
-  | TryNode
-  | DelayNode
-  | EmitNode
-  | AwaitEventNode
-  | CheckpointNode
-  | FreedomNode
-  | ReturnNode
-  | FailNode;
-
-export interface FlowDefinition {
-  input: DataSchema;
-  output: DataSchema;
-  state?: Record<string, SlotDeclaration>;
-  locals?: Record<string, SlotDeclaration>;
-  body: FlowNode;
+export interface MemoryApplyInstruction extends InstructionBase {
+  readonly op: "memory.apply";
+  readonly dst: string;
+  readonly sourceAgent: NameExpr;
+  readonly memory: NameExpr;
 }
 
-export interface AflProgram {
-  irVersion: "0.1";
-  name: string;
-  entry: string;
-  schemas?: Record<string, DataSchema>;
-  agents?: Record<string, AgentDeclaration>;
-  flows: Record<string, FlowDefinition>;
-  metadata?: Record<string, JsonValue>;
+export type FreedomMode = "move" | "flow";
+
+export interface FreedomInstruction extends InstructionBase {
+  readonly op: "freedom.move" | "freedom.flow";
+  readonly dst: string;
+  readonly mode: FreedomMode;
+  readonly planner: NameExpr;
+  readonly moves?: ValueExpr;
+  readonly prompt: ValueExpr;
+  readonly context: ValueExpr;
+  readonly schema?: SymbolExpr;
 }
 
-export type FreedomPlan =
-  | { kind: "continuation"; body: FlowNode }
-  | { kind: "revision"; flow: FlowDefinition; input: JsonValue };
+export type AflInstruction =
+  | AgentInstruction
+  | SystemPromptInstruction
+  | AgentWorkInstruction
+  | PromptInstruction
+  | InputInstruction
+  | OperInstruction
+  | ScriptInstruction
+  | CallInstruction
+  | DispatchListInstruction
+  | DispatchBatchInstruction
+  | SyncInstruction
+  | ForkInstruction
+  | InvokeInstruction
+  | MemoryAppendInstruction
+  | MemoryCopyInstruction
+  | MemoryApplyInstruction
+  | FreedomInstruction;
 
-export const FLOW_NODE_KINDS: ReadonlySet<FlowNode["kind"]> = new Set([
-  "noop",
-  "sequence",
-  "assign",
-  "invoke",
-  "callFlow",
-  "branch",
-  "loop",
-  "forEach",
-  "parallel",
-  "retry",
-  "timeout",
-  "try",
-  "delay",
-  "emit",
-  "awaitEvent",
-  "checkpoint",
-  "freedom",
-  "return",
-  "fail",
-]);
+export interface JumpTerminator extends InstructionBase {
+  readonly op: "jump";
+  readonly condition?: ValueExpr;
+  readonly trueTarget: string;
+  readonly falseTarget?: string;
+}
+
+export interface ReturnTerminator extends InstructionBase {
+  readonly op: "ret";
+  readonly value?: ValueExpr;
+}
+
+export interface FailTerminator extends InstructionBase {
+  readonly op: "fail";
+  readonly error: ValueExpr;
+}
+
+export type AflTerminator = JumpTerminator | ReturnTerminator | FailTerminator;
+
+export interface AflBlock {
+  readonly name: string;
+  readonly instructions: readonly AflInstruction[];
+  readonly terminator: AflTerminator;
+  readonly span: SourceSpan;
+}
+
+export interface AflNode {
+  readonly name: string;
+  readonly parameters: readonly string[];
+  readonly blocks: readonly AflBlock[];
+  readonly span: SourceSpan;
+}
+
+export interface AflModule {
+  readonly nodes: readonly AflNode[];
+  readonly sourceName?: string;
+}
+
+export function frag(content: string): Frag {
+  return { kind: "frag", content };
+}
+
+export function isFrag(value: unknown): value is Frag {
+  return isObject(value) && value.kind === "frag" && typeof value.content === "string";
+}
+
+export function symbol(name: string): SymbolRef {
+  if (!name.startsWith("@")) {
+    throw new TypeError("symbol name must start with '@'");
+  }
+  return { kind: "symbol", name: name as `@${string}` };
+}
+
+export function isComputeValue(value: unknown): value is ComputeValue {
+  if (
+    value === null ||
+    typeof value === "boolean" ||
+    typeof value === "string" ||
+    (typeof value === "number" && Number.isFinite(value))
+  ) {
+    return true;
+  }
+  if (Array.isArray(value)) {
+    return value.every(isComputeValue);
+  }
+  return isObject(value) && Object.values(value).every(isComputeValue);
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}

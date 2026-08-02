@@ -1,0 +1,6 @@
+main(task):
+    entry:
+        worker = agent @agent.smoke
+        worker.sysprompt "Follow the user's request and answer concisely."
+        result = worker.do task
+        ret result

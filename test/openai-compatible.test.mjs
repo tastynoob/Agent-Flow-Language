@@ -2,120 +2,104 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  AflRuntime,
+  FlowRuntimeError,
   OpenAICompatibleAgentAdapter,
+  symbol,
 } from "../dist/src/index.js";
-import { e, n, oneFlowProgram, s } from "./helpers.mjs";
 
-function chatProgram(outputSchema) {
-  return oneFlowProgram(
-    {
-      input: s.string(),
-      output: outputSchema,
-      body: n.sequence("root", [
-        n.invoke("generate", "writer", "generate", e.input(), {
-          scope: "local",
-          name: "result",
-        }),
-        n.return("return", e.local("result")),
-      ]),
-      locals: { result: { schema: outputSchema } },
-    },
-    {
-      writer: {
-        operations: {
-          generate: { input: s.string(), output: outputSchema },
-        },
-      },
-    },
-  );
-}
-
-test("OpenAI-compatible adapter maps an Agent operation to JSON chat completion", async () => {
-  const requests = [];
+test("OpenAI-compatible adapter maps Agent Memory and schema to chat completion", async () => {
+  let captured;
   const adapter = new OpenAICompatibleAgentAdapter({
-    baseUrl: "https://llm.example.test/v1/",
-    apiKey: () => "runtime-secret",
-    operations: {
-      "writer.generate": {
-        model: "test-model",
-        messages: (input) => [
-          { role: "system", content: "Return JSON." },
-          { role: "user", content: String(input) },
-        ],
-        output: "json",
-        maxTokens: 128,
+    baseUrl: "https://provider.example/v1/",
+    apiKey: "secret",
+    agents: {
+      "@agent.coder": {
+        model: "model-x",
+        temperature: 0.2,
+        maxTokens: 123,
+        jsonOutput: true,
       },
     },
     fetch: async (url, init) => {
-      requests.push({ url, init });
-      return new Response(
-        JSON.stringify({
-          id: "completion-1",
-          choices: [{ message: { role: "assistant", content: '{"text":"done"}' } }],
-        }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      );
+      captured = { url, init, body: JSON.parse(init.body) };
+      return new Response(JSON.stringify({ choices: [{ message: { content: "result" } }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
     },
   });
-  const outputSchema = s.object(
-    { text: s.string() },
-    { required: ["text"], additionalProperties: false },
+  const controller = new AbortController();
+  const result = await adapter.run({
+    runId: "run",
+    node: "main",
+    block: "entry",
+    mode: "seqdo",
+    agent: symbol("@agent.coder"),
+    systemPrompt: "system",
+    messages: [{ role: "user", content: "task" }],
+    schema: symbol("@schema.Result"),
+    signal: controller.signal,
+  });
+
+  assert.deepEqual(result, { output: "result" });
+  assert.equal(captured.url, "https://provider.example/v1/chat/completions");
+  assert.equal(captured.init.headers.authorization, "Bearer secret");
+  assert.deepEqual(captured.body.messages, [
+    { role: "system", content: "system" },
+    { role: "user", content: "task" },
+  ]);
+  assert.deepEqual(captured.body.response_format, { type: "json_object" });
+  assert.equal(captured.body.model, "model-x");
+  assert.equal(captured.body.max_tokens, 123);
+});
+
+test("OpenAI-compatible adapter redacts API keys from provider errors", async () => {
+  const secret = "do-not-leak";
+  const adapter = new OpenAICompatibleAgentAdapter({
+    baseUrl: "https://provider.example/v1",
+    apiKey: secret,
+    agents: { "@agent.coder": { model: "model-x" } },
+    fetch: async () => new Response(
+      JSON.stringify({ error: `provider reflected ${secret}` }),
+      { status: 401 },
+    ),
+  });
+
+  await assert.rejects(
+    adapter.run(request()),
+    (error) => {
+      assert.equal(error instanceof FlowRuntimeError, true);
+      assert.equal(error.code, "LLM_HTTP_ERROR");
+      assert.equal(JSON.stringify(error.serialize()).includes(secret), false);
+      assert.equal(JSON.stringify(error.serialize()).includes("[REDACTED]"), true);
+      return true;
+    },
   );
-  const runtime = new AflRuntime(chatProgram(outputSchema), { agents: adapter });
-
-  const result = await runtime.run("write it");
-
-  assert.deepEqual(result.output, { text: "done" });
-  assert.equal(requests[0].url, "https://llm.example.test/v1/chat/completions");
-  assert.equal(requests[0].init.headers.authorization, "Bearer runtime-secret");
-  const body = JSON.parse(requests[0].init.body);
-  assert.equal(body.model, "test-model");
-  assert.deepEqual(body.response_format, { type: "json_object" });
-  assert.equal(body.messages[1].content, "write it");
 });
 
-test("OpenAI-compatible adapter normalizes HTTP errors without exposing credentials", async () => {
+test("OpenAI-compatible adapter propagates AbortSignal cancellation", async () => {
   const adapter = new OpenAICompatibleAgentAdapter({
-    baseUrl: "https://llm.example.test",
-    apiKey: "do-not-leak",
-    operations: {
-      "writer.generate": {
-        model: "test-model",
-        messages: () => [{ role: "user", content: "hello" }],
-      },
-    },
-    fetch: async () =>
-      new Response(JSON.stringify({ error: { message: "rate limited" } }), { status: 429 }),
+    baseUrl: "https://provider.example/v1",
+    apiKey: "secret",
+    agents: { "@agent.coder": { model: "model-x" } },
+    fetch: async (_url, init) => new Promise((_resolve, reject) => {
+      init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+    }),
   });
-  const runtime = new AflRuntime(chatProgram(s.string()), { agents: adapter });
-
-  await assert.rejects(runtime.run("hello"), (error) => {
-    assert.equal(error.code, "LLM_HTTP_ERROR");
-    assert.equal(error.details.status, 429);
-    assert.equal(JSON.stringify(error).includes("do-not-leak"), false);
-    return true;
-  });
+  const controller = new AbortController();
+  const pending = adapter.run({ ...request(), signal: controller.signal });
+  controller.abort(new FlowRuntimeError("TEST_ABORT", "stop"));
+  await assert.rejects(pending, { code: "TEST_ABORT" });
 });
 
-test("OpenAI-compatible adapter preserves configuration errors", async () => {
-  const adapter = new OpenAICompatibleAgentAdapter({
-    baseUrl: "https://llm.example.test",
-    apiKey: "",
-    operations: {
-      "writer.generate": {
-        model: "test-model",
-        messages: () => [{ role: "user", content: "hello" }],
-      },
-    },
-    fetch: async () => {
-      throw new Error("fetch must not run");
-    },
-  });
-  const runtime = new AflRuntime(chatProgram(s.string()), { agents: adapter });
-
-  await assert.rejects(runtime.run("hello"), (error) => {
-    assert.equal(error.code, "LLM_API_KEY_MISSING");
-    return true;
-  });
-});
+function request() {
+  return {
+    runId: "run",
+    node: "main",
+    block: "entry",
+    mode: "do",
+    agent: symbol("@agent.coder"),
+    messages: [{ role: "user", content: "task" }],
+    signal: new AbortController().signal,
+  };
+}

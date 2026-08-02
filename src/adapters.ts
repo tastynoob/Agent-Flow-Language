@@ -1,76 +1,173 @@
 import type {
-  AgentDeclaration,
-  AgentOperationDeclaration,
-  AflProgram,
-  FreedomPlan,
-  JsonValue,
+  AflModule,
+  ComputeValue,
+  Frag,
+  ScriptLanguage,
+  SymbolRef,
 } from "./ir.js";
-import type { SerializedFlowError } from "./errors.js";
 
-export interface AgentInvokeRequest {
-  runId: string;
-  flowId: string;
-  nodeId: string;
-  agent: string;
-  operation: string;
-  declaration: AgentDeclaration;
-  operationDeclaration: AgentOperationDeclaration;
-  input: JsonValue;
-  signal: AbortSignal;
+export interface Message {
+  readonly role: string;
+  readonly content: string;
+}
+
+export interface AgentRunRequest {
+  readonly runId: string;
+  readonly node: string;
+  readonly block: string;
+  readonly mode: "do" | "seqdo";
+  readonly agent: SymbolRef;
+  readonly systemPrompt?: string;
+  readonly messages: readonly Message[];
+  readonly schema?: SymbolRef;
+  readonly signal: AbortSignal;
+}
+
+export interface AgentRunResult {
+  readonly output: string;
+  readonly messages?: readonly Message[];
 }
 
 export interface AgentAdapter {
-  invoke(request: AgentInvokeRequest): Promise<JsonValue>;
+  run(request: AgentRunRequest): Promise<AgentRunResult>;
 }
 
-export interface EventEmitRequest {
-  runId: string;
-  flowId: string;
-  nodeId: string;
-  event: string;
-  payload: JsonValue;
-  signal: AbortSignal;
+export interface PromptRenderRequest {
+  readonly prompt: SymbolRef;
+  readonly args: readonly PromptArgument[];
+  readonly signal: AbortSignal;
 }
 
-export interface EventWaitRequest {
-  runId: string;
-  flowId: string;
-  nodeId: string;
-  event: string;
-  signal: AbortSignal;
+export type PromptArgument = Frag | ComputeValue | SymbolRef;
+
+export interface PromptAdapter {
+  render(request: PromptRenderRequest): string | Promise<string>;
 }
 
-export interface EventAdapter {
-  emit(request: EventEmitRequest): Promise<void>;
-  wait(request: EventWaitRequest): Promise<JsonValue>;
+export interface InputRequest {
+  readonly runId: string;
+  readonly node: string;
+  readonly block: string;
+  readonly prompt: string;
+  readonly schema?: SymbolRef;
+  readonly signal: AbortSignal;
 }
 
-export interface CheckpointRequest {
-  runId: string;
-  flowId: string;
-  nodeId: string;
-  label?: string;
-  input: JsonValue;
-  state: Record<string, JsonValue>;
-  traceSequence: number;
-  signal: AbortSignal;
+export interface InputAdapter {
+  read(request: InputRequest): string | Promise<string>;
 }
 
-export interface CheckpointAdapter {
-  save(request: CheckpointRequest): Promise<void>;
+export interface ScriptRequest {
+  readonly language: ScriptLanguage;
+  readonly source: string;
+  readonly args: readonly ComputeValue[];
+  readonly signal: AbortSignal;
+}
+
+export interface ScriptAdapter {
+  execute(request: ScriptRequest): ComputeValue | Promise<ComputeValue>;
+}
+
+export interface CapabilityRequest {
+  readonly capability: SymbolRef;
+  readonly args: readonly PromptArgument[];
+  readonly signal: AbortSignal;
+}
+
+export interface CapabilityAdapter {
+  invoke(request: CapabilityRequest): string | Frag | Promise<string | Frag>;
+}
+
+export interface ExternalFlowRequest {
+  readonly flow: SymbolRef;
+  readonly args: readonly RuntimeArgument[];
+  readonly signal: AbortSignal;
+}
+
+export interface ExternalFlowAdapter {
+  invoke(request: ExternalFlowRequest): RuntimeArgument | Promise<RuntimeArgument>;
+}
+
+export interface FormatRequest {
+  readonly formatter: SymbolRef;
+  readonly values: readonly Frag[];
+  readonly signal: AbortSignal;
+}
+
+export interface FormatterAdapter {
+  format(request: FormatRequest): string | Promise<string>;
+}
+
+export interface SchemaValidationRequest {
+  readonly schema: SymbolRef;
+  readonly content: string;
+  readonly signal: AbortSignal;
+}
+
+export interface SchemaAdapter {
+  validate(request: SchemaValidationRequest): void | Promise<void>;
+}
+
+export interface MoveRequest {
+  readonly move: SymbolRef;
+  readonly args: readonly RuntimeArgument[];
+  readonly signal: AbortSignal;
+}
+
+export interface MoveAdapter {
+  execute(request: MoveRequest): string | Frag | Promise<string | Frag>;
+}
+
+export interface FreedomMovePlan {
+  readonly kind: "move";
+  readonly move: SymbolRef;
+  readonly args?: readonly RuntimeArgument[];
+}
+
+export interface FreedomExistingFlowPlan {
+  readonly kind: "flow";
+  readonly flow: SymbolRef;
+  readonly args?: readonly RuntimeArgument[];
+}
+
+export interface FreedomGeneratedFlowPlan {
+  readonly kind: "generated";
+  readonly source: string;
+  readonly entry: string;
+  readonly args?: readonly RuntimeArgument[];
+}
+
+export type FreedomPlan = FreedomMovePlan | FreedomExistingFlowPlan | FreedomGeneratedFlowPlan;
+
+export interface FreedomRequest {
+  readonly mode: "move" | "flow";
+  readonly planner: SymbolRef;
+  readonly systemPrompt?: string;
+  readonly messages: readonly Message[];
+  readonly moves?: readonly SymbolRef[];
+  readonly prompt: Frag;
+  readonly context: Frag;
+  readonly signal: AbortSignal;
+}
+
+export interface FreedomAdapter {
+  plan(request: FreedomRequest): FreedomPlan | Promise<FreedomPlan>;
 }
 
 export interface FreedomPolicyRequest {
-  program: AflProgram;
-  runId: string;
-  flowId: string;
-  nodeId: string;
-  plan: FreedomPlan;
-  planHash: string;
+  readonly module: AflModule;
+  readonly plan: FreedomPlan;
+  readonly runId: string;
+  readonly node: string;
+  readonly block: string;
 }
 
 export interface RuntimePolicy {
-  authorizeAgent?(request: AgentInvokeRequest): boolean | Promise<boolean>;
+  readonly maxConcurrency?: number;
+  readonly maxDispatchWorkers?: number;
+  readonly maxDispatchTasks?: number;
+  authorizeAgent?(request: AgentRunRequest): boolean | Promise<boolean>;
+  authorizeCapability?(request: CapabilityRequest): boolean | Promise<boolean>;
   approveFreedom?(request: FreedomPolicyRequest): boolean | Promise<boolean>;
 }
 
@@ -78,42 +175,54 @@ export type TraceEventType =
   | "run.started"
   | "run.completed"
   | "run.failed"
-  | "flow.started"
-  | "flow.completed"
-  | "flow.failed"
   | "node.started"
   | "node.completed"
   | "node.failed"
+  | "block.started"
+  | "block.completed"
+  | "instruction.started"
+  | "instruction.completed"
+  | "instruction.failed"
   | "agent.started"
   | "agent.completed"
   | "agent.failed"
-  | "event.emitted"
-  | "event.received"
-  | "checkpoint.created"
-  | "freedom.plan.created"
-  | "freedom.plan.accepted"
-  | "freedom.plan.rejected"
-  | "revision.created";
+  | "dispatch.started"
+  | "dispatch.completed"
+  | "fork.started"
+  | "fork.completed"
+  | "freedom.planned"
+  | "freedom.approved"
+  | "freedom.rejected";
 
 export interface TraceEvent {
-  sequence: number;
-  timestamp: string;
-  runId: string;
-  type: TraceEventType;
-  flowId?: string;
-  nodeId?: string;
-  details?: JsonValue;
-  error?: SerializedFlowError;
+  readonly sequence: number;
+  readonly timestamp: string;
+  readonly runId: string;
+  readonly type: TraceEventType;
+  readonly node?: string;
+  readonly block?: string;
+  readonly instruction?: number;
+  readonly details?: ComputeValue;
+  readonly error?: { readonly code: string; readonly message: string };
 }
 
 export interface TraceSink {
   emit(event: TraceEvent): void | Promise<void>;
 }
 
+export type RuntimeArgument = Frag | ComputeValue | SymbolRef;
+
 export interface RuntimeBindings {
-  agents: AgentAdapter;
-  events?: EventAdapter;
-  checkpoints?: CheckpointAdapter;
-  policy?: RuntimePolicy;
-  trace?: TraceSink;
+  readonly agents: AgentAdapter;
+  readonly prompts?: PromptAdapter;
+  readonly input?: InputAdapter;
+  readonly scripts?: ScriptAdapter;
+  readonly capabilities?: CapabilityAdapter;
+  readonly flows?: ExternalFlowAdapter;
+  readonly formatters?: FormatterAdapter;
+  readonly schemas?: SchemaAdapter;
+  readonly moves?: MoveAdapter;
+  readonly freedom?: FreedomAdapter;
+  readonly policy?: RuntimePolicy;
+  readonly trace?: TraceSink;
 }

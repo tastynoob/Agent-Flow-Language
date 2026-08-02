@@ -1,0 +1,4 @@
+main(value):
+    entry:
+        result = prompt "echo", value
+        ret result
