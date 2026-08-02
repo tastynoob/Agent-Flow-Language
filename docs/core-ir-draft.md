@@ -91,11 +91,11 @@ Node 可以通过 `call` 调用。循环由 basic block 之间的回跳形成，
 
 ## 5. Dependency 与并行
 
-AFL IR 不是把文本逐行翻译成单线程执行过程。一个 basic block 内，runtime 根据数据、flow 和运行资源之间的依赖判断哪些指令已经可以开始。
+AFL IR 不是把文本逐行翻译成单线程执行过程。一个 basic block 内，VM 根据数据、flow 和运行资源之间的依赖判断哪些指令已经可以开始。
 
 例如四个 Agent 分别执行互不依赖的工作时，四条调用可以并行；如果后续指令读取它们的结果，则等所需结果产生后再运行。`dispatch` 用于创建不继承某个 Agent 上下文的 child flow，`fork` 用于复制已有 Agent 的 Memory 并立即启动一个新 Agent 分支，`sync` 用于等待和收集 dispatch 结果。
 
-`dispatch` 有两种形式：`dispatch [flow_a(...), flow_b(...)]` 手工列出 child flow；`dispatch count, flow, task` 批量启动相同 flow。`new_agent = fork source_agent, new_agent.do task` 则把 `memory.copy`、`memory.apply` 和启动动作组合成一条上下文分支指令。Batch count 可以是常量，也可以由 Agent 输出后解析成整数。Runtime policy 可以限制同时运行数量，但不改变声明的逻辑 Worker 数量。
+`dispatch` 有两种形式：`dispatch [flow_a(...), flow_b(...)]` 手工列出 child flow；`dispatch count, flow, task` 批量启动相同 flow。`new_agent = fork source_agent, new_agent.do task` 则把 `memory.copy`、`memory.apply` 和启动动作组合成一条上下文分支指令。Batch count 可以是常量，也可以由 Agent 输出后解析成整数。VM policy 可以限制同时运行数量，但不改变声明的逻辑 Worker 数量。
 
 文本顺序、同一 Agent 的连续调用、memory 读写与显式 dependency 之间如何配合，见执行语义草案。这里的目标是同时容纳数据流并行和易读的 Agent 工作过程，而不是预设所有指令都串行或都并行。
 
@@ -152,7 +152,7 @@ memory.append coder.memory, user, review_result
 - `freedom.move` 从 flow 暴露的候选 move 中选择并执行一步；
 - `freedom.flow` 选择已有 flow，或生成一个有作用域的临时 child flow。
 
-两种结果都要经过 runtime 的接口、能力和 policy 检查。是否进一步支持修改当前 node 或创建长期 revision，仍需要结合真实案例继续收敛。
+两种结果都要经过 VM 的接口、能力和 policy 检查。是否进一步支持修改当前 node 或创建长期 revision，仍需要结合真实案例继续收敛。
 
 ## 10. 工具链
 
@@ -162,9 +162,9 @@ Python / TypeScript generator / future AFL DSL
                          v
                       AFL IR
                          |
-              validator / TypeScript runtime
+              validator / TypeScript VM
                          |
              Agent / Memory / Capability adapter
 ```
 
-当前文本草案尚未绑定 parser、validator 或 runtime 的内部数据结构。实现应以收敛后的语法和语义为输入，而不是从历史代码接口反推语言设计。
+当前文本草案尚未绑定 parser、validator 或 VM 的内部数据结构。实现应以收敛后的语法和语义为输入，而不是从历史代码接口反推语言设计。

@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  AflRuntime,
-  FlowRuntimeError,
+  AflVm,
+  AflVmError,
   MockAgentAdapter,
   frag,
   symbol,
@@ -11,7 +11,7 @@ import {
 
 test("prompt, input, script, capability, schema, formatter, and external flow bindings compose", async () => {
   const seen = { schemas: [], capability: false, flow: false, formatter: false };
-  const runtime = AflRuntime.fromSource(`
+  const vm = AflVm.fromSource(`
 identity(value):
     entry:
         ret value
@@ -70,7 +70,7 @@ main():
     },
   });
 
-  const result = await runtime.run();
+  const result = await vm.run();
   assert.equal(result.output.content, "page|external:answer");
   assert.deepEqual(seen.schemas, [["@schema.Answer", "answer"]]);
   assert.equal(seen.capability, true);
@@ -80,7 +80,7 @@ main():
 
 test("freedom.move executes only a selected candidate after policy approval", async () => {
   let approved = false;
-  const runtime = AflRuntime.fromSource(`
+  const vm = AflVm.fromSource(`
 main():
     entry:
         planner = agent @agent.planner
@@ -106,13 +106,13 @@ main():
       },
     },
   });
-  const result = await runtime.run();
+  const result = await vm.run();
   assert.equal(result.output.content, "executed:details");
   assert.equal(approved, true);
 });
 
 test("freedom rejects out-of-scope moves and validates generated AFL before execution", async () => {
-  const outOfScope = AflRuntime.fromSource(`
+  const outOfScope = AflVm.fromSource(`
 main():
     entry:
         planner = agent @agent.planner
@@ -125,7 +125,7 @@ main():
   });
   await assert.rejects(outOfScope.run(), { code: "FREEDOM_MOVE_OUT_OF_SCOPE" });
 
-  const generated = AflRuntime.fromSource(`
+  const generated = AflVm.fromSource(`
 main():
     entry:
         planner = agent @agent.planner
@@ -145,7 +145,7 @@ main():
   const result = await generated.run();
   assert.equal(result.output.content, "generated\n\nok");
 
-  const invalid = AflRuntime.fromSource(`
+  const invalid = AflVm.fromSource(`
 main():
     entry:
         planner = agent @agent.planner

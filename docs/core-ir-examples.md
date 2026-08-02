@@ -85,7 +85,7 @@ parallel_review(code):
         ret reports
 ```
 
-三个 Agent 调用彼此没有数据或 Memory 依赖，因此 runtime 可以同时启动。`prompt` 等三个 Frag 都完成后，再按 package formatter 把它们组合成新的 Frag。
+三个 Agent 调用彼此没有数据或 Memory 依赖，因此 VM 可以同时启动。`prompt` 等三个 Frag 都完成后，再按 package formatter 把它们组合成新的 Frag。
 
 ## 5. Dispatch Child Flow
 
@@ -210,7 +210,7 @@ route_task(task):
         ret result
 ```
 
-`freedom.flow` 在已知路由无法覆盖任务时接管，并返回 role-free Frag。Planner 的候选 child flow 仍需经过 runtime validation 和 policy 检查。
+`freedom.flow` 在已知路由无法覆盖任务时接管，并返回 role-free Frag。Planner 的候选 child flow 仍需经过 VM validation 和 policy 检查。
 
 ## 12. 可复用 Flow 集
 

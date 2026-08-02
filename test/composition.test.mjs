@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  AflRuntime,
-  FlowRuntimeError,
+  AflVm,
+  AflVmError,
   MockAgentAdapter,
   frag,
   parseAfl,
@@ -21,7 +21,7 @@ test("list dispatch preserves declaration order and batch dispatch uses dynamic 
       return frag(`done:${value}`);
     },
   };
-  const list = AflRuntime.fromSource(`
+  const list = AflVm.fromSource(`
 main():
     entry:
         jobs = dispatch [@flow.worker("slow"), @flow.worker("fast")]
@@ -33,7 +33,7 @@ main():
   assert.deepEqual(new Set(started), new Set(["slow", "fast"]));
 
   let calls = 0;
-  const batch = AflRuntime.fromSource(`
+  const batch = AflVm.fromSource(`
 main(task):
     entry:
         count = typescript "return Number(args[0])", "3"
@@ -62,7 +62,7 @@ main(task):
 
 test("dispatch child failure aborts unfinished siblings", async () => {
   let cancelled = false;
-  const runtime = AflRuntime.fromSource(`
+  const vm = AflVm.fromSource(`
 main():
     entry:
         jobs = dispatch [@flow.worker("wait"), @flow.worker("fail"), @flow.worker("wait-too")]
@@ -76,7 +76,7 @@ main():
         const value = argumentText(request.args[0]);
         if (value === "fail") {
           await delay(5);
-          throw new FlowRuntimeError("CHILD_FAILED", "child failed");
+          throw new AflVmError("CHILD_FAILED", "child failed");
         }
         await new Promise((resolve, reject) => {
           const timer = setTimeout(resolve, 500);
@@ -91,15 +91,15 @@ main():
     },
   });
 
-  await assert.rejects(runtime.run(), (error) => {
-    assert.equal(error instanceof FlowRuntimeError, true);
+  await assert.rejects(vm.run(), (error) => {
+    assert.equal(error instanceof AflVmError, true);
     return true;
   });
   assert.equal(cancelled, true);
 });
 
 test("local call receives a separate invocation and normalizes compute output to Frag", async () => {
-  const runtime = AflRuntime.fromSource(`
+  const vm = AflVm.fromSource(`
 double(value):
     entry:
         result = oper value * 2
@@ -109,12 +109,12 @@ main():
         result = call double, 21
         ret result
 `, { agents });
-  const result = await runtime.run();
+  const result = await vm.run();
   assert.deepEqual(result.output, { kind: "frag", content: "42" });
 });
 
 test("dispatch enforces the configured total task limit", async () => {
-  const runtime = AflRuntime.fromSource(`
+  const vm = AflVm.fromSource(`
 main():
     entry:
         jobs = dispatch 3, @flow.worker, "task"
@@ -125,7 +125,7 @@ main():
     policy: { maxDispatchTasks: 2 },
     flows: { invoke: () => frag("done") },
   });
-  await assert.rejects(runtime.run(), { code: "DISPATCH_TASK_LIMIT_EXCEEDED" });
+  await assert.rejects(vm.run(), { code: "DISPATCH_TASK_LIMIT_EXCEEDED" });
 });
 
 function delay(milliseconds) {

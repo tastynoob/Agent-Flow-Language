@@ -27,14 +27,14 @@ export class AflValidationError extends Error {
   }
 }
 
-export interface SerializedFlowError {
+export interface SerializedVmError {
   readonly code: string;
   readonly message: string;
   readonly span?: SourceSpan;
   readonly details?: ComputeValue;
 }
 
-export class FlowRuntimeError extends Error {
+export class AflVmError extends Error {
   readonly code: string;
   readonly span: SourceSpan | undefined;
   readonly details: ComputeValue | undefined;
@@ -45,24 +45,24 @@ export class FlowRuntimeError extends Error {
     options: { span?: SourceSpan; details?: ComputeValue; cause?: unknown } = {},
   ) {
     super(message, options.cause === undefined ? undefined : { cause: options.cause });
-    this.name = "FlowRuntimeError";
+    this.name = "AflVmError";
     this.code = code;
     this.span = options.span;
     this.details = options.details;
   }
 
-  withSpan(span: SourceSpan): FlowRuntimeError {
+  withSpan(span: SourceSpan): AflVmError {
     if (this.span !== undefined) {
       return this;
     }
-    return new FlowRuntimeError(this.code, this.message, {
+    return new AflVmError(this.code, this.message, {
       span,
       ...(this.details === undefined ? {} : { details: this.details }),
       cause: this,
     });
   }
 
-  serialize(): SerializedFlowError {
+  serialize(): SerializedVmError {
     return {
       code: this.code,
       message: this.message,
@@ -72,20 +72,20 @@ export class FlowRuntimeError extends Error {
   }
 }
 
-export function normalizeRuntimeError(
+export function normalizeVmError(
   error: unknown,
   span?: SourceSpan,
-): FlowRuntimeError {
-  if (error instanceof FlowRuntimeError) {
+): AflVmError {
+  if (error instanceof AflVmError) {
     return span === undefined ? error : error.withSpan(span);
   }
   if (error instanceof Error) {
-    return new FlowRuntimeError("ADAPTER_ERROR", error.message, {
+    return new AflVmError("ADAPTER_ERROR", error.message, {
       ...(span === undefined ? {} : { span }),
       cause: error,
     });
   }
-  return new FlowRuntimeError("UNKNOWN_ERROR", "unknown runtime error", {
+  return new AflVmError("UNKNOWN_ERROR", "unknown VM error", {
     ...(span === undefined ? {} : { span }),
     ...(isComputeDetail(error) ? { details: error } : {}),
     cause: error,

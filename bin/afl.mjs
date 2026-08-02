@@ -6,9 +6,9 @@ import { pathToFileURL } from "node:url";
 
 import {
   AflParseError,
-  AflRuntime,
+  AflVm,
   AflValidationError,
-  FlowRuntimeError,
+  AflVmError,
   MemoryTraceSink,
   parseAfl,
   validateModule,
@@ -35,15 +35,15 @@ if ((command !== "validate" && command !== "run") || file === undefined) {
       const options = parseRunOptions(args);
       const bindings = options.adapter === undefined ? missingAgentBindings() : await loadBindings(options.adapter);
       const trace = options.trace === undefined ? undefined : new MemoryTraceSink();
-      const runtime = new AflRuntime(module, {
+      const vm = new AflVm(module, {
         ...bindings,
         ...(trace === undefined ? {} : { trace }),
       });
-      const runtimeArgs = options.argsFile === undefined
+      const vmArgs = options.argsFile === undefined
         ? JSON.parse(options.args ?? "[]")
         : JSON.parse(await readFile(resolve(options.argsFile), "utf8"));
-      if (!Array.isArray(runtimeArgs)) throw new Error("--args must decode to a JSON array");
-      const result = await runtime.run(options.entry ?? "main", runtimeArgs, {
+      if (!Array.isArray(vmArgs)) throw new Error("--args must decode to a JSON array");
+      const result = await vm.run(options.entry ?? "main", vmArgs, {
         ...(options.runId === undefined ? {} : { runId: options.runId }),
       });
       process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
@@ -52,7 +52,7 @@ if ((command !== "validate" && command !== "run") || file === undefined) {
       }
     }
   } catch (error) {
-    if (error instanceof FlowRuntimeError) {
+    if (error instanceof AflVmError) {
       process.stderr.write(`${JSON.stringify(error.serialize(), null, 2)}\n`);
     } else if (error instanceof AflParseError || error instanceof AflValidationError) {
       process.stderr.write(`${JSON.stringify({ message: error.message, diagnostics: error.diagnostics }, null, 2)}\n`);
@@ -93,7 +93,7 @@ async function loadBindings(modulePath) {
   const loaded = await import(pathToFileURL(resolve(modulePath)).href);
   const bindings = loaded.default ?? loaded.bindings;
   if (bindings === undefined || typeof bindings !== "object" || bindings.agents === undefined) {
-    throw new Error("adapter module must export default RuntimeBindings or a named 'bindings'");
+    throw new Error("adapter module must export default VmBindings or a named 'bindings'");
   }
   return bindings;
 }
@@ -102,7 +102,7 @@ function missingAgentBindings() {
   return {
     agents: {
       async run(request) {
-        throw new FlowRuntimeError(
+        throw new AflVmError(
           "AGENT_ADAPTER_MISSING",
           `no adapter configured for '${request.agent.name}'`,
         );

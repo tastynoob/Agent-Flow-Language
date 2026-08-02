@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  AflRuntime,
+  AflVm,
   MockAgentAdapter,
   parseAfl,
 } from "../dist/src/index.js";
@@ -24,7 +24,7 @@ test("coder-reviewer loop copies current context and returns defects for revisio
     return reviewerRuns === 1 ? "P1: add tests" : "finish";
   });
 
-  const runtime = AflRuntime.fromSource(`
+  const vm = AflVm.fromSource(`
 main(task):
     entry:
         coder = agent @agent.coder
@@ -44,7 +44,7 @@ main(task):
         ret code
 `, { agents });
 
-  const result = await runtime.run("main", ["build feature"]);
+  const result = await vm.run("main", ["build feature"]);
   assert.deepEqual(result.output, { kind: "frag", content: "fixed-v2" });
   assert.equal(coderRuns, 2);
   assert.equal(reviewerRuns, 2);
@@ -62,7 +62,7 @@ test("independent Agents run concurrently while one Agent remains ordered", asyn
     return request.messages.at(-1).content;
   };
   agents.on("@agent.left", handler).on("@agent.right", handler);
-  const parallel = AflRuntime.fromSource(`
+  const parallel = AflVm.fromSource(`
 main():
     entry:
         left = agent @agent.left
@@ -77,7 +77,7 @@ main():
 
   active = 0;
   maximum = 0;
-  const ordered = AflRuntime.fromSource(`
+  const ordered = AflVm.fromSource(`
 main():
     entry:
         worker = agent @agent.left
@@ -107,7 +107,7 @@ test("fork snapshots source Memory, isolates branches, and runs branches concurr
     }
     return `out:${input}`;
   });
-  const runtime = AflRuntime.fromSource(`
+  const vm = AflVm.fromSource(`
 main():
     entry:
         source = agent @agent.worker
@@ -120,7 +120,7 @@ main():
         result = prompt "done", left_result, right_result, source_result
         ret result
 `, { agents });
-  await runtime.run();
+  await vm.run();
 
   assert.equal(branchMaximum, 2);
   const leftEnd = calls.find((call) => call.input === "left-end");
@@ -139,7 +139,7 @@ test("memory.append and memory.apply preserve roles without sharing source state
     requests.push(request.messages.map((message) => ({ ...message })));
     return `out:${request.messages.at(-1).content}`;
   });
-  const runtime = AflRuntime.fromSource(`
+  const vm = AflVm.fromSource(`
 main():
     entry:
         source = agent @agent.worker
@@ -152,7 +152,7 @@ main():
         result = prompt "done", branch_result, source_result
         ret result
 `, { agents });
-  await runtime.run();
+  await vm.run();
 
   const branch = requests.find((messages) => messages.at(-1).content === "branch");
   const source = requests.find((messages) => messages.at(-1).content === "source");
@@ -163,7 +163,7 @@ main():
   assert.equal(source.some((message) => message.content === "observation"), false);
 });
 
-test("aliased Agent parameters are ordered by runtime handle identity", async () => {
+test("aliased Agent parameters are ordered by VM handle identity", async () => {
   let active = 0;
   let maximum = 0;
   const order = [];
@@ -176,7 +176,7 @@ test("aliased Agent parameters are ordered by runtime handle identity", async ()
     active -= 1;
     return input;
   });
-  const runtime = AflRuntime.fromSource(`
+  const vm = AflVm.fromSource(`
 use_twice(first, second):
     entry:
         one = first.do "one"
@@ -188,9 +188,20 @@ main():
         result = call use_twice, worker, worker
         ret result
 `, { agents });
-  await runtime.run();
+  await vm.run();
   assert.equal(maximum, 1);
   assert.deepEqual(order, ["one", "two"]);
+});
+
+test("VM requires an Agent binding only when Agent work executes", async () => {
+  const vm = AflVm.fromSource(`
+main():
+    entry:
+        worker = agent @agent.worker
+        result = worker.do "work"
+        ret result
+`, {});
+  await assert.rejects(vm.run(), { code: "AGENT_ADAPTER_MISSING" });
 });
 
 function delay(milliseconds) {

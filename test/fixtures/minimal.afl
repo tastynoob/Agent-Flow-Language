@@ -1,0 +1,4 @@
+main():
+    entry:
+        result = prompt "afl-vm-ok"
+        ret result

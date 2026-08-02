@@ -30,7 +30,7 @@ JSON 可以作为 Frag content 的一种格式，但 Memory 不要求内容必�
 
 ## 2. Agent 默认绑定
 
-创建 Agent 时，runtime 默认同时创建并绑定一份 working Memory：
+创建 Agent 时，VM 默认同时创建并绑定一份 working Memory：
 
 ```text
 coder = agent @agent.coder
@@ -38,7 +38,7 @@ coder = agent @agent.coder
 
 后续 `coder.do/seqdo` 自动使用 `coder.memory`，不需要每次显式传入 Memory handle。
 
-默认 Memory 至少在当前 node invocation 内保持。跨 invocation 或长期持久化可以由 runtime 提供持久 handle，不改变 Agent 指令形式。
+默认 Memory 至少在当前 node invocation 内保持。跨 invocation 或长期持久化可以由 VM 提供持久 handle，不改变 Agent 指令形式。
 
 ## 3. Agent 输入与输出
 
@@ -124,7 +124,7 @@ branch = memory.apply source_agent, branch_memory
 coder.sysprompt @prompt.coder
 ```
 
-`sysprompt` 隐含 `system` role。Runtime 可以把 system prompt 保存为 Memory 中的特殊 Message，也可以映射为 provider 的独立配置；对 AFL flow 来说，它都属于该 Agent 后续可见的 system context。
+`sysprompt` 隐含 `system` role。VM 可以把 system prompt 保存为 Memory 中的特殊 Message，也可以映射为 provider 的独立配置；对 AFL flow 来说，它都属于该 Agent 后续可见的 system context。
 
 设置 Reviewer system prompt 不会修改被复制的 Coder Memory，也不会反向影响 Coder 配置。
 

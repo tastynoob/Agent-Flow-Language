@@ -41,7 +41,7 @@ parallel_security_review(code):
         ret result
 ```
 
-`reviewer_count` 是 compute value。Planner 返回的 Frag 需要由 script executor 解析并校验为非负整数；Runtime policy 还可以设置允许的最大值。
+`reviewer_count` 是 compute value。Planner 返回的 Frag 需要由 script executor 解析并校验为非负整数；VM policy 还可以设置允许的最大值。
 
 `dispatch reviewer_count, review_once, code` 创建 `reviewer_count` 次 `review_once(code)`。每次调用拥有独立的 node invocation、Agent 和默认 Memory，但接收相同的 `code` Frag。各 Worker 之间没有数据或 Memory dependency，因此可以并行运行；`sync` 是它们的汇合点。
 
@@ -88,13 +88,13 @@ List 版本则说明，同一个并行原语也可以描述固定的多专家审
 这个案例也留下几项需要继续收敛的语义：
 
 - Batch Worker 是否需要可选的实例序号或实例 metadata；
-- `count` 的数值校验、最大值和资源预算由 validator 还是 Runtime policy 负责；
+- `count` 的数值校验、最大值和资源预算由 validator 还是 VM policy 负责；
 - 单个 child 失败时，`sync` 采用整体失败还是允许 all-settled；
 - 结果顺序按声明顺序、实例序号还是完成顺序确定；
 - 相同 flow、task、模型配置和确定性推理可能产生重复结果，voting flow 如何声明采样差异；
 - 若后续需要把不同 task 逐项分发给同一个 flow，应设计独立的 map 语义，而不是改变 batch dispatch。
 
-这些问题不妨碍当前两种 `dispatch` 形式描述基础 Parallel Voting，但会影响 Runtime 的可复现性和容错行为。
+这些问题不妨碍当前两种 `dispatch` 形式描述基础 Parallel Voting，但会影响 VM 的可复现性和容错行为。
 
 ## 7. 结论
 

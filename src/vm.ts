@@ -2,8 +2,8 @@ import type {
   AgentRunRequest,
   FreedomPlan,
   PromptArgument,
-  RuntimeArgument,
-  RuntimeBindings,
+  VmArgument,
+  VmBindings,
   TraceEvent,
   TraceEventType,
 } from "./adapters.js";
@@ -20,7 +20,7 @@ import {
   evaluateValue,
   formatCompute,
 } from "./evaluator.js";
-import { FlowRuntimeError, normalizeRuntimeError } from "./errors.js";
+import { AflVmError, normalizeVmError } from "./errors.js";
 import {
   frag,
   isComputeValue,
@@ -46,30 +46,30 @@ import {
   isSymbolRef,
   type AgentHandle,
   type MemoryHandle,
-  type RuntimeValue,
+  type VmValue,
   type TaskGroupHandle,
-} from "./runtime-values.js";
+} from "./vm-values.js";
 import { assertValidModule } from "./validation.js";
 
-export interface RunOptions {
+export interface VmRunOptions {
   readonly runId?: string;
   readonly signal?: AbortSignal;
   readonly maxSteps?: number;
 }
 
-export interface RunResult {
+export interface VmRunResult {
   readonly runId: string;
-  readonly output: RuntimeValue;
+  readonly output: VmValue;
 }
 
 interface MutableFrame {
   readonly module: AflModule;
   readonly node: AflNode;
-  readonly values: Map<string, RuntimeValue>;
+  readonly values: Map<string, VmValue>;
   readonly taskGroups: Set<TaskGroupHandle>;
 }
 
-interface RunContext {
+interface VmRunContext {
   readonly runId: string;
   readonly signal: AbortSignal;
   readonly maxSteps: number;
@@ -90,36 +90,36 @@ interface TraceLocation {
 
 let runSequence = 0;
 
-export class AflRuntime {
+export class AflVm {
   readonly module: AflModule;
-  readonly bindings: RuntimeBindings;
+  readonly bindings: VmBindings;
 
-  constructor(module: AflModule, bindings: RuntimeBindings) {
+  constructor(module: AflModule, bindings: VmBindings) {
     this.module = assertValidModule(module);
     this.bindings = bindings;
   }
 
-  static fromSource(source: string, bindings: RuntimeBindings, sourceName?: string): AflRuntime {
-    return new AflRuntime(parseAfl(source, sourceName), bindings);
+  static fromSource(source: string, bindings: VmBindings, sourceName?: string): AflVm {
+    return new AflVm(parseAfl(source, sourceName), bindings);
   }
 
   async run(
     entry = "main",
-    args: readonly RuntimeArgument[] = [],
-    options: RunOptions = {},
-  ): Promise<RunResult> {
+    args: readonly VmArgument[] = [],
+    options: VmRunOptions = {},
+  ): Promise<VmRunResult> {
     const linked = linkedController(options.signal);
     const maxSteps = options.maxSteps ?? 100_000;
     const maxConcurrency = this.bindings.policy?.maxConcurrency ?? 32;
     if (!Number.isInteger(maxSteps) || maxSteps <= 0) {
       linked.dispose();
-      throw new FlowRuntimeError("RUN_OPTIONS_INVALID", "maxSteps must be a positive integer");
+      throw new AflVmError("RUN_OPTIONS_INVALID", "maxSteps must be a positive integer");
     }
     if (!Number.isInteger(maxConcurrency) || maxConcurrency <= 0) {
       linked.dispose();
-      throw new FlowRuntimeError("RUNTIME_POLICY_INVALID", "maxConcurrency must be a positive integer");
+      throw new AflVmError("VM_POLICY_INVALID", "maxConcurrency must be a positive integer");
     }
-    const context: RunContext = {
+    const context: VmRunContext = {
       runId: options.runId ?? createRunId(),
       signal: linked.controller.signal,
       maxSteps,
@@ -133,11 +133,11 @@ export class AflRuntime {
       await this.trace(context, "run.completed", {}, { entry });
       return { runId: context.runId, output };
     } catch (error) {
-      const runtimeError = normalizeRuntimeError(error);
-      await this.trace(context, "run.failed", {}, undefined, runtimeError);
-      throw runtimeError;
+      const vmError = normalizeVmError(error);
+      await this.trace(context, "run.failed", {}, undefined, vmError);
+      throw vmError;
     } finally {
-      linked.controller.abort(new FlowRuntimeError("RUN_CLOSED", "AFL run has closed"));
+      linked.controller.abort(new AflVmError("RUN_CLOSED", "AFL run has closed"));
       linked.dispose();
     }
   }
@@ -145,18 +145,18 @@ export class AflRuntime {
   private async executeNode(
     module: AflModule,
     nodeName: string,
-    args: readonly RuntimeValue[],
-    context: RunContext,
+    args: readonly VmValue[],
+    context: VmRunContext,
     invocationSignal: AbortSignal = context.signal,
-  ): Promise<RuntimeValue> {
+  ): Promise<VmValue> {
     throwIfAborted(invocationSignal);
     this.takeStep(context, `node '${nodeName}'`, invocationSignal);
     const node = module.nodes.find((candidate) => candidate.name === nodeName);
     if (node === undefined) {
-      throw new FlowRuntimeError("FLOW_UNKNOWN", `node '${nodeName}' is not declared`);
+      throw new AflVmError("FLOW_UNKNOWN", `node '${nodeName}' is not declared`);
     }
     if (args.length !== node.parameters.length) {
-      throw new FlowRuntimeError(
+      throw new AflVmError(
         "CALL_ARITY",
         `node '${nodeName}' expects ${node.parameters.length} arguments, received ${args.length}`,
         { span: node.span },
@@ -165,7 +165,7 @@ export class AflRuntime {
     const frame: MutableFrame = {
       module,
       node,
-      values: new Map(node.parameters.map((parameter, index) => [parameter, cloneRuntimeValue(args[index]!)])),
+      values: new Map(node.parameters.map((parameter, index) => [parameter, cloneVmValue(args[index]!)])),
       taskGroups: new Set(),
     };
     await this.trace(context, "node.started", { node: node.name });
@@ -175,7 +175,7 @@ export class AflRuntime {
       for (;;) {
         const block = blocks.get(blockName);
         if (block === undefined) {
-          throw new FlowRuntimeError("BLOCK_UNKNOWN", `block '${blockName}' is not declared`, { span: node.span });
+          throw new AflVmError("BLOCK_UNKNOWN", `block '${blockName}' is not declared`, { span: node.span });
         }
         this.takeStep(context, `block '${node.name}.${block.name}'`, invocationSignal);
         await this.executeBlock(frame, block, context, invocationSignal);
@@ -188,14 +188,14 @@ export class AflRuntime {
         }
         if (terminator.op === "fail") {
           const value = evaluateValue(terminator.error, frame);
-          throw new FlowRuntimeError("FLOW_FAILED", failureMessage(value), { span: terminator.span });
+          throw new AflVmError("FLOW_FAILED", failureMessage(value), { span: terminator.span });
         }
         if (terminator.condition === undefined) {
           blockName = terminator.trueTarget;
         } else {
           const condition = asCompute(evaluateValue(terminator.condition, frame), terminator.span, "jump condition");
           if (typeof condition !== "boolean") {
-            throw new FlowRuntimeError("JUMP_CONDITION_NOT_BOOLEAN", "jump condition must be boolean", {
+            throw new AflVmError("JUMP_CONDITION_NOT_BOOLEAN", "jump condition must be boolean", {
               span: terminator.span,
             });
           }
@@ -207,16 +207,16 @@ export class AflRuntime {
       if (frame.taskGroups.size > 0) {
         await Promise.allSettled([...frame.taskGroups].flatMap((group) => group.tasks));
       }
-      const runtimeError = normalizeRuntimeError(error, node.span);
-      await this.trace(context, "node.failed", { node: node.name }, undefined, runtimeError);
-      throw runtimeError;
+      const vmError = normalizeVmError(error, node.span);
+      await this.trace(context, "node.failed", { node: node.name }, undefined, vmError);
+      throw vmError;
     }
   }
 
   private async executeBlock(
     frame: MutableFrame,
     block: AflBlock,
-    context: RunContext,
+    context: VmRunContext,
     invocationSignal: AbortSignal,
   ): Promise<void> {
     await this.trace(context, "block.started", { node: frame.node.name, block: block.name });
@@ -236,7 +236,7 @@ export class AflRuntime {
       await new Promise<void>((resolve, reject) => {
         let active = 0;
         let completed = 0;
-        let failure: FlowRuntimeError | undefined;
+        let failure: AflVmError | undefined;
         const started = new Set<number>();
 
         const settle = (): void => {
@@ -262,7 +262,7 @@ export class AflRuntime {
               })
               .catch((error: unknown) => {
                 if (failure === undefined) {
-                  failure = normalizeRuntimeError(error, instruction.span);
+                  failure = normalizeVmError(error, instruction.span);
                   linked.controller.abort(failure);
                 }
                 active -= 1;
@@ -270,7 +270,7 @@ export class AflRuntime {
               });
           }
           if (active === 0 && completed < block.instructions.length && failure === undefined) {
-            failure = new FlowRuntimeError("DEPENDENCY_DEADLOCK", `block '${block.name}' cannot make progress`, {
+            failure = new AflVmError("DEPENDENCY_DEADLOCK", `block '${block.name}' cannot make progress`, {
               span: block.span,
             });
             settle();
@@ -290,9 +290,9 @@ export class AflRuntime {
     block: AflBlock,
     instruction: AflInstruction,
     index: number,
-    context: RunContext,
+    context: VmRunContext,
     signal: AbortSignal,
-  ): Promise<RuntimeValue | undefined> {
+  ): Promise<VmValue | undefined> {
     throwIfAborted(signal);
     this.takeStep(context, `instruction '${instruction.op}'`, signal);
     const location = { node: frame.node.name, block: block.name, instruction: index };
@@ -302,19 +302,19 @@ export class AflRuntime {
       await this.trace(context, "instruction.completed", location, { op: instruction.op });
       return value;
     } catch (error) {
-      const runtimeError = normalizeRuntimeError(error, instruction.span);
-      await this.trace(context, "instruction.failed", location, { op: instruction.op }, runtimeError);
-      throw runtimeError;
+      const vmError = normalizeVmError(error, instruction.span);
+      await this.trace(context, "instruction.failed", location, { op: instruction.op }, vmError);
+      throw vmError;
     }
   }
 
   private async executeInstructionInner(
     frame: MutableFrame,
     instruction: AflInstruction,
-    context: RunContext,
+    context: VmRunContext,
     location: Required<TraceLocation>,
     signal: AbortSignal,
-  ): Promise<RuntimeValue | undefined> {
+  ): Promise<VmValue | undefined> {
     switch (instruction.op) {
       case "agent": {
         const memory = instruction.memory === undefined
@@ -322,7 +322,7 @@ export class AflRuntime {
           : asMemory(evaluateValue(instruction.memory, frame), instruction.memory.span);
         return context.locks.use([{ key: memory.id, mode: "write" }], signal, () => {
           if (memory.owner !== undefined) {
-            throw new FlowRuntimeError("MEMORY_ALREADY_BOUND", "Memory is already bound to an Agent", {
+            throw new AflVmError("MEMORY_ALREADY_BOUND", "Memory is already bound to an Agent", {
               span: instruction.span,
             });
           }
@@ -358,7 +358,7 @@ export class AflRuntime {
         return this.renderPrompt(instruction.source, instruction.args, frame, signal);
       case "input": {
         if (this.bindings.input === undefined) {
-          throw new FlowRuntimeError("INPUT_ADAPTER_MISSING", "input requires an Input binding", {
+          throw new AflVmError("INPUT_ADAPTER_MISSING", "input requires an Input binding", {
             span: instruction.span,
           });
         }
@@ -372,7 +372,7 @@ export class AflRuntime {
           signal,
         });
         if (typeof content !== "string") {
-          throw new FlowRuntimeError("INPUT_RESULT_INVALID", "Input binding returned a non-string value", {
+          throw new AflVmError("INPUT_RESULT_INVALID", "Input binding returned a non-string value", {
             span: instruction.span,
           });
         }
@@ -383,7 +383,7 @@ export class AflRuntime {
         return evaluateOper(instruction.expression, frame);
       case "script": {
         if (this.bindings.scripts === undefined) {
-          throw new FlowRuntimeError("SCRIPT_ADAPTER_MISSING", `${instruction.language} requires a Script binding`, {
+          throw new AflVmError("SCRIPT_ADAPTER_MISSING", `${instruction.language} requires a Script binding`, {
             span: instruction.span,
           });
         }
@@ -399,7 +399,7 @@ export class AflRuntime {
           signal,
         })));
         if (!isComputeValue(result)) {
-          throw new FlowRuntimeError("SCRIPT_RESULT_INVALID", "Script binding returned a non-compute value", {
+          throw new AflVmError("SCRIPT_RESULT_INVALID", "Script binding returned a non-compute value", {
             span: instruction.span,
           });
         }
@@ -423,14 +423,14 @@ export class AflRuntime {
       case "dispatch.batch": {
         const count = asCompute(evaluateValue(instruction.count, frame), instruction.count.span, "dispatch count");
         if (!Number.isInteger(count) || typeof count !== "number" || count < 0) {
-          throw new FlowRuntimeError("DISPATCH_COUNT_INVALID", "dispatch count must be a non-negative integer", {
+          throw new AflVmError("DISPATCH_COUNT_INVALID", "dispatch count must be a non-negative integer", {
             span: instruction.count.span,
           });
         }
         const task = evaluateValue(instruction.task, frame);
         const calls = Array.from({ length: count }, () => ({
           target: instruction.target,
-          args: [cloneRuntimeValue(task)],
+          args: [cloneVmValue(task)],
           span: instruction.span,
         }));
         return this.startDispatch(frame, calls, context, location, signal);
@@ -438,7 +438,7 @@ export class AflRuntime {
       case "sync": {
         const group = asTaskGroup(evaluateValue(instruction.taskGroup, frame), instruction.taskGroup.span);
         if (group.consumed) {
-          throw new FlowRuntimeError("TASK_GROUP_ALREADY_SYNCED", "TaskGroup has already been synced", {
+          throw new AflVmError("TASK_GROUP_ALREADY_SYNCED", "TaskGroup has already been synced", {
             span: instruction.span,
           });
         }
@@ -457,7 +457,7 @@ export class AflRuntime {
               signal,
             });
         if (typeof content !== "string") {
-          throw new FlowRuntimeError("FORMATTER_RESULT_INVALID", "Formatter binding returned a non-string value", {
+          throw new AflVmError("FORMATTER_RESULT_INVALID", "Formatter binding returned a non-string value", {
             span: instruction.span,
           });
         }
@@ -496,7 +496,7 @@ export class AflRuntime {
       }
       case "invoke": {
         if (this.bindings.capabilities === undefined) {
-          throw new FlowRuntimeError("CAPABILITY_ADAPTER_MISSING", "invoke requires a Capability binding", {
+          throw new AflVmError("CAPABILITY_ADAPTER_MISSING", "invoke requires a Capability binding", {
             span: instruction.span,
           });
         }
@@ -507,7 +507,7 @@ export class AflRuntime {
         };
         const approved = await this.bindings.policy?.authorizeCapability?.(request);
         if (approved === false) {
-          throw new FlowRuntimeError("CAPABILITY_DENIED", `capability '${request.capability.name}' was denied`, {
+          throw new AflVmError("CAPABILITY_DENIED", `capability '${request.capability.name}' was denied`, {
             span: instruction.span,
           });
         }
@@ -516,7 +516,7 @@ export class AflRuntime {
         ));
         if (typeof result === "string") return frag(result);
         if (isFrag(result)) return result;
-        throw new FlowRuntimeError("CAPABILITY_RESULT_INVALID", "Capability binding returned an invalid value", {
+        throw new AflVmError("CAPABILITY_RESULT_INVALID", "Capability binding returned an invalid value", {
           span: instruction.span,
         });
       }
@@ -545,7 +545,7 @@ export class AflRuntime {
           signal,
           () => {
             if (memory.owner !== undefined) {
-              throw new FlowRuntimeError("MEMORY_ALREADY_BOUND", "Memory is already bound to an Agent", {
+              throw new AflVmError("MEMORY_ALREADY_BOUND", "Memory is already bound to an Agent", {
                 span: instruction.span,
               });
             }
@@ -568,10 +568,17 @@ export class AflRuntime {
     role: string,
     input: Frag,
     schema: SymbolExpr | undefined,
-    context: RunContext,
+    context: VmRunContext,
     location: Required<TraceLocation>,
     signal: AbortSignal,
   ): Promise<Frag> {
+    const agentAdapter = this.bindings.agents;
+    if (agentAdapter === undefined) {
+      throw new AflVmError(
+        "AGENT_ADAPTER_MISSING",
+        `Agent '${agent.agent.name}' requires an Agent binding`,
+      );
+    }
     return context.locks.use(
       [{ key: agent.id, mode: "write" }, { key: agent.memory.id, mode: "write" }],
       signal,
@@ -590,18 +597,18 @@ export class AflRuntime {
         };
         const approved = await this.bindings.policy?.authorizeAgent?.(request);
         if (approved === false) {
-          throw new FlowRuntimeError("AGENT_DENIED", `Agent '${agent.agent.name}' was denied`);
+          throw new AflVmError("AGENT_DENIED", `Agent '${agent.agent.name}' was denied`);
         }
         await this.trace(context, "agent.started", location, { agent: agent.id, mode });
         try {
-          const result = await context.external.use(signal, () => this.bindings.agents.run(request));
+          const result = await context.external.use(signal, () => agentAdapter.run(request));
           if (typeof result.output !== "string") {
-            throw new FlowRuntimeError("AGENT_OUTPUT_INVALID", "Agent adapter output must be a string");
+            throw new AflVmError("AGENT_OUTPUT_INVALID", "Agent adapter output must be a string");
           }
           await this.validateSchema(result.output, schema, signal);
           for (const message of result.messages ?? []) {
             if (typeof message.role !== "string" || typeof message.content !== "string") {
-              throw new FlowRuntimeError("AGENT_MESSAGES_INVALID", "Agent adapter returned an invalid Message");
+              throw new AflVmError("AGENT_MESSAGES_INVALID", "Agent adapter returned an invalid Message");
             }
             agent.memory.messages.push({ role: message.role, content: message.content });
           }
@@ -609,9 +616,9 @@ export class AflRuntime {
           await this.trace(context, "agent.completed", location, { agent: agent.id, mode });
           return frag(result.output);
         } catch (error) {
-          const runtimeError = normalizeRuntimeError(error);
-          await this.trace(context, "agent.failed", location, { agent: agent.id, mode }, runtimeError);
-          throw runtimeError;
+          const vmError = normalizeVmError(error);
+          await this.trace(context, "agent.failed", location, { agent: agent.id, mode }, vmError);
+          throw vmError;
         }
       },
     );
@@ -627,14 +634,14 @@ export class AflRuntime {
     const values = args.map((argument) => this.toPromptArgument(evaluateValue(argument, frame), argument.span));
     if (isSymbolRef(sourceValue)) {
       if (this.bindings.prompts === undefined) {
-        throw new FlowRuntimeError("PROMPT_ADAPTER_MISSING", `prompt '${sourceValue.name}' requires a Prompt binding`, {
+        throw new AflVmError("PROMPT_ADAPTER_MISSING", `prompt '${sourceValue.name}' requires a Prompt binding`, {
           span: source.span,
         });
       }
       throwIfAborted(signal);
       const rendered = await this.bindings.prompts.render({ prompt: sourceValue, args: values, signal });
       if (typeof rendered !== "string") {
-        throw new FlowRuntimeError("PROMPT_RESULT_INVALID", "Prompt binding returned a non-string value", {
+        throw new AflVmError("PROMPT_RESULT_INVALID", "Prompt binding returned a non-string value", {
           span: source.span,
         });
       }
@@ -646,7 +653,7 @@ export class AflRuntime {
         ? formatCompute(sourceValue)
         : undefined;
     if (base === undefined) {
-      throw new FlowRuntimeError("PROMPT_SOURCE_INVALID", "prompt source cannot be a runtime handle", {
+      throw new AflVmError("PROMPT_SOURCE_INVALID", "prompt source cannot be a VM handle", {
         span: source.span,
       });
     }
@@ -656,38 +663,38 @@ export class AflRuntime {
   private async invokeFlow(
     module: AflModule,
     target: FlowTarget,
-    args: readonly RuntimeValue[],
-    context: RunContext,
+    args: readonly VmValue[],
+    context: VmRunContext,
     signal: AbortSignal,
-  ): Promise<RuntimeValue> {
+  ): Promise<VmValue> {
     throwIfAborted(signal);
     if (target.kind === "local") return this.executeNode(module, target.name, args, context, signal);
     if (this.bindings.flows === undefined) {
-      throw new FlowRuntimeError("FLOW_ADAPTER_MISSING", `external flow '${target.name}' requires a Flow binding`, {
+      throw new AflVmError("FLOW_ADAPTER_MISSING", `external flow '${target.name}' requires a Flow binding`, {
         span: target.span,
       });
     }
-    const portable = args.map((value) => this.toRuntimeArgument(value, target.span));
+    const portable = args.map((value) => this.toVmArgument(value, target.span));
     return this.bindings.flows.invoke({ flow: symbol(target.name), args: portable, signal });
   }
 
   private async startDispatch(
     frame: MutableFrame,
-    calls: readonly { readonly target: FlowTarget; readonly args: readonly RuntimeValue[]; readonly span: SourceSpan }[],
-    context: RunContext,
+    calls: readonly { readonly target: FlowTarget; readonly args: readonly VmValue[]; readonly span: SourceSpan }[],
+    context: VmRunContext,
     location: Required<TraceLocation>,
     parentSignal: AbortSignal,
   ): Promise<TaskGroupHandle> {
     const maxWorkers = this.bindings.policy?.maxDispatchWorkers ?? 16;
     const maxTasks = this.bindings.policy?.maxDispatchTasks ?? 10_000;
     if (!Number.isInteger(maxWorkers) || maxWorkers <= 0) {
-      throw new FlowRuntimeError("RUNTIME_POLICY_INVALID", "maxDispatchWorkers must be a positive integer");
+      throw new AflVmError("VM_POLICY_INVALID", "maxDispatchWorkers must be a positive integer");
     }
     if (!Number.isInteger(maxTasks) || maxTasks < 0) {
-      throw new FlowRuntimeError("RUNTIME_POLICY_INVALID", "maxDispatchTasks must be a non-negative integer");
+      throw new AflVmError("VM_POLICY_INVALID", "maxDispatchTasks must be a non-negative integer");
     }
     if (calls.length > maxTasks) {
-      throw new FlowRuntimeError(
+      throw new AflVmError(
         "DISPATCH_TASK_LIMIT_EXCEEDED",
         `dispatch requested ${calls.length} tasks, exceeding maxDispatchTasks=${maxTasks}`,
       );
@@ -726,7 +733,7 @@ export class AflRuntime {
     const lastWriter = new Map<string, number>();
     const readers = new Map<string, Set<number>>();
     block.instructions.forEach((instruction, index) => {
-      for (const access of this.runtimeResourceAccesses(instruction, frame)) {
+      for (const access of this.vmResourceAccesses(instruction, frame)) {
         const writer = lastWriter.get(access.key);
         if (writer !== undefined) dependencies[index]!.add(writer);
         if (access.mode === "write") {
@@ -742,7 +749,7 @@ export class AflRuntime {
     });
   }
 
-  private runtimeResourceAccesses(
+  private vmResourceAccesses(
     instruction: AflInstruction,
     frame: MutableFrame,
   ): Array<{ key: string; mode: "read" | "write" }> {
@@ -794,12 +801,12 @@ export class AflRuntime {
   private async executeFreedom(
     frame: MutableFrame,
     instruction: Extract<AflInstruction, { op: "freedom.move" | "freedom.flow" }>,
-    context: RunContext,
+    context: VmRunContext,
     location: Required<TraceLocation>,
     signal: AbortSignal,
   ): Promise<Frag> {
     if (this.bindings.freedom === undefined) {
-      throw new FlowRuntimeError("FREEDOM_ADAPTER_MISSING", `${instruction.op} requires a Freedom binding`, {
+      throw new AflVmError("FREEDOM_ADAPTER_MISSING", `${instruction.op} requires a Freedom binding`, {
         span: instruction.span,
       });
     }
@@ -828,7 +835,7 @@ export class AflRuntime {
     });
     if (approved === false) {
       await this.trace(context, "freedom.rejected", location, { kind: plan.kind });
-      throw new FlowRuntimeError("FREEDOM_DENIED", "freedom plan was denied by policy", {
+      throw new AflVmError("FREEDOM_DENIED", "freedom plan was denied by policy", {
         span: instruction.span,
       });
     }
@@ -843,16 +850,16 @@ export class AflRuntime {
     module: AflModule,
     plan: FreedomPlan,
     candidates: readonly SymbolRef[] | undefined,
-    context: RunContext,
+    context: VmRunContext,
     signal: AbortSignal,
     span: SourceSpan,
-  ): Promise<RuntimeValue> {
+  ): Promise<VmValue> {
     if (plan.kind === "move") {
       if (candidates === undefined || !candidates.some((candidate) => candidate.name === plan.move.name)) {
-        throw new FlowRuntimeError("FREEDOM_MOVE_OUT_OF_SCOPE", `move '${plan.move.name}' is not a candidate`, { span });
+        throw new AflVmError("FREEDOM_MOVE_OUT_OF_SCOPE", `move '${plan.move.name}' is not a candidate`, { span });
       }
       if (this.bindings.moves === undefined) {
-        throw new FlowRuntimeError("MOVE_ADAPTER_MISSING", "freedom move requires a Move binding", { span });
+        throw new AflVmError("MOVE_ADAPTER_MISSING", "freedom move requires a Move binding", { span });
       }
       const result = await this.bindings.moves.execute({
         move: plan.move,
@@ -861,11 +868,11 @@ export class AflRuntime {
       });
       if (typeof result === "string") return frag(result);
       if (isFrag(result)) return result;
-      throw new FlowRuntimeError("MOVE_RESULT_INVALID", "Move binding returned an invalid value", { span });
+      throw new AflVmError("MOVE_RESULT_INVALID", "Move binding returned an invalid value", { span });
     }
     if (plan.kind === "flow") {
       if (this.bindings.flows === undefined) {
-        throw new FlowRuntimeError("FLOW_ADAPTER_MISSING", "freedom flow requires a Flow binding", { span });
+        throw new AflVmError("FLOW_ADAPTER_MISSING", "freedom flow requires a Flow binding", { span });
       }
       return this.bindings.flows.invoke({ flow: plan.flow, args: plan.args ?? [], signal });
     }
@@ -875,24 +882,24 @@ export class AflRuntime {
 
   private evaluateMoveCandidates(expression: ValueExpr, frame: MutableFrame): SymbolRef[] {
     if (expression.kind !== "list") {
-      throw new FlowRuntimeError("FREEDOM_MOVES_INVALID", "freedom.move candidates must be a symbol list", {
+      throw new AflVmError("FREEDOM_MOVES_INVALID", "freedom.move candidates must be a symbol list", {
         span: expression.span,
       });
     }
     return expression.items.map((item) => asSymbol(evaluateValue(item, frame), item.span));
   }
 
-  private toPromptArgument(value: RuntimeValue, span: SourceSpan): PromptArgument {
+  private toPromptArgument(value: VmValue, span: SourceSpan): PromptArgument {
     if (isFrag(value) || isComputeValue(value) || isSymbolRef(value)) return clonePortable(value);
-    throw new FlowRuntimeError("PROMPT_ARGUMENT_INVALID", "prompt argument cannot be a runtime handle", { span });
+    throw new AflVmError("PROMPT_ARGUMENT_INVALID", "prompt argument cannot be a VM handle", { span });
   }
 
-  private toRuntimeArgument(value: RuntimeValue, span: SourceSpan): RuntimeArgument {
+  private toVmArgument(value: VmValue, span: SourceSpan): VmArgument {
     if (isFrag(value) || isComputeValue(value) || isSymbolRef(value)) return clonePortable(value);
-    throw new FlowRuntimeError("FLOW_ARGUMENT_INVALID", "external flow argument cannot be a runtime handle", { span });
+    throw new AflVmError("FLOW_ARGUMENT_INVALID", "external flow argument cannot be a VM handle", { span });
   }
 
-  private createMemory(context: RunContext, messages: readonly { role: string; content: string }[] = []): MemoryHandle {
+  private createMemory(context: VmRunContext, messages: readonly { role: string; content: string }[] = []): MemoryHandle {
     return {
       kind: "memory",
       id: this.nextHandle(context, "memory"),
@@ -900,20 +907,20 @@ export class AflRuntime {
     };
   }
 
-  private createAgent(context: RunContext, agent: SymbolRef, memory: MemoryHandle): AgentHandle {
+  private createAgent(context: VmRunContext, agent: SymbolRef, memory: MemoryHandle): AgentHandle {
     return { kind: "agent", id: this.nextHandle(context, "agent"), agent, memory };
   }
 
-  private nextHandle(context: RunContext, prefix: string): string {
+  private nextHandle(context: VmRunContext, prefix: string): string {
     context.counters.handles += 1;
     return `${context.runId}:${prefix}:${context.counters.handles}`;
   }
 
-  private takeStep(context: RunContext, label: string, signal: AbortSignal = context.signal): void {
+  private takeStep(context: VmRunContext, label: string, signal: AbortSignal = context.signal): void {
     throwIfAborted(signal);
     context.counters.steps += 1;
     if (context.counters.steps > context.maxSteps) {
-      throw new FlowRuntimeError(
+      throw new AflVmError(
         "RUN_STEP_BUDGET_EXCEEDED",
         `run exceeded ${context.maxSteps} steps while entering ${label}`,
       );
@@ -922,7 +929,7 @@ export class AflRuntime {
 
   private assertNoOutstandingGroups(frame: MutableFrame, span: SourceSpan): void {
     if (frame.taskGroups.size > 0) {
-      throw new FlowRuntimeError("TASK_GROUP_UNCONSUMED", "node cannot return before syncing every TaskGroup", {
+      throw new AflVmError("TASK_GROUP_UNCONSUMED", "node cannot return before syncing every TaskGroup", {
         span,
       });
     }
@@ -930,7 +937,7 @@ export class AflRuntime {
 
   private requireFormatter() {
     if (this.bindings.formatters === undefined) {
-      throw new FlowRuntimeError("FORMATTER_ADAPTER_MISSING", "explicit formatter requires a Formatter binding");
+      throw new AflVmError("FORMATTER_ADAPTER_MISSING", "explicit formatter requires a Formatter binding");
     }
     return this.bindings.formatters;
   }
@@ -942,7 +949,7 @@ export class AflRuntime {
   ): Promise<void> {
     if (schema === undefined) return;
     if (this.bindings.schemas === undefined) {
-      throw new FlowRuntimeError("SCHEMA_ADAPTER_MISSING", `schema '${schema.name}' requires a Schema binding`, {
+      throw new AflVmError("SCHEMA_ADAPTER_MISSING", `schema '${schema.name}' requires a Schema binding`, {
         span: schema.span,
       });
     }
@@ -950,11 +957,11 @@ export class AflRuntime {
   }
 
   private async trace(
-    context: RunContext,
+    context: VmRunContext,
     type: TraceEventType,
     location: TraceLocation = {},
     details?: ComputeValue,
-    error?: FlowRuntimeError,
+    error?: AflVmError,
   ): Promise<void> {
     if (this.bindings.trace === undefined) return;
     context.counters.trace += 1;
@@ -973,16 +980,16 @@ export class AflRuntime {
   }
 }
 
-function normalizeFlowResult(value: RuntimeValue, span: SourceSpan): Frag {
+function normalizeFlowResult(value: VmValue, span: SourceSpan): Frag {
   if (isFrag(value)) return value;
   if (isComputeValue(value)) return frag(formatCompute(value));
-  throw new FlowRuntimeError("FLOW_RESULT_INVALID", "flow result must be Frag or compute data", { span });
+  throw new AflVmError("FLOW_RESULT_INVALID", "flow result must be Frag or compute data", { span });
 }
 
-function failureMessage(value: RuntimeValue): string {
+function failureMessage(value: VmValue): string {
   if (isFrag(value)) return value.content;
   if (isComputeValue(value)) return formatCompute(value);
-  return "flow entered fail with a runtime handle";
+  return "flow entered fail with a VM handle";
 }
 
 function formatPromptArgument(value: PromptArgument): string {
@@ -991,16 +998,16 @@ function formatPromptArgument(value: PromptArgument): string {
   return formatCompute(value);
 }
 
-function clonePortable<T extends RuntimeArgument>(value: T): T {
+function clonePortable<T extends VmArgument>(value: T): T {
   return structuredClone(value);
 }
 
-function cloneRuntimeValue(value: RuntimeValue): RuntimeValue {
+function cloneVmValue(value: VmValue): VmValue {
   if (isAgentHandle(value) || isMemoryHandle(value) || isTaskGroupLike(value)) return value;
   return clonePortable(value);
 }
 
-function isTaskGroupLike(value: RuntimeValue): value is TaskGroupHandle {
+function isTaskGroupLike(value: VmValue): value is TaskGroupHandle {
   return typeof value === "object" && value !== null && "kind" in value && value.kind === "taskGroup";
 }
 
@@ -1018,38 +1025,38 @@ function validateFreedomPlanShape(
   span: SourceSpan,
 ): asserts plan is FreedomPlan {
   if (typeof plan !== "object" || plan === null || !("kind" in plan)) {
-    throw new FlowRuntimeError("FREEDOM_PLAN_INVALID", "Freedom binding returned an invalid plan", { span });
+    throw new AflVmError("FREEDOM_PLAN_INVALID", "Freedom binding returned an invalid plan", { span });
   }
   const candidate = plan as Record<string, unknown>;
   if (candidate.kind !== "move" && candidate.kind !== "flow" && candidate.kind !== "generated") {
-    throw new FlowRuntimeError("FREEDOM_PLAN_INVALID", "Freedom plan has an unknown kind", { span });
+    throw new AflVmError("FREEDOM_PLAN_INVALID", "Freedom plan has an unknown kind", { span });
   }
   if (candidate.args !== undefined &&
-      (!Array.isArray(candidate.args) || !candidate.args.every(isRuntimeArgument))) {
-    throw new FlowRuntimeError("FREEDOM_PLAN_INVALID", "Freedom plan args are invalid", { span });
+      (!Array.isArray(candidate.args) || !candidate.args.every(isVmArgument))) {
+    throw new AflVmError("FREEDOM_PLAN_INVALID", "Freedom plan args are invalid", { span });
   }
   if (mode === "move" && candidate.kind !== "move") {
-    throw new FlowRuntimeError("FREEDOM_PLAN_KIND_INVALID", "freedom.move requires a move plan", { span });
+    throw new AflVmError("FREEDOM_PLAN_KIND_INVALID", "freedom.move requires a move plan", { span });
   }
   if (mode === "flow" && candidate.kind === "move") {
-    throw new FlowRuntimeError("FREEDOM_PLAN_KIND_INVALID", "freedom.flow requires a flow plan", { span });
+    throw new AflVmError("FREEDOM_PLAN_KIND_INVALID", "freedom.flow requires a flow plan", { span });
   }
   if (candidate.kind === "move" &&
       (!isSymbolRef(candidate.move) || !candidate.move.name.startsWith("@move."))) {
-    throw new FlowRuntimeError("FREEDOM_PLAN_INVALID", "move plan requires an @move symbol", { span });
+    throw new AflVmError("FREEDOM_PLAN_INVALID", "move plan requires an @move symbol", { span });
   }
   if (candidate.kind === "flow" &&
       (!isSymbolRef(candidate.flow) || !candidate.flow.name.startsWith("@flow."))) {
-    throw new FlowRuntimeError("FREEDOM_PLAN_INVALID", "flow plan requires an @flow symbol", { span });
+    throw new AflVmError("FREEDOM_PLAN_INVALID", "flow plan requires an @flow symbol", { span });
   }
   if (candidate.kind === "generated" &&
       (typeof candidate.source !== "string" || candidate.source.trim().length === 0 ||
        typeof candidate.entry !== "string" || candidate.entry.trim().length === 0)) {
-    throw new FlowRuntimeError("FREEDOM_PLAN_INVALID", "generated flow requires source and entry", { span });
+    throw new AflVmError("FREEDOM_PLAN_INVALID", "generated flow requires source and entry", { span });
   }
 }
 
-function isRuntimeArgument(value: unknown): value is RuntimeArgument {
+function isVmArgument(value: unknown): value is VmArgument {
   return isFrag(value) || isSymbolRef(value) || isComputeValue(value);
 }
 

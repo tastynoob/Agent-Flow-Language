@@ -5,7 +5,7 @@
 
 ## 1. 设计范围
 
-本文定义 AFL IR 的文本骨架、指令格式、Frag 和 role 写法。Schema、package、Agent provider 和宿主脚本语言由外部规范或 runtime binding 提供。
+本文定义 AFL IR 的文本骨架、指令格式、Frag 和 role 写法。Schema、package、Agent provider 和宿主脚本语言由外部规范或 VM binding 提供。
 
 一个 IR 文件由若干 node 组成：
 
@@ -38,9 +38,9 @@ bug_list_2
 @mcp.github.read_file
 ```
 
-String 使用双引号，转义规则沿用 JSON string。Boolean、number、list 和 record 字面量主要供 `oper`、script executor 和 runtime option 使用。
+String 使用双引号，转义规则沿用 JSON string。Boolean、number、list 和 record 字面量主要供 `oper`、script executor 和 VM option 使用。
 
-Role operand 可以使用基础 role keyword，也可以引用 runtime 定义的 role symbol：
+Role operand 可以使用基础 role keyword，也可以引用 VM 定义的 role symbol：
 
 ```text
 system
@@ -144,7 +144,7 @@ String literal 在需要 Frag 的位置自动包装成 Frag。没有参数的 pr
 | 类别 | 代表指令 | 返回结果 |
 | --- | --- | --- |
 | 数据指令 | `do`、`seqdo`、`prompt`、`input`、`invoke`、`call`、`sync` | role-free Frag |
-| 计算指令 | `oper`、`python`、`typescript`、`shell` | runtime compute value |
+| 计算指令 | `oper`、`python`、`typescript`、`shell` | VM compute value |
 | 资源指令 | `agent`、`memory.copy`、`memory.apply`、`dispatch`、`fork` | Agent、Memory、TaskGroup 等 handle |
 
 Terminator 和 `memory.append` 等 effect instruction 不需要产生结果。
@@ -233,7 +233,7 @@ result = typescript "script", arg0, arg1, ...
 result = shell "command", arg0, arg1, ...
 ```
 
-脚本不能隐式读取 node 中的其他值。Frag operand 以其字符串内容传入；脚本输出是 runtime compute value。执行环境、参数编码和权限由对应 runtime binding 定义。
+脚本不能隐式读取 node 中的其他值。Frag operand 以其字符串内容传入；脚本输出是 VM compute value。执行环境、参数编码和权限由对应 VM binding 定义。
 
 需要把 compute value 传给 Agent 时，可以通过 `prompt` 等数据指令把它格式化为 Frag。
 
@@ -260,7 +260,7 @@ jobs = dispatch [@flow.security(code), @flow.performance(code), @flow.tests(code
 jobs = dispatch worker_count, @flow.review_once, code
 ```
 
-List 形式逐项启动显式写出的 flow call，可以混用不同 flow 和不同参数。Batch 形式的第一个 operand `worker_count` 是非负整数 compute value，runtime 启动对应数量的相同调用：
+List 形式逐项启动显式写出的 flow call，可以混用不同 flow 和不同参数。Batch 形式的第一个 operand `worker_count` 是非负整数 compute value，VM 启动对应数量的相同调用：
 
 ```text
 @flow.review_once(code)
@@ -277,7 +277,7 @@ new_agent = fork agent, new_agent.do prompt
 long_agent = fork agent, long_agent.seqdo task
 ```
 
-`fork` 左侧的 `dst` 在同一条指令的启动动作中表示新分支 Agent。Runtime 复制 source Agent 的 Memory，用相同 Agent binding 创建 `dst`，再在该分支上启动右侧的 `do` 或 `seqdo`：
+`fork` 左侧的 `dst` 在同一条指令的启动动作中表示新分支 Agent。VM 复制 source Agent 的 Memory，用相同 Agent binding 创建 `dst`，再在该分支上启动右侧的 `do` 或 `seqdo`：
 
 ```text
 security = fork coder, security.do security_prompt
@@ -297,14 +297,14 @@ reports = sync jobs, @format.json_array
 
 ## 11. Capability
 
-`invoke` 显式调用 skill、MCP method 或 runtime capability，并把 capability 输出格式化为 Frag：
+`invoke` 显式调用 skill、MCP method 或 VM capability，并把 capability 输出格式化为 Frag：
 
 ```text
 page = invoke @skill.web.read, url
 issue = invoke @mcp.github.get_issue, repository, number
 ```
 
-Symbol 的输入、输出格式和授权由 package/runtime binding 提供。
+Symbol 的输入、输出格式和授权由 package/VM binding 提供。
 
 ## 12. Memory
 

@@ -2,7 +2,7 @@
   "name": "@afl-lang/core",
   "version": "0.1.0",
   "private": true,
-  "description": "Reference parser, validator, and runtime for Agent Flow Language IR",
+  "description": "Reference virtual machine for Agent Flow Language IR",
   "type": "module",
   "main": "./dist/src/index.js",
   "types": "./dist/src/index.d.ts",
@@ -13,15 +13,24 @@
     }
   },
   "bin": {
-    "afl": "./bin/afl.mjs"
+    "afl": "./bin/afl.mjs",
+    "afl-vm": "./bin/afl-vm.mjs"
   },
+  "files": [
+    "bin",
+    "dist/src",
+    "docs",
+    "README.md"
+  ],
   "scripts": {
     "clean": "node scripts/clean.mjs",
     "build": "tsc -p tsconfig.json",
     "test:ts": "npm run build && node --test test/*.test.mjs",
-    "test:cli": "node bin/afl.mjs validate test/fixtures/echo.afl && node bin/afl.mjs run test/fixtures/echo.afl --args '[\"hello\"]' --run-id cli-test",
-    "smoke:deepseek": "npm run build && node bin/afl.mjs run examples/live-smoke.afl --adapter examples/deepseek-bindings.mjs --args '[\"Reply with exactly: afl-live-ok\"]'",
-    "test": "npm run test:ts && npm run test:cli"
+    "test:cli": "node bin/afl.mjs validate test/fixtures/echo.afl && node bin/afl-vm.mjs test/fixtures/noop-bindings.mjs test/fixtures/minimal.afl",
+    "test:package": "node scripts/test-vm-package.mjs",
+    "smoke:deepseek": "npm run build && node bin/afl-vm.mjs examples/deepseek-bindings.mjs examples/live-smoke.afl",
+    "prepack": "npm run clean && npm run build",
+    "test": "npm run test:ts && npm run test:cli && npm run test:package"
   },
   "engines": {
     "node": ">=18"

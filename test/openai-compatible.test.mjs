@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  FlowRuntimeError,
+  AflVmError,
   OpenAICompatibleAgentAdapter,
   symbol,
 } from "../dist/src/index.js";
@@ -68,7 +68,7 @@ test("OpenAI-compatible adapter redacts API keys from provider errors", async ()
   await assert.rejects(
     adapter.run(request()),
     (error) => {
-      assert.equal(error instanceof FlowRuntimeError, true);
+      assert.equal(error instanceof AflVmError, true);
       assert.equal(error.code, "LLM_HTTP_ERROR");
       assert.equal(JSON.stringify(error.serialize()).includes(secret), false);
       assert.equal(JSON.stringify(error.serialize()).includes("[REDACTED]"), true);
@@ -88,7 +88,7 @@ test("OpenAI-compatible adapter propagates AbortSignal cancellation", async () =
   });
   const controller = new AbortController();
   const pending = adapter.run({ ...request(), signal: controller.signal });
-  controller.abort(new FlowRuntimeError("TEST_ABORT", "stop"));
+  controller.abort(new AflVmError("TEST_ABORT", "stop"));
   await assert.rejects(pending, { code: "TEST_ABORT" });
 });
 

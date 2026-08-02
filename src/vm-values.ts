@@ -25,7 +25,7 @@ export interface TaskGroupHandle {
   consumed: boolean;
 }
 
-export type RuntimeValue =
+export type VmValue =
   | Frag
   | ComputeValue
   | SymbolRef

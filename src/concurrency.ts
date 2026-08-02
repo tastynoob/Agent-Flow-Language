@@ -1,4 +1,4 @@
-import { FlowRuntimeError } from "./errors.js";
+import { AflVmError } from "./errors.js";
 
 type Release = () => void;
 
@@ -211,7 +211,7 @@ export function throwIfAborted(signal: AbortSignal): void {
 }
 
 function abortReason(signal: AbortSignal): unknown {
-  return signal.reason ?? new FlowRuntimeError("RUN_ABORTED", "AFL run was aborted");
+  return signal.reason ?? new AflVmError("RUN_ABORTED", "AFL run was aborted");
 }
 
 function canAcquireImmediately(state: LockState, mode: "read" | "write"): boolean {

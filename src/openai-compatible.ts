@@ -1,5 +1,5 @@
 import type { AgentAdapter, AgentRunRequest, AgentRunResult, Message } from "./adapters.js";
-import { FlowRuntimeError } from "./errors.js";
+import { AflVmError } from "./errors.js";
 
 export interface OpenAICompatibleAgentBinding {
   readonly model: string;
@@ -37,7 +37,7 @@ export class OpenAICompatibleAgentAdapter implements AgentAdapter {
   async run(request: AgentRunRequest): Promise<AgentRunResult> {
     const binding = this.agents[request.agent.name];
     if (binding === undefined) {
-      throw new FlowRuntimeError(
+      throw new AflVmError(
         "AGENT_SYMBOL_UNBOUND",
         `no OpenAI-compatible binding for '${request.agent.name}'`,
       );
@@ -68,7 +68,7 @@ export class OpenAICompatibleAgentAdapter implements AgentAdapter {
       });
     } catch (error) {
       if (request.signal.aborted) throw request.signal.reason;
-      throw new FlowRuntimeError("LLM_TRANSPORT_ERROR", "chat completion request failed", { cause: error });
+      throw new AflVmError("LLM_TRANSPORT_ERROR", "chat completion request failed", { cause: error });
     }
 
     const raw = await response.text();
@@ -77,13 +77,13 @@ export class OpenAICompatibleAgentAdapter implements AgentAdapter {
     try {
       payload = JSON.parse(raw);
     } catch (error) {
-      throw new FlowRuntimeError("LLM_RESPONSE_NOT_JSON", "chat endpoint returned invalid JSON", {
+      throw new AflVmError("LLM_RESPONSE_NOT_JSON", "chat endpoint returned invalid JSON", {
         details: { status: response.status, body: redacted.slice(0, 4096) },
         cause: error,
       });
     }
     if (!response.ok) {
-      throw new FlowRuntimeError("LLM_HTTP_ERROR", `chat endpoint returned HTTP ${response.status}`, {
+      throw new AflVmError("LLM_HTTP_ERROR", `chat endpoint returned HTTP ${response.status}`, {
         details: { status: response.status, body: safeResponseDetail(payload, apiKey) },
       });
     }
@@ -96,7 +96,7 @@ function requestMessages(request: AgentRunRequest): Message[] {
   if (request.systemPrompt !== undefined) result.push({ role: "system", content: request.systemPrompt });
   for (const message of request.messages) {
     if (!new Set(["system", "user", "assistant", "tool"]).has(message.role)) {
-      throw new FlowRuntimeError(
+      throw new AflVmError(
         "LLM_MESSAGE_ROLE_UNSUPPORTED",
         `OpenAI-compatible chat does not support role '${message.role}'`,
       );
@@ -104,7 +104,7 @@ function requestMessages(request: AgentRunRequest): Message[] {
     result.push({ role: message.role, content: message.content });
   }
   if (result.length === 0) {
-    throw new FlowRuntimeError("LLM_MESSAGES_INVALID", "chat completion requires at least one Message");
+    throw new AflVmError("LLM_MESSAGES_INVALID", "chat completion requires at least one Message");
   }
   return result;
 }
@@ -112,7 +112,7 @@ function requestMessages(request: AgentRunRequest): Message[] {
 function resolveApiKey(apiKey: string | (() => string)): string {
   const resolved = typeof apiKey === "function" ? apiKey() : apiKey;
   if (resolved.length === 0) {
-    throw new FlowRuntimeError("LLM_API_KEY_MISSING", "chat adapter API key is empty");
+    throw new AflVmError("LLM_API_KEY_MISSING", "chat adapter API key is empty");
   }
   return resolved;
 }
@@ -142,8 +142,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function invalidResponse(): FlowRuntimeError {
-  return new FlowRuntimeError(
+function invalidResponse(): AflVmError {
+  return new AflVmError(
     "LLM_RESPONSE_INVALID",
     "chat response does not contain choices[0].message.content",
   );

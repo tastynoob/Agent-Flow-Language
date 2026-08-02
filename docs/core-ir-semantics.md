@@ -5,18 +5,18 @@
 
 ## 1. 范围
 
-本文说明 node、basic block、dependency、Frag、role 和核心指令在当前草案中的含义。它用于对齐 frontend 与 runtime，不定义 package、schema 描述语言或 provider API。
+本文说明 node、basic block、dependency、Frag、role 和核心指令在当前草案中的含义。它用于对齐 frontend 与 VM，不定义 package、schema 描述语言或 provider API。
 
 ## 2. Node 调用
 
-调用一个 node 时，runtime 创建一次独立的 node invocation：
+调用一个 node 时，VM 创建一次独立的 node invocation：
 
 1. 将实参与 node 参数绑定；
 2. 创建本次调用的工作值环境；
 3. 激活 `entry` basic block；
 4. 按 dependency 调度 block 内指令；
 5. 执行 block terminator；
-6. 遇到 `ret`、`fail` 或未处理的 runtime error 时结束调用。
+6. 遇到 `ret`、`fail` 或未处理的 VM error 时结束调用。
 
 Node 参数和已经完成的指令结果可以被后续 basic block 使用。Node invocation 结束后，普通工作值随调用释放；需要长期保存的内容应进入 memory、artifact 或外部 store。
 
@@ -32,7 +32,7 @@ Node 参数和已经完成的指令结果可以被后续 basic block 使用。No
 
 跳回之前的 block 会创建新的 block activation，因此可以表达循环。
 
-每次指令执行产生的 Frag 或 compute value 都是不可变结果。当前文本草案允许名称在后续 block activation 中绑定到新结果；runtime、trace 或 lowering 可以给每次结果分配独立版本。这保留了 SSA-like 数据流属性，但暂不要求手写 IR 暴露 phi 或严格 SSA 名称。
+每次指令执行产生的 Frag 或 compute value 都是不可变结果。当前文本草案允许名称在后续 block activation 中绑定到新结果；VM、trace 或 lowering 可以给每次结果分配独立版本。这保留了 SSA-like 数据流属性，但暂不要求手写 IR 暴露 phi 或严格 SSA 名称。
 
 一个 block activation 内不允许两条指令写同一个 `dst`。
 
@@ -63,7 +63,7 @@ Message {
 }
 ```
 
-Role 属于 Frag 进入 Memory 的边，而不是 Frag 自身属性。基础 role 包括 `system`、`user`、`assistant` 和 `tool`；runtime 可以通过 symbol 扩展其他 role。
+Role 属于 Frag 进入 Memory 的边，而不是 Frag 自身属性。基础 role 包括 `system`、`user`、`assistant` 和 `tool`；VM 可以通过 symbol 扩展其他 role。
 
 ### 4.3 Memory
 
@@ -83,7 +83,7 @@ Memory {
 
 - 数据结果：`do`、`seqdo`、`prompt`、`input`、`invoke`、`call`、`sync` 等返回 Frag；
 - 计算结果：`oper` 与 script executor 返回 bool、number、string 或宿主结构等本地 compute value；
-- 资源结果：`agent`、`memory.copy`、`memory.apply`、`dispatch`、`fork` 返回 runtime handle。
+- 资源结果：`agent`、`memory.copy`、`memory.apply`、`dispatch`、`fork` 返回 VM handle。
 
 资源 handle 不会为了满足统一字符串形式而包装成 Frag。它们只用于后续资源指令，不能直接作为 Agent message 发送。
 
@@ -121,7 +121,7 @@ Agent 调用和 `memory.append` 会读写绑定 Memory。同一 Agent 或同一 
 - 它读取的 Frag、compute value 或 handle 已经产生；
 - 它依赖的前序 block 已完成；
 - 它需要的 Agent、Memory 或 capability 当前可用；
-- runtime policy 允许启动。
+- VM policy 允许启动。
 
 所有 ready 指令都可以并行启动。并发上限、rate limit 和预算可以推迟启动，但不会新增业务 dependency。
 
@@ -163,7 +163,7 @@ Role-free 返回值可以被另一个 Agent 作为 `user` message 接收，也�
 
 ### 7.6 `seqdo`
 
-`agent.seqdo` 与 `do` 使用相同的输入和最终输出规则，但允许同一个 Agent 连续完成多步工作，直到报告完成、需要外部输入、失败或触发 runtime 限制。
+`agent.seqdo` 与 `do` 使用相同的输入和最终输出规则，但允许同一个 Agent 连续完成多步工作，直到报告完成、需要外部输入、失败或触发 VM 限制。
 
 内部可以产生多条 assistant、tool 和 observation Message。AFL 指令只返回最后约定的业务输出 Frag；完整过程保留在 Agent Memory 和 trace 中。
 
@@ -175,7 +175,7 @@ Agent 调用可以带 schema symbol：
 report = reviewer.seqdo prompt, @schema.Report
 ```
 
-Runtime 可以要求模型输出 JSON 并校验 schema，但校验后的 `report` 仍是包装 JSON 文本的 Frag，不会自动变成 Core IR record。
+VM 可以要求模型输出 JSON 并校验 schema，但校验后的 `report` 仍是包装 JSON 文本的 Frag，不会自动变成 Core IR record。
 
 简单 flow 不必使用 JSON。例如 Reviewer 可以约定：没有缺陷时精确输出 `finish`，否则输出文本缺陷列表：
 
@@ -200,7 +200,7 @@ finish = oper review_result == "finish"
 
 ### 8.2 `python`、`typescript`、`shell`
 
-Script executor 把显式 operand 交给对应 runtime binding。Frag 以 content string 传入，脚本结果作为 compute value 返回。
+Script executor 把显式 operand 交给对应 VM binding。Frag 以 content string 传入，脚本结果作为 compute value 返回。
 
 Script 不能隐式读取 node 中的其他工作值。需要把脚本结果传给 Agent 时，先通过 `prompt` 或其他 formatter 生成 Frag。
 
@@ -249,7 +249,7 @@ jump condition, true_target, false_target
 
 ### 10.3 `fail`
 
-`fail` 以错误结束当前 node invocation。错误可以使用 Frag 或 runtime error value 表示。Retry、catch 和 compensation 暂可由 basic block、子 flow 和 runtime policy 组合。
+`fail` 以错误结束当前 node invocation。错误可以使用 Frag 或 VM error value 表示。Retry、catch 和 compensation 暂可由 basic block、子 flow 和 VM policy 组合。
 
 ## 11. Flow 组合
 
@@ -267,7 +267,7 @@ List 形式显式列出 flow call：
 dispatch [flow_a(...), flow_b(...), ...]
 ```
 
-Runtime 为每个 list item 创建一次 child invocation。不同 item 可以调用不同 flow，也可以传入不同 task。
+VM 为每个 list item 创建一次 child invocation。不同 item 可以调用不同 flow，也可以传入不同 task。
 
 Batch 形式批量启动同一个 flow：
 
@@ -275,9 +275,9 @@ Batch 形式批量启动同一个 flow：
 dispatch count, flow, task
 ```
 
-`count` 可以是硬编码非负整数，也可以是 Agent 输出经 `oper` 或 script executor 解析得到的整数。Runtime 创建 `count` 次 `flow(task)`。每个 child 接收同一个 task Frag，但获得独立 node invocation、Agent 和 Memory。
+`count` 可以是硬编码非负整数，也可以是 Agent 输出经 `oper` 或 script executor 解析得到的整数。VM 创建 `count` 次 `flow(task)`。每个 child 接收同一个 task Frag，但获得独立 node invocation、Agent 和 Memory。
 
-Runtime policy 可以限制同时运行的 child 数量，使部分逻辑 Worker 排队，但不得静默改变 `count`。`count` 不是绕过预算、rate limit 或部署上限的权限参数。
+VM policy 可以限制同时运行的 child 数量，使部分逻辑 Worker 排队，但不得静默改变 `count`。`count` 不是绕过预算、rate limit 或部署上限的权限参数。
 
 这两种形式都不表示 iterable map。运行时 task list 的逐项分发如果成为核心需求，应另行定义，不能通过猜测 `task` 内容隐式实现。
 
@@ -329,6 +329,6 @@ Agent 在 `do/seqdo` 内部自行使用 tool，与 flow 显式执行 `invoke` �
 - `input` 可以等待外部输入；
 - `seqdo` 可以等待 Agent 所需的外部输入；
 - `sync` 可以等待 child flow；
-- runtime error、格式校验失败、权限拒绝和显式 `fail` 会使当前路径失败。
+- VM error、格式校验失败、权限拒绝和显式 `fail` 会使当前路径失败。
 
-Timeout、重试、取消和恢复策略暂由 runtime policy 或可复用 flow 表达。是否提升为核心指令，需要用长任务和长期 Agent 案例验证。
+Timeout、重试、取消和恢复策略暂由 VM policy 或可复用 flow 表达。是否提升为核心指令，需要用长任务和长期 Agent 案例验证。

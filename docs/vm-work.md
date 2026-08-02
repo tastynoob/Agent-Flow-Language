@@ -1,6 +1,6 @@
-# AFL IR 执行器当前工作定义
+# AFL IR 虚拟机当前工作定义
 
-状态：第一版 reference executor 已实现
+状态：第一版 reference VM 已实现
 日期：2026-08-02
 
 ## 1. 本轮目标
@@ -17,11 +17,11 @@ AFL source
     -> module AST
     -> semantic validator
     -> dependency scheduler
-    -> runtime bindings
+    -> VM bindings
     -> Frag result + trace
 ```
 
-Runtime API 接收 module、入口 node 名称和参数。文本格式暂不声明全局 `entry`；调用方显式选择入口，CLI 可以默认使用名为 `main` 的 node。
+VM API 接收 module、入口 node 名称和参数。文本格式暂不声明全局 `entry`；调用方显式选择入口，CLI 可以默认使用名为 `main` 的 node。
 
 ## 3. 本轮覆盖的语言范围
 
@@ -39,7 +39,7 @@ Runtime API 接收 module、入口 node 名称和参数。文本格式暂不声�
 - bool、number、string、list 和 record compute value；
 - name、field/index、string/number/boolean literal 与 external symbol；
 - `prompt`、`input` 和 `oper`；
-- `python`、`typescript`、`shell` 通过显式 script binding 执行，Core runtime 不直接给予宿主进程权限。
+- `python`、`typescript`、`shell` 通过显式 script binding 执行，Core VM 不直接给予宿主进程权限。
 
 ### 3.3 Agent 与 Memory
 
@@ -58,16 +58,16 @@ Runtime API 接收 module、入口 node 名称和参数。文本格式暂不声�
 
 ## 4. AST 与运行时值
 
-Parser 输出语言无关语义的 TypeScript AST：module 包含 node，node 包含 block，block 包含 instruction 和 terminator。AST 保留 source span，用于 validator 和 runtime diagnostics。
+Parser 输出语言无关语义的 TypeScript AST：module 包含 node，node 包含 block，block 包含 instruction 和 terminator。AST 保留 source span，用于 validator 和 VM diagnostics。
 
-Runtime value 分为：
+VM value 分为：
 
 - `Frag`：只暴露 `content: string`；
 - compute value：null、boolean、number、string、list 或 record；
 - `AgentHandle`、`MemoryHandle` 和 `TaskGroupHandle`；
 - external symbol reference。
 
-Handle 具有 runtime identity，不允许作为 prompt content 隐式字符串化。Frag 进入 `oper` 或 script 时读取 content；compute value 进入 `prompt` 时由 formatter 显式编码。
+Handle 具有 VM identity，不允许作为 prompt content 隐式字符串化。Frag 进入 `oper` 或 script 时读取 content；compute value 进入 `prompt` 时由 formatter 显式编码。
 
 ## 5. Parser 与 Validator
 
@@ -95,7 +95,7 @@ Validator 至少检查：
 - name producer/consumer 形成数据依赖；
 - block activation 形成 flow 依赖；
 - Agent 和 Memory 的状态操作形成资源依赖；
-- runtime policy 只延迟 ready instruction，不改变业务依赖。
+- VM policy 只延迟 ready instruction，不改变业务依赖。
 
 Scheduler 会并行启动所有 ready instruction。Agent/Memory 使用 handle identity 的异步读写锁：Memory copy 和 fork snapshot 是读操作；Agent call、system prompt、append 和 bind 是写操作。同一资源的冲突操作按源码顺序进入锁队列，不同资源不因文本相邻而串行。
 
@@ -109,7 +109,7 @@ Literal prompt 使用稳定的默认 formatter；prompt symbol 由 binding 渲�
 
 ### 7.2 Agent call
 
-Agent binding 接收 operation mode、Agent symbol、system prompt、完整 Message snapshot、可选 schema 和 AbortSignal，返回最终文本与可选的内部 Message。Runtime 负责写入输入 Message 和最终 assistant Message。
+Agent binding 接收 operation mode、Agent symbol、system prompt、完整 Message snapshot、可选 schema 和 AbortSignal，返回最终文本与可选的内部 Message。VM 负责写入输入 Message 和最终 assistant Message。
 
 `do` 表示一次 adapter 工作单元；`seqdo` 允许 adapter 内部执行多轮模型/tool 交互。简单 chat adapter 可以把两者都映射为一次 completion，但 contract 不把 `seqdo` 限制为单轮。
 
@@ -131,7 +131,7 @@ TaskGroup 遵循 structured concurrency：创建它的 node 在退出前必须 `
 
 ### 7.5 External effect
 
-`invoke`、script executor、external flow、schema 和 formatter 都经过 runtime binding。未绑定 symbol 产生稳定错误，不进行名称猜测或隐式网络访问。
+`invoke`、script executor、external flow、schema 和 formatter 都经过 VM binding。未绑定 symbol 产生稳定错误，不进行名称猜测或隐式网络访问。
 
 ### 7.6 Freedom
 
@@ -140,13 +140,13 @@ Freedom binding 返回结构化计划：
 - move plan 引用已注册 move；
 - flow plan 引用已有 flow，或提供带入口的临时 AFL source。
 
-Runtime 检查候选范围、symbol、capability、预算和 policy；临时 source 必须经过同一个 parser 与 validator，之后作为有作用域的 child module 执行。Freedom adapter 不能直接返回已经执行的最终结果来绕过验证。
+VM 检查候选范围、symbol、capability、预算和 policy；临时 source 必须经过同一个 parser 与 validator，之后作为有作用域的 child module 执行。Freedom adapter 不能直接返回已经执行的最终结果来绕过验证。
 
 ## 8. 迁移边界
 
 新实现完成后：
 
-- `src/ir.ts`、parser、validator、runtime 和 adapter API 以当前 AFL IR 为准；
+- `src/ir.ts`、parser、validator、VM 和 adapter API 以当前 AFL IR 为准；
 - 旧 builder、expression、value、旧 JSON fixture 和旧 HIR tests 移除；
 - CLI 改为读取文本 `.afl`，支持 validate 与 run；
 - Python 旧 frontend 继续保持 legacy 标记，本轮不伪装成新 frontend；
@@ -168,6 +168,18 @@ Runtime 检查候选范围、symbol、capability、预算和 policy；临时 sou
 
 真实 provider secret 只从环境变量读取，不写入 source、fixture、命令输出或 trace。
 
-当前自动化测试已覆盖前八项，并额外覆盖动态任务总量限制、运行时 handle alias 排序与 Memory 重复绑定诊断。真实 provider smoke 入口为 `npm run smoke:deepseek`；它只有在调用环境提供 `DEEPSEEK_API_KEY` 时执行，不属于默认测试，不能由 mock 替代。
+当前自动化测试已覆盖前八项，并额外覆盖动态任务总量限制、VM handle alias 排序与 Memory 重复绑定诊断。真实 provider smoke 入口为 `npm run smoke:deepseek`；它只有在调用环境提供 `DEEPSEEK_API_KEY` 时执行，不属于默认测试，不能由 mock 替代。
 
 2026-08-02 已使用环境变量中的 DeepSeek API key 完成第九项验证：`examples/live-smoke.afl` 经 CLI、OpenAI-compatible adapter 和真实模型执行后返回 Frag `afl-live-ok`。密钥未写入 source、fixture 或 trace。
+
+## 10. VM 可执行入口
+
+Reference VM 通过 npm `bin` 暴露为 `afl-vm`。当前最小调用由两个位置参数构成：
+
+```text
+afl-vm <bindings-module> <flow.afl>
+```
+
+VM 默认调用无参 `main()`。入口名、node 参数、trace 和 run id 是可选 CLI 覆盖，不改变最小接口。Bindings 可以来自本地 JavaScript module 或已安装 package；VM 在加载 AFL 前先建立显式宿主能力边界，不从 IR 猜测 provider、密钥或工具实现。
+
+`package.json` 的发布清单包含 `bin/`、`dist/src/`、规范文档与 README。安装生成的 npm tarball 后，`node_modules/.bin/afl-vm` 必须能在仓库外执行同一份 AFL IR；源码目录中的 wrapper 成功不作为打包完成的充分证据。

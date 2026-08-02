@@ -24,7 +24,7 @@
 这导致同一种协作范式被反复实现，并产生几个问题：
 
 - 难以从实现代码中看出完整行为；
-- 难以移植到另一种 Agent runtime；
+- 难以移植到另一种 Agent VM；
 - prompt、角色和控制流耦合，不能独立替换；
 - 缺少统一的数据格式、失败、并发和事件语义；
 - 很难把“三省六部”“coder-reviewer”“辩论投票”等范式作为库发布；
@@ -45,7 +45,7 @@ Agent Flow Language（暂称 AFL）是一门行为描述与编排语言。
 - AI 决策型控制流 `freedom`；
 - 执行预算、权限和可观测性要求。
 
-语言源文件本身不直接实现模型调用。Frontend 将其转换为 AFL IR，再由符合语义约定的 runtime 执行，并通过 binding 连接模型、Agent、tool 和存储实现。
+语言源文件本身不直接实现模型调用。Frontend 将其转换为 AFL IR，再由符合语义约定的 VM 执行，并通过 binding 连接模型、Agent、tool 和存储实现。
 
 ## 4. 核心设计原则
 
@@ -61,9 +61,9 @@ Agent Flow Language（暂称 AFL）是一门行为描述与编排语言。
 
 prompt、Agent、move 和 flow 都应具有可声明的接口，可以作为参数传递、组合和导出。一个 review loop 不应绑定到特定 coder、reviewer、模型或 memory 实现。
 
-### 4.4 Runtime 无关
+### 4.4 VM 无关
 
-核心语义不依赖特定厂商。模型地址、API key、部署位置和产品专用配置属于 runtime binding，不属于可移植 flow。
+核心语义不依赖特定厂商。模型地址、API key、部署位置和产品专用配置属于 VM binding，不属于可移植 flow。
 
 ### 4.5 状态和数据流显式化
 
@@ -106,7 +106,7 @@ prompt、Agent、move 和 flow 都应具有可声明的接口，可以作为参�
 
 | 类别 | 必需能力 |
 | --- | --- |
-| 数据 | Frag string、compute value、runtime handle、可选 schema/format adapter |
+| 数据 | Frag string、compute value、VM handle、可选 schema/format adapter |
 | Agent | interface、instance、capability、Frag call、stream、cancel |
 | 状态 | local state、shared store handle、artifact、memory handle |
 | 控制流 | sequence、match、loop、return、finish、fail |
@@ -130,7 +130,7 @@ prompt、Agent、move 和 flow 都应具有可声明的接口，可以作为参�
 - 编译期展开的 flow pattern；
 - 完整组织范式；
 - policy、测试和 eval case；
-- runtime adapter。
+- VM adapter。
 
 示意用法：
 
@@ -150,13 +150,13 @@ flow function 应支持依赖注入，例如将 worker、reviewer、prompt、mem
 
 1. 阅读一个源文件，理解 Agent 系统的主要行为和失败路径；
 2. 用相同语言描述固定流程、事件驱动流程和 AI 自由兜底流程；
-3. 将同一 flow 绑定到不同模型、Agent runtime 和工具实现；
+3. 将同一 flow 绑定到不同模型、Agent VM 和工具实现；
 4. 把 prompt、审核循环、并行研究、组织架构等发布为版本化 package；
 5. 对 flow 做格式检查、依赖检查、权限检查和基本的死路分析；
 6. 用 mock Agent 仿真，不调用真实模型；
 7. 记录真实运行轨迹，并在固定 Agent 输出下确定性重放；
 8. 查看 freedom 为什么被触发、看到了哪些选择、生成了什么 continuation；
-9. 从源文件生成流程图、运行看板或目标 runtime 的执行计划。
+9. 从源文件生成流程图、运行看板或目标 VM 的执行计划。
 
 ## 9. 代表性验收场景
 
@@ -173,12 +173,12 @@ flow function 应支持依赖注入，例如将 worker、reviewer、prompt、mem
 9. 递归任务拆分，但受深度、成本和并发限制；
 10. 同一 review-loop package 分别注入代码和合同领域的 Agent 与 prompt。
 
-如果某个场景必须依靠 runtime 中未声明的自定义 orchestration 代码才能成立，说明语言核心仍缺少语义。
+如果某个场景必须依靠 VM 中未声明的自定义 orchestration 代码才能成立，说明语言核心仍缺少语义。
 
 ## 10. 非目标
 
 - 不重新定义模型 API、MCP 或 A2A 等已有通信协议；
-- 不保证不同模型或 runtime 产生相同业务输出；
+- 不保证不同模型或 VM 产生相同业务输出；
 - 不将 chain-of-thought 作为必须保存或交换的数据；
 - 不把任意 Python、TypeScript 或 shell 代码伪装成可移植 flow；
 - 不在可移植 package 中保存 API key 等 secret；
@@ -187,7 +187,7 @@ flow function 应支持依赖注入，例如将 worker、reviewer、prompt、mem
 
 ## 11. 相关项目与借鉴方向
 
-- [OpenProse](https://github.com/openprose/prose)：可移植 Agent workflow、function、pattern、test 和 runtime contract；
+- [OpenProse](https://github.com/openprose/prose)：可移植 Agent workflow、function、pattern、test 和 VM contract；
 - [OpenClaw](https://github.com/openclaw/openclaw)：长期运行 Agent、skills、sessions、channels、tools 和多 Agent routing；
 - [Edict 三省六部](https://github.com/cft0808/edict)：制度化审核、事件总线、状态机、并行调度、权限和审计；
 - [AgentSPEX](https://agentspex.ai/)：类型化步骤、分支、循环、并行和显式状态；

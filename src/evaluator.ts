@@ -1,4 +1,4 @@
-import { FlowRuntimeError } from "./errors.js";
+import { AflVmError } from "./errors.js";
 import {
   isComputeValue,
   isFrag,
@@ -14,14 +14,14 @@ import {
   isMemoryHandle,
   isSymbolRef,
   isTaskGroupHandle,
-  type RuntimeValue,
-} from "./runtime-values.js";
+  type VmValue,
+} from "./vm-values.js";
 
 export interface ValueEnvironment {
-  readonly values: ReadonlyMap<string, RuntimeValue>;
+  readonly values: ReadonlyMap<string, VmValue>;
 }
 
-export function evaluateValue(expression: ValueExpr, environment: ValueEnvironment): RuntimeValue {
+export function evaluateValue(expression: ValueExpr, environment: ValueEnvironment): VmValue {
   switch (expression.kind) {
     case "literal":
       return cloneCompute(expression.value);
@@ -32,7 +32,7 @@ export function evaluateValue(expression: ValueExpr, environment: ValueEnvironme
     case "list": {
       const values = expression.items.map((item) => evaluateValue(item, environment));
       if (!values.every(isComputeValue)) {
-        throw runtimeType("VALUE_LIST_NOT_COMPUTE", "list values must contain compute values", expression.span);
+        throw vmType("VALUE_LIST_NOT_COMPUTE", "list values must contain compute values", expression.span);
       }
       return values;
     }
@@ -41,7 +41,7 @@ export function evaluateValue(expression: ValueExpr, environment: ValueEnvironme
       for (const [key, item] of Object.entries(expression.entries)) {
         const value = evaluateValue(item, environment);
         if (!isComputeValue(value)) {
-          throw runtimeType("VALUE_RECORD_NOT_COMPUTE", "record values must contain compute values", item.span);
+          throw vmType("VALUE_RECORD_NOT_COMPUTE", "record values must contain compute values", item.span);
         }
         result[key] = value;
       }
@@ -79,14 +79,14 @@ export function evaluateOper(expression: OperExpr, environment: ValueEnvironment
     case "+":
       if (typeof left === "number" && typeof right === "number") return left + right;
       if (typeof left === "string" && typeof right === "string") return left + right;
-      throw runtimeType("OPER_TYPE_INVALID", "'+' requires two numbers or two strings", expression.span);
+      throw vmType("OPER_TYPE_INVALID", "'+' requires two numbers or two strings", expression.span);
     case "-":
       return expectNumber(left, expression.left.span) - expectNumber(right, expression.right.span);
     case "*":
       return expectNumber(left, expression.left.span) * expectNumber(right, expression.right.span);
     case "/": {
       const divisor = expectNumber(right, expression.right.span);
-      if (divisor === 0) throw runtimeType("OPER_DIVIDE_BY_ZERO", "division by zero", expression.span);
+      if (divisor === 0) throw vmType("OPER_DIVIDE_BY_ZERO", "division by zero", expression.span);
       return expectNumber(left, expression.left.span) / divisor;
     }
     case "<":
@@ -97,35 +97,35 @@ export function evaluateOper(expression: OperExpr, environment: ValueEnvironment
   }
 }
 
-export function asFrag(value: RuntimeValue, span: SourceSpan, label = "value"): Frag {
+export function asFrag(value: VmValue, span: SourceSpan, label = "value"): Frag {
   if (isFrag(value)) return value;
   if (typeof value === "string") return { kind: "frag", content: value };
-  throw runtimeType("FRAG_REQUIRED", `${label} must be a Frag or string`, span);
+  throw vmType("FRAG_REQUIRED", `${label} must be a Frag or string`, span);
 }
 
-export function asCompute(value: RuntimeValue, span: SourceSpan, label = "value"): ComputeValue {
+export function asCompute(value: VmValue, span: SourceSpan, label = "value"): ComputeValue {
   if (isFrag(value)) return value.content;
   if (isComputeValue(value)) return value;
-  throw runtimeType("COMPUTE_REQUIRED", `${label} cannot be used as a compute value`, span);
+  throw vmType("COMPUTE_REQUIRED", `${label} cannot be used as a compute value`, span);
 }
 
-export function asAgent(value: RuntimeValue, span: SourceSpan) {
-  if (!isAgentHandle(value)) throw runtimeType("AGENT_REQUIRED", "value must be an Agent handle", span);
+export function asAgent(value: VmValue, span: SourceSpan) {
+  if (!isAgentHandle(value)) throw vmType("AGENT_REQUIRED", "value must be an Agent handle", span);
   return value;
 }
 
-export function asMemory(value: RuntimeValue, span: SourceSpan) {
-  if (!isMemoryHandle(value)) throw runtimeType("MEMORY_REQUIRED", "value must be a Memory handle", span);
+export function asMemory(value: VmValue, span: SourceSpan) {
+  if (!isMemoryHandle(value)) throw vmType("MEMORY_REQUIRED", "value must be a Memory handle", span);
   return value;
 }
 
-export function asTaskGroup(value: RuntimeValue, span: SourceSpan) {
-  if (!isTaskGroupHandle(value)) throw runtimeType("TASK_GROUP_REQUIRED", "value must be a TaskGroup handle", span);
+export function asTaskGroup(value: VmValue, span: SourceSpan) {
+  if (!isTaskGroupHandle(value)) throw vmType("TASK_GROUP_REQUIRED", "value must be a TaskGroup handle", span);
   return value;
 }
 
-export function asSymbol(value: RuntimeValue, span: SourceSpan) {
-  if (!isSymbolRef(value)) throw runtimeType("SYMBOL_REQUIRED", "value must be an external symbol", span);
+export function asSymbol(value: VmValue, span: SourceSpan) {
+  if (!isSymbolRef(value)) throw vmType("SYMBOL_REQUIRED", "value must be an external symbol", span);
   return value;
 }
 
@@ -133,12 +133,12 @@ export function formatCompute(value: ComputeValue): string {
   return typeof value === "string" ? value : JSON.stringify(value);
 }
 
-function resolveName(expression: NameExpr, environment: ValueEnvironment): RuntimeValue {
+function resolveName(expression: NameExpr, environment: ValueEnvironment): VmValue {
   const initial = environment.values.get(expression.name);
   if (initial === undefined) {
-    throw runtimeType("VALUE_UNAVAILABLE", `value '${expression.name}' is unavailable`, expression.span);
+    throw vmType("VALUE_UNAVAILABLE", `value '${expression.name}' is unavailable`, expression.span);
   }
-  let value: RuntimeValue = initial;
+  let value: VmValue = initial;
   for (const segment of expression.path) {
     if (isAgentHandle(value) && segment === "memory") {
       value = value.memory;
@@ -159,7 +159,7 @@ function resolveName(expression: NameExpr, environment: ValueEnvironment): Runti
         continue;
       }
     }
-    throw runtimeType(
+    throw vmType(
       "VALUE_PATH_INVALID",
       `path segment '${String(segment)}' is unavailable on '${expression.name}'`,
       expression.span,
@@ -168,24 +168,24 @@ function resolveName(expression: NameExpr, environment: ValueEnvironment): Runti
   return value;
 }
 
-function expectComputeOperand(value: RuntimeValue, span: SourceSpan): ComputeValue {
+function expectComputeOperand(value: VmValue, span: SourceSpan): ComputeValue {
   return isFrag(value) ? value.content : asCompute(value, span, "oper operand");
 }
 
 function expectBoolean(value: ComputeValue, span: SourceSpan): boolean {
-  if (typeof value !== "boolean") throw runtimeType("BOOLEAN_REQUIRED", "operand must be boolean", span);
+  if (typeof value !== "boolean") throw vmType("BOOLEAN_REQUIRED", "operand must be boolean", span);
   return value;
 }
 
 function expectNumber(value: ComputeValue, span: SourceSpan): number {
-  if (typeof value !== "number") throw runtimeType("NUMBER_REQUIRED", "operand must be numeric", span);
+  if (typeof value !== "number") throw vmType("NUMBER_REQUIRED", "operand must be numeric", span);
   return value;
 }
 
 function compare(operator: "<" | "<=" | ">" | ">=", left: ComputeValue, right: ComputeValue, span: SourceSpan): boolean {
   if ((typeof left !== "number" || typeof right !== "number") &&
       (typeof left !== "string" || typeof right !== "string")) {
-    throw runtimeType("OPER_TYPE_INVALID", `operator '${operator}' requires comparable operands`, span);
+    throw vmType("OPER_TYPE_INVALID", `operator '${operator}' requires comparable operands`, span);
   }
   if (typeof left === "number" && typeof right === "number") {
     if (operator === "<") return left < right;
@@ -211,6 +211,6 @@ function cloneCompute<T extends ComputeValue>(value: T): T {
   return structuredClone(value);
 }
 
-function runtimeType(code: string, message: string, span: SourceSpan): FlowRuntimeError {
-  return new FlowRuntimeError(code, message, { span });
+function vmType(code: string, message: string, span: SourceSpan): AflVmError {
+  return new AflVmError(code, message, { span });
 }

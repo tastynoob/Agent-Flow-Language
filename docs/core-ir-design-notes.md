@@ -40,7 +40,7 @@ Coder/Reviewer 只是验证语义的第一个例子，IR 不应把角色、审�
 
 ## 3. 当前草案补出的语义
 
-需求给出了主要形态，但 runtime 仍需要一些可执行规则。当前文档暂时提出以下方案，后续可以根据示例调整。
+需求给出了主要形态，但 VM 仍需要一些可执行规则。当前文档暂时提出以下方案，后续可以根据示例调整。
 
 ### 3.1 Block 内按依赖调度
 
@@ -59,13 +59,13 @@ Coder/Reviewer 只是验证语义的第一个例子，IR 不应把角色、审�
 
 Flow 本身是半静态数据流。不可变 Frag 和 compute value 很适合按 SSA 思路建立 producer/consumer dependency；传统 SSA 的 block parameter、phi 和全局唯一名称也有利于 verifier 与 lowering。
 
-但 AFL IR 首先是描述 Agent flow。当前文本草案允许后续 block activation 把同一可读名称绑定到新结果，例如 `code` 在 revise 后表示新版本；每次实际产生的值仍然不可变，并可由 runtime 分配独立版本。
+但 AFL IR 首先是描述 Agent flow。当前文本草案允许后续 block activation 把同一可读名称绑定到新结果，例如 `code` 在 revise 后表示新版本；每次实际产生的值仍然不可变，并可由 VM 分配独立版本。
 
 是否把 block parameter 或严格 SSA 名称暴露给手写 IR，继续由循环、并行和可视化案例决定。内部表示可以先采用 SSA-like version，而不要求表面语法完全模仿编译器 IR。
 
 ### 3.3 Frag 是可进入 Memory 的最小业务数据
 
-把 record、enum 和 generic type 全部放入 Core IR，会让它迅速膨胀成完整 DSL。另一方面，只返回无身份的宿主对象，也不利于跨 Agent、跨 runtime 和 trace 传递。
+把 record、enum 和 generic type 全部放入 Core IR，会让它迅速膨胀成完整 DSL。另一方面，只返回无身份的宿主对象，也不利于跨 Agent、跨 VM 和 trace 传递。
 
 当前草案把普通业务结果统一为 `Frag(string)`。它可以直接作为 prompt 参数、Agent 输入或 Memory message content。JSON 只是字符串协议之一；简单 review 可以直接使用 `finish` sentinel 和文本缺陷列表。
 
@@ -94,7 +94,7 @@ Agent 输出在来源 Memory 中具有 `assistant` role，但同一内容交给 
 
 复杂判断如果全部拆成 opcode，会让 Core IR 偏离 flow；完全禁止脚本，又会迫使每个 frontend 发明不可移植的隐藏扩展。
 
-当前草案把 Python、TypeScript 和 shell 直接标在指令上，并要求输入显式列出。Runtime/package 可以根据场景允许、沙箱化或拒绝它们。这样 portable flow 与环境绑定 flow 可以共享主体语义，而不会假装两者具有相同部署条件。
+当前草案把 Python、TypeScript 和 shell 直接标在指令上，并要求输入显式列出。VM/package 可以根据场景允许、沙箱化或拒绝它们。这样 portable flow 与环境绑定 flow 可以共享主体语义，而不会假装两者具有相同部署条件。
 
 ## 4. 尚需案例验证的问题
 
@@ -118,7 +118,7 @@ Agent 输出在来源 Memory 中具有 `assistant` role，但同一内容交给 
 1. 它描述的是稳定的 flow 行为，还是普通宿主计算？
 2. 去掉它后，常见 flow 是否明显难写或无法表达？
 3. 它能否从两 Agent 案例扩展到任意数量、任意角色和嵌套 flow？
-4. Runtime 是否能观察、验证和记录它，而不是只能相信自然语言？
+4. VM 是否能观察、验证和记录它，而不是只能相信自然语言？
 5. 它是否迫使 Core IR 承担 package、schema 或 provider 本应负责的内容？
 
 满足这些标准不代表设计永久固定，只表示它值得进入下一轮实现验证。

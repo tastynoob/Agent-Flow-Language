@@ -80,12 +80,12 @@ export interface CapabilityAdapter {
 
 export interface ExternalFlowRequest {
   readonly flow: SymbolRef;
-  readonly args: readonly RuntimeArgument[];
+  readonly args: readonly VmArgument[];
   readonly signal: AbortSignal;
 }
 
 export interface ExternalFlowAdapter {
-  invoke(request: ExternalFlowRequest): RuntimeArgument | Promise<RuntimeArgument>;
+  invoke(request: ExternalFlowRequest): VmArgument | Promise<VmArgument>;
 }
 
 export interface FormatRequest {
@@ -110,7 +110,7 @@ export interface SchemaAdapter {
 
 export interface MoveRequest {
   readonly move: SymbolRef;
-  readonly args: readonly RuntimeArgument[];
+  readonly args: readonly VmArgument[];
   readonly signal: AbortSignal;
 }
 
@@ -121,20 +121,20 @@ export interface MoveAdapter {
 export interface FreedomMovePlan {
   readonly kind: "move";
   readonly move: SymbolRef;
-  readonly args?: readonly RuntimeArgument[];
+  readonly args?: readonly VmArgument[];
 }
 
 export interface FreedomExistingFlowPlan {
   readonly kind: "flow";
   readonly flow: SymbolRef;
-  readonly args?: readonly RuntimeArgument[];
+  readonly args?: readonly VmArgument[];
 }
 
 export interface FreedomGeneratedFlowPlan {
   readonly kind: "generated";
   readonly source: string;
   readonly entry: string;
-  readonly args?: readonly RuntimeArgument[];
+  readonly args?: readonly VmArgument[];
 }
 
 export type FreedomPlan = FreedomMovePlan | FreedomExistingFlowPlan | FreedomGeneratedFlowPlan;
@@ -162,7 +162,7 @@ export interface FreedomPolicyRequest {
   readonly block: string;
 }
 
-export interface RuntimePolicy {
+export interface VmPolicy {
   readonly maxConcurrency?: number;
   readonly maxDispatchWorkers?: number;
   readonly maxDispatchTasks?: number;
@@ -210,10 +210,10 @@ export interface TraceSink {
   emit(event: TraceEvent): void | Promise<void>;
 }
 
-export type RuntimeArgument = Frag | ComputeValue | SymbolRef;
+export type VmArgument = Frag | ComputeValue | SymbolRef;
 
-export interface RuntimeBindings {
-  readonly agents: AgentAdapter;
+export interface VmBindings {
+  readonly agents?: AgentAdapter;
   readonly prompts?: PromptAdapter;
   readonly input?: InputAdapter;
   readonly scripts?: ScriptAdapter;
@@ -223,6 +223,6 @@ export interface RuntimeBindings {
   readonly schemas?: SchemaAdapter;
   readonly moves?: MoveAdapter;
   readonly freedom?: FreedomAdapter;
-  readonly policy?: RuntimePolicy;
+  readonly policy?: VmPolicy;
   readonly trace?: TraceSink;
 }

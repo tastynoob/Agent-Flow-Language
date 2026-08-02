@@ -5,7 +5,7 @@ import type {
   TraceEvent,
   TraceSink,
 } from "./adapters.js";
-import { FlowRuntimeError } from "./errors.js";
+import { AflVmError } from "./errors.js";
 
 export type MockAgentHandler = (
   request: AgentRunRequest,
@@ -25,7 +25,7 @@ export class MockAgentAdapter implements AgentAdapter {
     this.calls.push(cloneRequest(request));
     const handler = this.handlers.get(request.agent.name);
     if (handler === undefined) {
-      throw new FlowRuntimeError("MOCK_HANDLER_MISSING", `no mock handler for '${request.agent.name}'`);
+      throw new AflVmError("MOCK_HANDLER_MISSING", `no mock handler for '${request.agent.name}'`);
     }
     const result = await handler(request);
     return typeof result === "string" ? { output: result } : structuredClone(result);
