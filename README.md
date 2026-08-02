@@ -1,5 +1,7 @@
 # Agent Flow Language
 
+> 设计状态：当前代码是 structured HIR prototype。instruction-oriented Core IR 正在重新设计，初步定义见 [Core IR 草案](docs/core-ir-draft.md)，在草案检阅完成前暂不将现有 `FlowNode` 视为最终 Canonical IR。
+
 AFL 是一个 IR-first 的 Agent 工作流语言项目。Canonical Flow IR 定义控制流、状态、并发、可靠性、事件和受控动态规划；Agent、skill、MCP、网页访问和其他具体能力由 runtime adapter 提供。
 
 当前仓库包含：
@@ -91,6 +93,7 @@ adapter module 必须显式导出 `RuntimeBindings`。portable IR 不会自动�
 
 - [项目目标](docs/project-goals.md)
 - [语言形态决策](docs/language-form.md)
+- [Core IR 初步定义](docs/core-ir-draft.md)
 - [IR v0.1](docs/ir-v0.1.md)
 - [Runtime adapters](docs/runtime-adapters.md)
 - [实现状态](docs/implementation-status.md)

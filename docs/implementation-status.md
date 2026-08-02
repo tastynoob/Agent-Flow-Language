@@ -4,11 +4,12 @@
 
 ## 当前阶段
 
-IR v0.1 原型已经完成，进入语义稳定与真实 flow 验证阶段。
+Structured HIR 原型已经完成。当前暂停扩展旧 `FlowNode`，进入 instruction-oriented Core IR 的设计复核阶段。
 
 ## 已确认决策
 
-- Canonical Flow IR 是语言无关的唯一语义核心；
+- 长期语义核心应是语言无关的 instruction-oriented Core IR；
+- 当前 `AflProgram/FlowNode` 实现重新定位为 structured HIR prototype；
 - TypeScript 用于第一份 builder、validator、simulator 和 reference runtime；
 - Python 作为 generator frontend，只生成 `.aflir`；
 - IR 只定义 workflow，不内建网页、文件、shell 或 MCP tool 行为；
@@ -19,7 +20,7 @@ IR v0.1 原型已经完成，进入语义稳定与真实 flow 验证阶段。
 ## 实现进度
 
 - [x] 项目目标与语言形态决策
-- [x] IR v0.1 语义基线
+- [x] Structured HIR v0.1 语义实验
 - [x] TypeScript IR 类型与 validator
 - [x] TypeScript builder
 - [x] TypeScript reference runtime
@@ -27,6 +28,8 @@ IR v0.1 原型已经完成，进入语义稳定与真实 flow 验证阶段。
 - [x] OpenAI-compatible Agent adapter 概念验证
 - [x] Python generator frontend
 - [x] 跨语言一致性测试
+- [ ] Core IR 草案检阅与定稿
+- [ ] Core verifier、VM 和 HIR lowering
 
 ## 验证记录
 
@@ -63,3 +66,9 @@ IR v0.1 原型已经完成，进入语义稳定与真实 flow 验证阶段。
 ### 2026-08-02：限制 v0.1 的动态修改方式
 
 动态修改不直接覆盖正在运行的 Program。`freedom` 可以生成在当前 frame 中运行的 continuation，或生成作为独立 flow revision 运行的新 FlowDefinition。两者都必须经过 validation、policy 和 trace；持久替换已部署 package 留待后续版本定义发布与审批协议。
+
+### 2026-08-02：现有 IR 重新定位为 HIR
+
+设计复核确认，现有 `FlowNode` 将 `loop`、`parallel`、`retry`、`try` 等高层结构直接作为 runtime 节点，未达到最小正交指令集的目标。它不再称为 Canonical Core IR，而作为 structured HIR 和语义实验保留。
+
+新的 Core IR 方向采用 basic block、类型化 SSA register、terminator、`do/seqdo`、`jump/branch`、`fork/sync`、`call`、prompt 与通用 `invoke`。在 `docs/core-ir-draft.md` 通过检阅前，不重写 runtime，也不继续扩充旧节点集合。

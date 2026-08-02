@@ -1,7 +1,9 @@
-# AFL Canonical Flow IR v0.1
+# AFL Structured Flow HIR Prototype v0.1
 
-状态：实现基线
+状态：已实现的高层语义实验，待 Core IR 检阅后重新定位
 日期：2026-08-02
+
+> 设计复核发现，本模型直接把 `loop`、`parallel`、`retry` 等高层结构作为节点，更适合作为 HIR，而不是最终 Canonical Core IR。新的指令式 Core IR 初步定义见 [Core IR 草案](core-ir-draft.md)。本文件保留用于记录已经实现和测试过的高层语义，不再作为底层 VM 指令规范。
 
 ## 1. 范围
 
