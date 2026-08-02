@@ -1,7 +1,6 @@
 # Agent Flow Language 项目目标
 
-状态：草案
-日期：2026-08-02
+> Proposal：本文记录长期目标，不描述当前 AFL VM 的实现契约。
 
 ## 1. 愿景
 
@@ -32,7 +31,7 @@
 
 ## 3. 项目定位
 
-Agent Flow Language（暂称 AFL）是一门行为描述与编排语言。
+Agent Flow Language（AFL）是一门行为描述与编排语言。
 
 一个 AFL 程序应当能够声明：
 

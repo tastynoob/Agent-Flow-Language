@@ -1,8 +1,5 @@
 # AFL IR 示例
 
-状态：与当前语法、语义草案配套
-日期：2026-08-02
-
 ## 1. Coder / Reviewer 修订循环
 
 ```text
@@ -85,7 +82,7 @@ parallel_review(code):
         ret reports
 ```
 
-三个 Agent 调用彼此没有数据或 Memory 依赖，因此 VM 可以同时启动。`prompt` 等三个 Frag 都完成后，再按 package formatter 把它们组合成新的 Frag。
+三个 Agent 调用彼此没有数据或 Memory 依赖，因此 VM 可以同时启动。三个 Frag 都完成后，Prompt binding 根据 `@prompt.combine_reports` 将它们组合成新的 Frag。
 
 ## 5. Dispatch Child Flow
 
@@ -97,7 +94,7 @@ full_review(code):
         ret reports
 ```
 
-`dispatch` 返回 TaskGroup handle；这些 child flow 不继承某个已有 Agent 的 Memory。`sync` 按 task group interface 把多个 Frag 结果聚合成一个 Frag。
+`dispatch` 返回 TaskGroup handle；这些 child flow 不继承某个已有 Agent 的 Memory。省略 formatter 的 `sync` 将多个 Frag content 编码成 JSON string array，并包装为一个 Frag。
 
 ## 6. Fork Agent Branches
 
@@ -158,7 +155,7 @@ structured_review(code):
         ret report
 ```
 
-`@schema.ReviewReport` 可以约束和校验 JSON，但 `report` 仍是 role-free Frag，其 content 是 JSON 字符串。解析、转换或复杂判断可以交给 `oper` 的显式 function 或 script executor。
+`@schema.ReviewReport` 由 Schema binding 校验，但 `report` 仍是 role-free Frag，其 content 是 JSON 字符串。解析、转换或复杂判断交给 script binding。
 
 ## 9. `oper` 与 Script Executor
 
@@ -185,7 +182,7 @@ inspect_issue(repository, number):
         ret report
 ```
 
-`invoke` 把 MCP 输出格式化为 role-free Frag。若由 Analyst 在 `seqdo` 内自行选择 MCP，则属于 Agent 内部行为，不需要单独写 `invoke`。
+`invoke` 通过 Capability binding 调用 `@mcp.github.get_issue`，并把返回字符串包装为 role-free Frag。若由 Analyst 在 `seqdo` 内自行调用工具，则属于 Agent adapter 内部行为。
 
 ## 11. Freedom Fallback
 
@@ -210,7 +207,7 @@ route_task(task):
         ret result
 ```
 
-`freedom.flow` 在已知路由无法覆盖任务时接管，并返回 role-free Frag。Planner 的候选 child flow 仍需经过 VM validation 和 policy 检查。
+`freedom.flow` 在已知路由无法覆盖任务时接管，并返回 role-free Frag。Freedom binding 返回的 plan 需要通过 mode 和结构检查；generated flow 还会经过 parser 与 validator，可选 policy 可以拒绝执行。
 
 ## 12. 可复用 Flow 集
 
@@ -223,4 +220,4 @@ deliver(task):
         ret packaged
 ```
 
-Prompt、Agent binding 和 node/flow 都可以通过 package symbol 复用。各 flow 的业务输入输出使用 Frag，因此 package 可以自行约定文本或 JSON 协议。
+`@flow.*` symbol 由 External Flow binding 解析，业务输入输出通过 Frag 或 compute value 传递。当前 IR 没有 package 声明或导入语法。

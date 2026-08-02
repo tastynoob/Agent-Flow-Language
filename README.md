@@ -1,23 +1,53 @@
 # Agent Flow Language
 
-Agent Flow Language（AFL）是一种面向 Agent 工作流的描述语言。它以 flow-oriented IR 表达 Agent、Memory、Frag、控制流、依赖并行、公共 flow 和受验证的 `freedom` 行为，使工作流可以被检查、执行、组合和分发。
+AFL 是一种面向 Agent 工作流的描述语言，当前实现提供文本 IR、parser、semantic validator、dependency scheduler 和 TypeScript VM。
 
-仓库目前包含第一版 TypeScript reference VM：文本 AFL 经过 parser、semantic validator 和 dependency scheduler 后，由显式 VM bindings 执行。语言语义仍处于 v0 草案阶段，API 与文本格式可能继续调整。
+文本 AFL 通过显式 VM bindings 连接 Agent、Prompt、Input、Script、Capability、外部 Flow、Formatter、Schema、Freedom 和 Trace 实现。当前格式为 v0，API 与文本格式可能继续调整。
+
+AFL提供一种最小IR实现，并不提供高级描述，可以使用python、typescript等语言作为AFL IR generator前端，以提供更加便捷的表达方式
 
 ## 架构
 
 ```text
-Python / TypeScript generator / future AFL DSL
-                         |
-                         v
-                      AFL IR
-                         |
-              parser / validator / AFL VM
-                         |
-       Agent / Prompt / Memory / Capability binding
+AFL IR source -> parser -> validator -> dependency scheduler -> AFL VM -> bindings
 ```
 
-AFL IR 本身保持语言无关。TypeScript 是当前 reference VM；Python、TypeScript generator 和未来专用 DSL 都可以作为 frontend。`python/` 仍是早期 Structured HIR frontend，仅保留作历史实验，不兼容当前 IR。
+## 一个代表性工作流
+
+下面的 flow 让 Coder 完成任务，再把 Coder 的完整 Memory 复制给 Reviewer。Reviewer 返回 `finish` 时结束；否则缺陷列表会交回 Coder，随后再次审核：
+
+```text
+main(task):
+    entry:
+        coder = agent @agent.coder
+        coder.sysprompt "Implement the requested change and return the current complete result."
+        code = coder.seqdo task
+        jump review
+
+    review:
+        review_memory = memory.copy coder.memory
+        reviewer = agent @agent.reviewer, review_memory
+        reviewer.sysprompt "Return exactly finish when correct; otherwise return a defect list."
+        review_result = reviewer.seqdo "Review the latest implementation."
+        finish = oper review_result == "finish"
+        jump finish, done, revise
+
+    revise:
+        fix_prompt = prompt "Fix every listed defect", review_result
+        code = coder.seqdo fix_prompt
+        jump review
+
+    done:
+        ret code
+```
+
+```text
+task -> Coder -> copy Memory -> Reviewer -> finish -> result
+          ^                         |
+          +------ defect list ------+
+```
+
+这里的 Agent 调用、Memory 复制、结果依赖、条件跳转和循环都是 VM 执行的 flow 语义，不是宿主代码中的隐藏编排。相同 primitive 还能通过 `dispatch/sync` 表达并行 Worker，通过 `fork` 创建继承上下文的 Agent 分支，并在预定义路径不足时使用受验证的 `freedom` fallback。完整文件见 [`examples/coder-reviewer.afl`](examples/coder-reviewer.afl)，并行案例见 [`docs/guides/parallel-voting.md`](docs/guides/parallel-voting.md)。
 
 ## AFL VM
 
@@ -70,17 +100,6 @@ DEEPSEEK_API_KEY=... npm run smoke:deepseek
 
 `DEEPSEEK_MODEL` 可以覆盖默认的 `deepseek-v4-flash`，`DEEPSEEK_BASE_URL` 可以覆盖默认 API 地址。密钥不会进入 AFL source、fixture 或 trace。
 
-## 设计文档
+## 文档
 
-- [项目目标](docs/project-goals.md)
-- [语言形态分析](docs/language-form.md)
-- [虚拟机工作定义](docs/vm-work.md)
-- [AFL IR 设计总览](docs/core-ir-draft.md)
-- [AFL IR 文本语法](docs/core-ir-syntax.md)
-- [AFL IR 执行语义](docs/core-ir-semantics.md)
-- [Memory 基础设施语义](docs/core-ir-memory.md)
-- [AFL IR 示例](docs/core-ir-examples.md)
-- [AFL IR 设计说明](docs/core-ir-design-notes.md)
-- [Parallel Voting 表达力案例](docs/afl-case-study-parallel-voting.md)
-
-语法、执行语义和 Memory 文档描述当前候选规则；设计说明记录推导与开放问题，不属于规范。
+[实现文档](docs/README.md)描述当前 parser、validator、VM 与 CLI 已支持的行为。尚未进入实现契约的长期目标和设计讨论保存在仓库的 `proposals/` 目录，不随 npm package 发布。

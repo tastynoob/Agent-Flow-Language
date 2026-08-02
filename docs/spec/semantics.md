@@ -1,11 +1,8 @@
-# AFL IR 执行语义草案
-
-状态：v0 讨论方案，等待案例检验
-日期：2026-08-02
+# AFL IR 执行语义
 
 ## 1. 范围
 
-本文说明 node、basic block、dependency、Frag、role 和核心指令在当前草案中的含义。它用于对齐 frontend 与 VM，不定义 package、schema 描述语言或 provider API。
+本文说明当前 validator、dependency scheduler 和 VM 对 node、basic block、Frag、role 与各类指令的处理方式。
 
 ## 2. Node 调用
 
@@ -18,7 +15,7 @@
 5. 执行 block terminator；
 6. 遇到 `ret`、`fail` 或未处理的 VM error 时结束调用。
 
-Node 参数和已经完成的指令结果可以被后续 basic block 使用。Node invocation 结束后，普通工作值随调用释放；需要长期保存的内容应进入 memory、artifact 或外部 store。
+Node 参数和已经完成的指令结果可以被后续 basic block 使用。Node invocation 结束后，其 frame 不再由 VM 保留。
 
 ## 3. Basic Block
 
@@ -32,7 +29,7 @@ Node 参数和已经完成的指令结果可以被后续 basic block 使用。No
 
 跳回之前的 block 会创建新的 block activation，因此可以表达循环。
 
-每次指令执行产生的 Frag 或 compute value 都是不可变结果。当前文本草案允许名称在后续 block activation 中绑定到新结果；VM、trace 或 lowering 可以给每次结果分配独立版本。这保留了 SSA-like 数据流属性，但暂不要求手写 IR 暴露 phi 或严格 SSA 名称。
+Frag 和 compute value 在写入 frame 时按值保存。名称可以在后续 block activation 中重新绑定；同一个 block 内不允许重复定义名称。
 
 一个 block activation 内不允许两条指令写同一个 `dst`。
 
@@ -48,7 +45,7 @@ Frag {
 }
 ```
 
-Frag 的 IR 可见内容只有字符串。实现可以在 trace 或 object store 中记录 identity、producer 和 provenance，但这些 sidecar metadata 不改变 Frag 的字符串语义。
+Frag 的 VM 表示只包含 `kind` 和 `content`。
 
 Frag 不带 role。同一个 Frag 可以被多个消费者读取，也可以用不同 role 加入不同 Memory。
 
@@ -67,7 +64,7 @@ Role 属于 Frag 进入 Memory 的边，而不是 Frag 自身属性。基础 rol
 
 ### 4.3 Memory
 
-第一版把 Memory 的可观察语义视为有序 Message 序列：
+Memory handle 保存有序 Message 序列：
 
 ```text
 Memory {
@@ -75,7 +72,7 @@ Memory {
 }
 ```
 
-存储实现可以额外使用 artifact store、summary、索引或 provider session，只要对 AFL 暴露的 append、copy、apply 和 Agent 上下文行为保持一致。
+Memory handle 还记录 VM 内部 identity 和可选 owner，用于资源依赖与绑定检查。
 
 ## 5. 结果类别
 
@@ -85,7 +82,7 @@ Memory {
 - 计算结果：`oper` 与 script executor 返回 bool、number、string 或宿主结构等本地 compute value；
 - 资源结果：`agent`、`memory.copy`、`memory.apply`、`dispatch`、`fork` 返回 VM handle。
 
-资源 handle 不会为了满足统一字符串形式而包装成 Frag。它们只用于后续资源指令，不能直接作为 Agent message 发送。
+资源 handle 不会包装成 Frag，也不能作为 Agent message、Prompt 参数、Capability 参数或外部 Flow 参数发送。
 
 JSON 是 Frag content 的一种可选编码，不是 Core IR 的内部数据模型。Flow 可以使用纯文本 sentinel、JSON、XML、Markdown 或自定义字符串协议。
 
@@ -110,7 +107,7 @@ Basic block 的 terminator 建立 flow 依赖。目标 block 只在当前 block 
 
 ### 6.3 Agent 与 Memory 依赖
 
-Agent 调用和 `memory.append` 会读写绑定 Memory。同一 Agent 或同一 Memory 上的状态性指令形成资源依赖。当前文本草案按它们在 block 中的顺序确定该资源依赖方向。
+Agent 调用和 `memory.append` 会读写绑定 Memory。同一 Agent 或同一 Memory 上的状态性指令形成资源依赖，依赖方向按它们在 block 中的文本顺序确定。
 
 不同 Agent 使用不同 Memory 时，不会仅因为文本相邻而互相等待。需要让同类 Agent 并行工作时，可以创建多个 Agent instance，并按需要复制上下文。
 
@@ -120,10 +117,9 @@ Agent 调用和 `memory.append` 会读写绑定 Memory。同一 Agent 或同一 
 
 - 它读取的 Frag、compute value 或 handle 已经产生；
 - 它依赖的前序 block 已完成；
-- 它需要的 Agent、Memory 或 capability 当前可用；
-- VM policy 允许启动。
+- 它需要的 Agent、Memory 或 TaskGroup handle 已经产生。
 
-所有 ready 指令都可以并行启动。并发上限、rate limit 和预算可以推迟启动，但不会新增业务 dependency。
+所有 ready 指令都可以并行启动。VM 默认最多同时执行 32 个 Agent、Script 和 Capability adapter 调用；`VmPolicy.maxConcurrency` 可以修改该上限。
 
 ## 7. Agent 与 Prompt
 
@@ -138,17 +134,17 @@ reviewer = agent @agent.reviewer, review_memory
 
 ### 7.2 `agent.sysprompt`
 
-`agent.sysprompt` 设置或替换 Agent 的 system prompt。它隐含 `system` role，并影响该 Agent 后续工作。Provider 是否把 system prompt 单独保存为配置，不改变 AFL 中的 role 语义。
+`agent.sysprompt` 设置或替换 Agent handle 上单独保存的 system prompt。后续 `AgentRunRequest` 通过 `systemPrompt` 字段携带该值；它不会作为普通 Message 写入 Memory。
 
 ### 7.3 `prompt`
 
-`prompt` 把 prompt source 和参数格式化为一个 Frag。Prompt package 决定模板替换、分隔和参数编码；literal 实现可以直接拼接字符串。
+Prompt source 是 symbol 时，VM 调用 Prompt binding 的 `render`。Source 是 literal、Frag 或 compute value 时，VM 将 source 与格式化后的参数用两个换行符连接。两种形式都返回 Frag。
 
-`prompt` 返回的 Frag 没有 role。只有它被传给 `agent.do/seqdo`、`agent.sysprompt` 或 `memory.append` 时，才获得 user、system、tool 或其他 role。
+`prompt` 返回的 Frag 没有 role。它被传给 `agent.do/seqdo` 或 `memory.append` 时才形成带 role 的 Message。
 
 ### 7.4 `input`
 
-`input` 暂停当前指令并等待外部输入。输入被包装成 role-free Frag 后产生 `dst`。输入来源是人、事件还是其他 adapter，不决定它后续进入 Memory 时的 role。
+`input` 将 prompt Frag、可选 schema、run id 和当前位置交给 Input binding。Binding 返回字符串后，VM 执行可选 schema 校验，并将字符串包装成 role-free Frag。
 
 ### 7.5 `do`
 
@@ -163,9 +159,9 @@ Role-free 返回值可以被另一个 Agent 作为 `user` message 接收，也�
 
 ### 7.6 `seqdo`
 
-`agent.seqdo` 与 `do` 使用相同的输入和最终输出规则，但允许同一个 Agent 连续完成多步工作，直到报告完成、需要外部输入、失败或触发 VM 限制。
+`agent.seqdo` 与 `do` 使用相同的输入和最终输出规则。VM 对两者都调用一次 `AgentAdapter.run`，并通过 `mode` 字段区分；多步执行与停止条件由 adapter 实现。
 
-内部可以产生多条 assistant、tool 和 observation Message。AFL 指令只返回最后约定的业务输出 Frag；完整过程保留在 Agent Memory 和 trace 中。
+Adapter 可以在 `messages` 中返回中间 Message。VM 依次追加这些 Message，再以 `assistant` role 追加 `output`，指令返回包装 `output` 的 Frag。
 
 ### 7.7 输出格式约束
 
@@ -175,7 +171,7 @@ Agent 调用可以带 schema symbol：
 report = reviewer.seqdo prompt, @schema.Report
 ```
 
-VM 可以要求模型输出 JSON 并校验 schema，但校验后的 `report` 仍是包装 JSON 文本的 Frag，不会自动变成 Core IR record。
+存在 schema operand 时，VM 要求 Schema binding 存在，并用它校验 Agent 输出字符串。校验后的 `report` 仍是 Frag，不会自动变成 Core IR record。
 
 简单 flow 不必使用 JSON。例如 Reviewer 可以约定：没有缺陷时精确输出 `finish`，否则输出文本缺陷列表：
 
@@ -184,7 +180,7 @@ review_result = reviewer.seqdo review_prompt
 finish = oper review_result == "finish"
 ```
 
-比较按 Frag 的原始字符串执行，不自动 trim、忽略大小写或解析自然语言。需要其他规则时应由 prompt、`oper` function 或 script 明确表达。
+比较按 Frag 的原始字符串执行，不自动 trim、忽略大小写或解析自然语言。需要其他规则时使用 script binding 显式转换。
 
 ## 8. `oper` 与 Script Executor
 
@@ -230,7 +226,7 @@ copied = memory.copy source_memory
 new_agent = memory.apply source_agent, memory
 ```
 
-`memory.apply` 使用 source Agent 的 binding 与配置创建一个新的 Agent handle，并把给定 Memory 作为其 working Memory。它不修改 source Agent，也不再次复制 Memory。第一版要求 Memory 尚未绑定其他 Agent；否则 validator 拒绝该操作，避免隐式产生 shared mutable Memory。调用方需要独立副本时先显式执行 `memory.copy`。
+`memory.apply` 使用 source Agent 的 symbol 与 system prompt 创建新的 Agent handle，并把给定 Memory 作为其 working Memory。它不修改 source Agent，也不再次复制 Memory。Memory 已有 owner 时，VM 报告 `MEMORY_ALREADY_BOUND`；调用方需要独立副本时先执行 `memory.copy`。
 
 ## 10. 控制流
 
@@ -245,11 +241,11 @@ jump condition, true_target, false_target
 
 ### 10.2 `ret`
 
-`ret` 结束当前 node invocation。业务 flow 通常返回 Frag；内部 helper 是否允许返回 compute value，由其接口决定。
+`ret value` 返回 frame 中的对应值；无操作数的 `ret` 返回空 Frag。`call` 和 `dispatch` 会把 child 的 compute value 格式化为 Frag，并拒绝 child 返回的 handle。
 
 ### 10.3 `fail`
 
-`fail` 以错误结束当前 node invocation。错误可以使用 Frag 或 VM error value 表示。Retry、catch 和 compensation 暂可由 basic block、子 flow 和 VM policy 组合。
+`fail value` 以 `FLOW_FAILED` 结束当前 node invocation。Frag 使用 `content` 作为错误消息，compute value 使用其格式化文本，handle 使用固定错误消息。
 
 ## 11. Flow 组合
 
@@ -275,11 +271,11 @@ Batch 形式批量启动同一个 flow：
 dispatch count, flow, task
 ```
 
-`count` 可以是硬编码非负整数，也可以是 Agent 输出经 `oper` 或 script executor 解析得到的整数。VM 创建 `count` 次 `flow(task)`。每个 child 接收同一个 task Frag，但获得独立 node invocation、Agent 和 Memory。
+`count` 必须求值为非负整数 compute value。Agent 输出是 Frag，需要先由 script binding 转换为 number。VM 创建 `count` 次 `flow(task)`；每个 child 拥有独立 node invocation，并接收 task 值的副本。
 
-VM policy 可以限制同时运行的 child 数量，使部分逻辑 Worker 排队，但不得静默改变 `count`。`count` 不是绕过预算、rate limit 或部署上限的权限参数。
+VM 默认允许一次 dispatch 创建最多 10,000 个 task，并最多同时运行 16 个 worker。`VmPolicy.maxDispatchTasks` 和 `maxDispatchWorkers` 可以修改这两个限制，但不会改变声明的 `count`。
 
-这两种形式都不表示 iterable map。运行时 task list 的逐项分发如果成为核心需求，应另行定义，不能通过猜测 `task` 内容隐式实现。
+这两种形式都不遍历运行时 task list。当前 VM 没有 iterable map 指令。
 
 ### 11.3 `fork`
 
@@ -302,11 +298,13 @@ Branch Agent 沿用 source Agent 的 binding 和配置，并绑定独立复制�
 
 `fork` 返回 branch Agent handle。启动动作的输出已经以 `assistant` role 写入 branch Memory，但这条快捷形式不额外返回 Frag。后续对 branch Agent 的 `do`、`seqdo`、`sysprompt` 或 Memory 写入，与启动动作形成同一 Agent 的资源依赖。
 
-多条互不依赖的 `fork` 指令可以并行启动任意数量的分支。需要 list 或 batch child flow、独立结果集合和 `sync` 时使用 `dispatch`。`fork` 是 `memory.copy`、`memory.apply` 与启动动作的组合快捷方式，这些步骤在 trace 中仍应可见。
+多条互不依赖的 `fork` 指令可以并行启动分支。需要 list 或 batch child flow、独立结果集合和 `sync` 时使用 `dispatch`。Trace 记录 `fork.started`、内部 Agent 事件和 `fork.completed`。
 
 ### 11.4 `sync`
 
-`sync` 等待 TaskGroup，并按 dispatch item 的声明顺序或 batch ordinal 收集 child Frag。可选 formatter 把结果集合编码成一个 Frag；省略时使用 task group interface 的默认 formatter。Formatter 可以输出 JSON 字符串或 package 声明的其他文本格式。
+`sync` 等待 TaskGroup，并按 list 声明顺序或 batch ordinal 收集 child Frag。省略 formatter 时，VM 把各 Frag 的 content 编码为 JSON string array。指定 formatter 时，VM 调用 Formatter binding。任一 child 失败会取消同组其他 child，`sync` 抛出该失败；同一个 TaskGroup 只能 sync 一次。
+
+Validator 要求每个 dispatch 产生的 TaskGroup 在 node 退出前恰好 sync 一次。VM 也会拒绝未消费或重复消费的 TaskGroup。
 
 Basic block 中互不依赖的普通 Agent 指令本身已经可以并行；`dispatch` 表达独立 child flow 的生命周期，`fork` 表达从 source Agent 复制上下文并立即工作的分支关系。
 
@@ -320,15 +318,15 @@ Agent 在 `do/seqdo` 内部自行使用 tool，与 flow 显式执行 `invoke` �
 
 `freedom.move` 从显式候选 move 中选择并执行一步；`freedom.flow` 选择已有 flow 或生成临时 child flow。两者的业务结果都返回 role-free Frag。
 
-候选行为在执行前接受 symbol、capability、预算和 policy 检查。一次 freedom fallback 不自动等价于永久改写当前程序；长期 revision 可以在后续案例中继续设计。
+VM 把 planner Agent 的 system prompt 和 Memory messages 交给 Freedom binding，不会为该指令另外调用 Agent binding。Freedom binding 返回的 plan 必须符合所用指令的 mode。`freedom.move` 还要求 move 位于显式候选列表中。可选 `approveFreedom` policy 返回 `false` 时拒绝执行；通过后，VM 调用 Move、External Flow binding，或解析并验证 generated flow。
 
 ## 14. 失败与挂起
 
-指令可以完成、等待外部事件或失败：
+指令可以完成、等待 adapter 或失败：
 
 - `input` 可以等待外部输入；
-- `seqdo` 可以等待 Agent 所需的外部输入；
+- `do/seqdo` 等待 Agent binding；
 - `sync` 可以等待 child flow；
 - VM error、格式校验失败、权限拒绝和显式 `fail` 会使当前路径失败。
 
-Timeout、重试、取消和恢复策略暂由 VM policy 或可复用 flow 表达。是否提升为核心指令，需要用长任务和长期 Agent 案例验证。
+`AflVm.run` 接受 `AbortSignal`，取消信号会传递给 adapter 和 child flow。VM 还使用 `maxSteps` 防止无限执行；默认值为 100,000。当前 IR 没有 timeout、retry、catch 或 compensation 指令。

@@ -1,11 +1,8 @@
-# AFL Memory 规则草案
-
-状态：基础规则讨论稿
-日期：2026-08-02
+# AFL Memory 语义
 
 ## 1. 最小模型
 
-第一版只需要三个概念：
+当前实现使用三个业务概念：
 
 ```text
 Frag {
@@ -38,7 +35,7 @@ coder = agent @agent.coder
 
 后续 `coder.do/seqdo` 自动使用 `coder.memory`，不需要每次显式传入 Memory handle。
 
-默认 Memory 至少在当前 node invocation 内保持。跨 invocation 或长期持久化可以由 VM 提供持久 handle，不改变 Agent 指令形式。
+Memory 是当前 VM run 中的 handle。实现没有持久化 Memory adapter，也不会在不同 VM run 之间自动恢复 Message。
 
 ## 3. Agent 输入与输出
 
@@ -61,7 +58,7 @@ result = coder.do tool, tool_result
 
 Agent 输出在来源 Memory 中是 assistant Message，但返回 Frag 不带 `assistant`。因此它进入另一个 Agent 时可以重新解释为 `user`、`tool` 或其他 role。
 
-`seqdo` 使用相同的边界规则。其内部可以向 Agent Memory 加入多条 assistant/tool Message，最后只把约定的业务输出作为 role-free Frag 返回。
+`seqdo` 使用相同的边界规则。Agent adapter 可以返回中间 Message；VM 依次追加这些 Message，再追加最终 `assistant` 输出，并把最终输出作为 role-free Frag 返回。
 
 ## 4. `memory.append`
 
@@ -111,7 +108,7 @@ Copy 不需要 role operand。它处理的是已经带 role 的完整 Message �
 branch = memory.apply source_agent, branch_memory
 ```
 
-`memory.apply` 使用 source Agent 的 binding 与配置创建新的 Agent，并把指定 Memory 绑定为它的 working Memory。它不修改 source Agent，也不隐式复制 Memory。第一版要求传入尚未绑定其他 Agent 的 Memory；shared Memory 另行定义。需要隔离时先执行 `memory.copy`：
+`memory.apply` 使用 source Agent 的 symbol 与 system prompt 创建新的 Agent，并把指定 Memory 绑定为它的 working Memory。它不修改 source Agent，也不隐式复制 Memory。传入的 Memory 已有 owner 时，VM 报告 `MEMORY_ALREADY_BOUND`。需要隔离时先执行 `memory.copy`：
 
 ```text
 branch_memory = memory.copy source_agent.memory
@@ -124,7 +121,7 @@ branch = memory.apply source_agent, branch_memory
 coder.sysprompt @prompt.coder
 ```
 
-`sysprompt` 隐含 `system` role。VM 可以把 system prompt 保存为 Memory 中的特殊 Message，也可以映射为 provider 的独立配置；对 AFL flow 来说，它都属于该 Agent 后续可见的 system context。
+`sysprompt` 设置 Agent handle 上单独保存的 system prompt，不会向 `messages` 追加 Message。后续 Agent 工作通过 `AgentRunRequest.systemPrompt` 接收该值。
 
 设置 Reviewer system prompt 不会修改被复制的 Coder Memory，也不会反向影响 Coder 配置。
 
@@ -211,14 +208,6 @@ Fork 完成后：
 
 不需要继承上下文的并行 child flow 使用 `dispatch`。显式 `memory.copy` 仍然保留，用于 Reviewer 与 Coder 使用不同 Agent binding、只复制但暂不执行，或需要自行决定 Memory 交给哪个 Agent 的场景。
 
-## 13. 后续扩展
+## 13. 当前限制
 
-`append`、`copy` 和 `apply` 构成当前最小语义。以下能力可以在真实用例中继续评估：
-
-- `memory.format`：把完整 Memory 序列化成一个 role-free Frag；
-- `memory.select`：选择部分 Message 并保留 role；
-- `memory.merge`：显式合并多份 Memory；
-- shared Memory：多个 Agent 受协调地写入同一 Memory；
-- persistent Memory：跨 flow invocation 继续存在。
-
-这些扩展需要同时定义 Message 顺序、写冲突、权限和 replay 行为。
+当前 parser 和 VM 只实现 `memory.append`、`memory.copy`、`memory.apply` 以及 Agent 的 `.memory` 引用。没有 `memory.format`、`memory.select`、`memory.merge`、shared Memory 或 persistent Memory 指令。

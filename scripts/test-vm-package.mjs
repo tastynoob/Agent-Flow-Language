@@ -36,15 +36,15 @@ try {
     cache,
   );
 
+  const installedPackage = join(install, "node_modules", "@afl-lang", "core");
+  await access(join(installedPackage, "docs", "README.md"));
+  await assertMissing(join(installedPackage, "proposals"));
   const executable = process.platform === "win32"
     ? join(install, "node_modules", ".bin", "afl-vm.cmd")
     : join(install, "node_modules", ".bin", "afl-vm");
   await access(executable);
   const commandModule = join(
-    install,
-    "node_modules",
-    "@afl-lang",
-    "core",
+    installedPackage,
     "bin",
     "vm-command.mjs",
   );
@@ -69,6 +69,16 @@ try {
   process.stdout.write(`installed ${basename(filename)}: afl-vm-ok\n`);
 } finally {
   await rm(temporary, { recursive: true, force: true });
+}
+
+async function assertMissing(path) {
+  try {
+    await access(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  throw new Error(`unpublished path was included in the package: ${path}`);
 }
 
 async function run(command, args, cwd, cacheDirectory) {

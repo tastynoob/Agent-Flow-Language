@@ -1,7 +1,6 @@
-# Agent Flow Language 的语言形态
+# Agent Flow Language 的候选语言形态
 
-状态：当前设计分析
-日期：2026-08-02
+> Proposal：本文讨论可能的 frontend 与工具链形态，不描述当前 AFL VM 的实现契约。
 
 ## 1. 讨论范围
 

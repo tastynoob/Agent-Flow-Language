@@ -1,8 +1,5 @@
 # AFL 案例：Parallel Voting
 
-状态：表达力检验草案
-日期：2026-08-02
-
 ## 1. 选择这个案例
 
 Parallel Voting 是一种常见的 Agent workflow：多个 Worker 独立处理同一任务，再由一个 Judge 汇总或裁决结果。Anthropic 的 [Building Effective AI Agents](https://www.anthropic.com/engineering/building-effective-agents) 将 voting 归入 parallelization，并以多次代码漏洞审查和内容分类为例。
@@ -41,7 +38,7 @@ parallel_security_review(code):
         ret result
 ```
 
-`reviewer_count` 是 compute value。Planner 返回的 Frag 需要由 script executor 解析并校验为非负整数；VM policy 还可以设置允许的最大值。
+`reviewer_count` 是 compute value。Planner 返回的 Frag 由 Script binding 转换为 number；dispatch 在运行时要求它是非负整数。`maxDispatchTasks` policy 可以限制 task 总数。
 
 `dispatch reviewer_count, review_once, code` 创建 `reviewer_count` 次 `review_once(code)`。每次调用拥有独立的 node invocation、Agent 和默认 Memory，但接收相同的 `code` Frag。各 Worker 之间没有数据或 Memory dependency，因此可以并行运行；`sync` 是它们的汇合点。
 
@@ -81,23 +78,17 @@ Dispatch Worker 默认不共享 Memory。若评审需要从某个已有 Agent �
 
 Batch 版本使用两个 node 和十五条指令表达了动态数量决策、同构 Worker 创建、并行执行、Memory 隔离、结果汇合与最终裁决。Core IR 不需要增加专门的 voting、shared state 或 reducer 指令。
 
-List 版本则说明，同一个并行原语也可以描述固定的多专家审查。Prompt package 可以进一步把安全、正确性和测试等评审范式封装在各自 flow 中。
+List 版本说明，同一个并行原语也可以描述固定的多专家审查。不同 Prompt 与外部 Flow symbol 分别由对应 binding 解析。
 
-## 6. 暴露出的边界
+## 6. 当前行为与限制
 
-这个案例也留下几项需要继续收敛的语义：
-
-- Batch Worker 是否需要可选的实例序号或实例 metadata；
-- `count` 的数值校验、最大值和资源预算由 validator 还是 VM policy 负责；
-- 单个 child 失败时，`sync` 采用整体失败还是允许 all-settled；
-- 结果顺序按声明顺序、实例序号还是完成顺序确定；
-- 相同 flow、task、模型配置和确定性推理可能产生重复结果，voting flow 如何声明采样差异；
-- 若后续需要把不同 task 逐项分发给同一个 flow，应设计独立的 map 语义，而不是改变 batch dispatch。
-
-这些问题不妨碍当前两种 `dispatch` 形式描述基础 Parallel Voting，但会影响 VM 的可复现性和容错行为。
+- Batch Worker 不接收实例序号或 metadata；
+- `count` 在 VM 运行时校验，默认 task 总数上限为 10,000；
+- 默认最多同时运行 16 个 dispatch worker；
+- 任一 child 失败会取消同组其他 child，`sync` 不提供 all-settled 结果；
+- 结果按 list 声明顺序或 batch ordinal 排列，不按完成顺序排列；
+- 当前没有 iterable map、race 或 per-worker sampling 配置语法。
 
 ## 7. 结论
 
-当前 AFL 草案可以较紧凑地表达 Parallel Voting，并且两种 `dispatch` 形式各自保持单一含义：list dispatch 描述显式 child call 集合，batch dispatch 描述同一 flow 与 task 的多实例执行。需要继承 Agent Memory 时再使用 `fork`，使“并行”与“上下文分支”不再混为同一语义。
-
-这个案例能够说明 AFL 对并行审查类 flow 有实际表达力，但还不能代表任意动态派单。带 task list 的 Orchestrator-Workers 更适合在 map、动态 flow 生成或其他分发语义明确后另行检验。
+当前实现可以用两种 `dispatch` 表达 Parallel Voting：list dispatch 描述显式 child call 集合，batch dispatch 描述同一 flow 与 task 的多实例执行。需要继承 Agent Memory 时使用 `fork`。运行时 task list 的逐项派发不属于这两种形式。

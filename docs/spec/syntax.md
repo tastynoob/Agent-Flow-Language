@@ -1,11 +1,8 @@
-# AFL IR 文本语法草案
+# AFL IR 文本语法
 
-状态：讨论稿，供语法检阅
-日期：2026-08-02
+## 1. 范围
 
-## 1. 设计范围
-
-本文定义 AFL IR 的文本骨架、指令格式、Frag 和 role 写法。Schema、package、Agent provider 和宿主脚本语言由外部规范或 VM binding 提供。
+本文定义当前 parser 接受的 AFL IR 文本骨架、指令格式、Frag 和 role 写法。外部 symbol 的具体行为由 VM binding 提供；当前 IR 没有 package 或 provider 声明语法。
 
 一个 IR 文件由若干 node 组成：
 
@@ -137,7 +134,7 @@ Frag = wrapper<string>
 
 Frag 在 IR 中表现为一个名称，字符串 wrapper 是其运行时表示。Frag 自身不带 role；JSON、XML、Markdown 或 flow 自定义格式都只是它所包装的字符串内容。
 
-String literal 在需要 Frag 的位置自动包装成 Frag。没有参数的 prompt symbol 也可以直接解析成 Frag；带参数的 formatter 使用 `prompt` 指令显式生成 Frag。
+String literal 在需要 Frag 的位置自动包装成 Frag。Prompt symbol 需要由 `prompt` 或 `agent.sysprompt` 交给 Prompt binding 渲染。
 
 指令结果分为三类：
 
@@ -200,11 +197,12 @@ fix_prompt = prompt @prompt.fix_bugs, review_result, artifact
 
 第一个 operand 是文本或 prompt symbol，其余 operand 由对应 formatter 转换为字符串。返回的 Frag 不带 role。
 
-`input` 暂停当前 flow，等待外部输入并返回 role-free Frag：
+`input` 把 prompt Frag 交给 Input binding，等待其返回字符串，并将结果包装为 role-free Frag：
 
 ```text
 answer = input "Choose a target branch"
-answer = input @prompt.choose_branch, @schema.BranchChoice
+question = prompt @prompt.choose_branch
+answer = input question, @schema.BranchChoice
 ```
 
 `input` 不预先指定这份 Frag 将来使用的 role。Schema 可以约束输入采用 JSON 等格式，但不会把返回值改成 Core IR record。
@@ -221,7 +219,7 @@ retry = oper attempt < max_attempts
 
 Frag 参与 string operation 时读取其包装的字符串。`oper` 不隐式把 Frag 猜测或解析成 JSON object；需要解析 JSON 或自定义格式时使用显式 operation 或 script executor。
 
-初始表达式集合包括逻辑、关系、简单算术、字符串比较、字段/索引读取和括号。`oper` 返回 bool、number、string 等本地计算值，不返回 Frag。
+表达式支持 `!`、一元 `-`、`&`、`|`、`==`、`!=`、`<`、`<=`、`>`、`>=`、`+`、`-`、`*`、`/`、字段/索引读取和括号。`oper` 返回 compute value，不返回 Frag。
 
 ## 9. Script Executor
 
@@ -293,7 +291,7 @@ reports = sync jobs
 reports = sync jobs, @format.json_array
 ```
 
-`dispatch` 返回 TaskGroup handle。`sync` 返回包含 child flow 结果集合的 Frag；可选 formatter 决定字符串格式，省略时使用 task group interface 的默认 formatter。`fork` 返回派生的 Agent handle，不使用 `sync` 汇合；需要结果时继续调用该 Agent，前一次输出已经保存在其 Memory 中。Race 和 all-settled 等形式留待并行案例继续收敛。
+`dispatch` 返回 TaskGroup handle。`sync` 返回包含 child flow 结果集合的 Frag；省略 formatter 时，content 是按声明顺序排列的 JSON string array。显式 formatter 由 Formatter binding 执行。`fork` 返回派生的 Agent handle，不使用 `sync` 汇合；需要结果时继续调用该 Agent，前一次输出已经保存在其 Memory 中。
 
 ## 11. Capability
 
@@ -304,7 +302,7 @@ page = invoke @skill.web.read, url
 issue = invoke @mcp.github.get_issue, repository, number
 ```
 
-Symbol 的输入、输出格式和授权由 package/VM binding 提供。
+Symbol 的输入、输出格式和授权由 Capability binding 与 policy 提供。
 
 ## 12. Memory
 
@@ -331,7 +329,7 @@ branch_memory = memory.copy coder.memory
 branch = memory.apply coder, branch_memory
 ```
 
-`memory.apply` 返回新的 Agent handle。新 Agent 沿用 source Agent 的 binding 与配置并使用给定 Memory；source Agent 不发生变化。第一版要求给定 Memory 尚未绑定其他 Agent。
+`memory.apply` 返回新的 Agent handle。新 Agent 沿用 source Agent 的 binding 与配置并使用给定 Memory；source Agent 不发生变化。给定 Memory 已绑定 Agent 时，VM 报告 `MEMORY_ALREADY_BOUND`。
 
 `memory.append` 需要 role，因为它建立从 Frag 到 Memory message 的边界。`memory.copy` 保留来源消息已有的 role，因此不接收新的 role。
 
