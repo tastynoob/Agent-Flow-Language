@@ -1,9 +1,9 @@
 # AFL Structured Flow HIR Prototype v0.1
 
-状态：已实现的高层语义实验，待 Core IR 检阅后重新定位
+状态：已实现并保留的高层语义实验
 日期：2026-08-02
 
-> 设计复核发现，本模型直接把 `loop`、`parallel`、`retry` 等高层结构作为节点，更适合作为 HIR，而不是最终 Canonical Core IR。新的指令式 Core IR 初步定义见 [Core IR 草案](core-ir-draft.md)。本文件保留用于记录已经实现和测试过的高层语义，不再作为底层 VM 指令规范。
+> 设计复核发现，本模型直接把 `loop`、`parallel`、`retry` 等高层结构作为节点，更适合作为 HIR，而不是最终 AFL IR。新的草案改用简单指令、basic block、node 和 dependency 描述 flow，初步定义见 [AFL IR 设计草案](core-ir-draft.md)。本文件只记录已经实现和测试过的旧高层语义，不再作为新 IR 的 runtime 规范。
 
 ## 1. 范围
 

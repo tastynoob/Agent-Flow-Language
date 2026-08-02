@@ -1,6 +1,6 @@
 # Agent Flow Language 项目目标
 
-状态：草案  
+状态：草案
 日期：2026-08-02
 
 ## 1. 愿景
@@ -26,7 +26,7 @@
 - 难以从实现代码中看出完整行为；
 - 难以移植到另一种 Agent runtime；
 - prompt、角色和控制流耦合，不能独立替换；
-- 缺少统一的类型、失败、并发和事件语义；
+- 缺少统一的数据格式、失败、并发和事件语义；
 - 很难把“三省六部”“coder-reviewer”“辩论投票”等范式作为库发布；
 - AI 可以临时规划，但规划通常是不可检查、不可重放的自然语言。
 
@@ -36,7 +36,7 @@ Agent Flow Language（暂称 AFL）是一门行为描述与编排语言。
 
 一个 AFL 程序应当能够声明：
 
-- Agent 及其类型化输入、输出和能力要求；
+- Agent 及其 Frag 输入输出格式和能力要求；
 - prompt 模板及其参数、结果契约和模型能力要求；
 - flow 的状态、事件、消息、artifact 和 memory 引用；
 - 顺序、并行、竞争、循环、分支、等待、取消和汇合；
@@ -55,7 +55,7 @@ Agent Flow Language（暂称 AFL）是一门行为描述与编排语言。
 
 ### 4.2 确定性控制与 AI 决策共存
 
-能够确定表达的流程应保持确定，例如类型检查、状态迁移、审批门和并发 join。只有在需要语义判断、开放式规划或预设分支无法处理时，才显式使用 Agent 决策。
+能够确定表达的流程应保持确定，例如格式与接口检查、状态迁移、审批门和并发 join。只有在需要语义判断、开放式规划或预设分支无法处理时，才显式使用 Agent 决策。
 
 ### 4.3 组合优先
 
@@ -67,7 +67,7 @@ prompt、Agent、move 和 flow 都应具有可声明的接口，可以作为参�
 
 ### 4.5 状态和数据流显式化
 
-避免使用一个无类型的全局 `Memory` 承载全部信息。对话、业务状态、artifact、长期记忆和运行时元数据应当可区分，并明确读写范围。
+避免使用一个隐式全局 `Memory` 隐藏全部数据流。普通业务数据使用 role-free Frag 传递，Frag 进入 Agent 或 Memory 时再指定 role；Agent Memory、artifact、长期存储和运行时 handle 应当可区分，并明确读写范围。
 
 ### 4.6 可验证、可追踪、可重放
 
@@ -100,14 +100,14 @@ prompt、Agent、move 和 flow 都应具有可声明的接口，可以作为参�
 - 可用 Agent、move、flow package 和 tool；
 - 剩余预算、deadline、权限和必须保持的约束。
 
-`freedom flow` 的结果应当是类型化 Flow IR，而不是不可检查的自然语言计划。生成结果在执行前必须经过解析、类型、能力和预算验证，并作为有作用域的子流程运行。
+`freedom flow` 的结果应当是可解析、可验证的 AFL IR，而不是不可检查的自然语言计划。生成结果在执行前需要经过 symbol、格式、能力、预算和 policy 验证，并作为有作用域的子流程运行。
 
 ## 6. 语言能力范围
 
 | 类别 | 必需能力 |
 | --- | --- |
-| 类型 | primitive、record、enum、generic、result/error、schema adapter |
-| Agent | interface、instance、capability、typed call、stream、cancel |
+| 数据 | Frag string、compute value、runtime handle、可选 schema/format adapter |
+| Agent | interface、instance、capability、Frag call、stream、cancel |
 | 状态 | local state、shared store handle、artifact、memory handle |
 | 控制流 | sequence、match、loop、return、finish、fail |
 | 并发 | parallel、race、join、map、reduce、structured cancellation |
@@ -123,8 +123,8 @@ prompt、Agent、move 和 flow 都应具有可声明的接口，可以作为参�
 
 一个 package 可以导出：
 
-- 类型和 Agent interface；
-- 类型化 prompt function；
+- Frag format、schema 和 Agent interface；
+- prompt formatter/function；
 - 原子 move；
 - 有独立运行状态的 flow function；
 - 编译期展开的 flow pattern；
@@ -140,7 +140,7 @@ use @afl/patterns/review-loop@^1;
 use @community/orgs/three-departments@3;
 ```
 
-prompt 不能只是字符串。它还应声明参数、输出类型、所需工具或模型能力，并可以携带示例与 eval case。
+Prompt package 可以是简单字符串，也可以是带参数的 formatter。它还可以声明输出格式、所需工具或模型能力，并携带示例与 eval case；执行 formatter 后产生的仍是 role-free Frag。
 
 flow function 应支持依赖注入，例如将 worker、reviewer、prompt、memory handle 和 policy 作为参数，从而让同一个 review loop 用于代码、文案、合同或研究报告。
 
@@ -152,7 +152,7 @@ flow function 应支持依赖注入，例如将 worker、reviewer、prompt、mem
 2. 用相同语言描述固定流程、事件驱动流程和 AI 自由兜底流程；
 3. 将同一 flow 绑定到不同模型、Agent runtime 和工具实现；
 4. 把 prompt、审核循环、并行研究、组织架构等发布为版本化 package；
-5. 对 flow 做类型检查、依赖检查、权限检查和基本的死路分析；
+5. 对 flow 做格式检查、依赖检查、权限检查和基本的死路分析；
 6. 用 mock Agent 仿真，不调用真实模型；
 7. 记录真实运行轨迹，并在固定 Agent 输出下确定性重放；
 8. 查看 freedom 为什么被触发、看到了哪些选择、生成了什么 continuation；
@@ -180,7 +180,7 @@ flow function 应支持依赖注入，例如将 worker、reviewer、prompt、mem
 第一阶段目标不是立即建设完整平台，而是验证语义内核：
 
 - 一份版本化的核心语义说明；
-- 一套语言无关、类型化的规范 Flow IR；
+- 一套语言无关、版本化且可验证的规范 Flow IR；
 - IR validator 和基础静态检查；
 - 一个 reference builder，用于快速构造和迭代 IR；
 - 一个 reference runtime，包含 mock Agent / simulator；

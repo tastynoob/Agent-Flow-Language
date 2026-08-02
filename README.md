@@ -1,12 +1,13 @@
 # Agent Flow Language
 
-> 设计状态：当前代码是 structured HIR prototype。instruction-oriented Core IR 正在重新设计，初步定义见 [Core IR 草案](docs/core-ir-draft.md)，在草案检阅完成前暂不将现有 `FlowNode` 视为最终 Canonical IR。
+> 设计状态：当前代码是 Structured HIR prototype。新的 flow-oriented AFL IR 已重写为 [设计草案](docs/core-ir-draft.md)，正在检阅语法、dependency、memory 与 `freedom` 语义，尚未进入实现。
 
-AFL 是一个 IR-first 的 Agent 工作流语言项目。Canonical Flow IR 定义控制流、状态、并发、可靠性、事件和受控动态规划；Agent、skill、MCP、网页访问和其他具体能力由 runtime adapter 提供。
+AFL 是一个 IR-first 的 Agent 工作流语言项目。新的 IR 使用简单指令、basic block、node 和 dependency 描述可动态执行的 Agent flow；Agent、memory、skill、MCP 和宿主脚本由 runtime binding 提供具体实现。
 
 当前仓库包含：
 
-- 语言无关的 AFL IR v0.1 语义；
+- 已实现的 Structured HIR v0.1 语义实验；
+- 尚在检阅、未实现的新 AFL IR 草案；
 - TypeScript IR 类型、validator、builder 和 reference runtime；
 - mock Agent、event、checkpoint 和 trace adapter；
 - `afl validate` / `afl run` CLI；
@@ -21,7 +22,7 @@ Python generator ----+--> .aflir --> Validator --> TypeScript Runtime --> Adapte
 未来 AFL DSL --------+
 ```
 
-IR 不包含 provider URL、API key 或 `fetch/browser/shell` 节点。一个 `invoke` 只引用声明过的逻辑 Agent operation，部署方决定如何绑定和授权。
+IR 不包含 provider URL 或 API key。`invoke` 通过 symbol 引用 skill、MCP 或 capability；显式 `python`、`typescript`、`shell` 指令属于 runtime-bound escape hatch，部署方可以授权、沙箱化或拒绝。
 
 ## 开发
 
@@ -32,7 +33,7 @@ npm test
 
 测试使用 Node.js 内建 test runner 和 pytest。TypeScript runtime 没有第三方运行时依赖。
 
-## TypeScript authoring
+## TypeScript authoring（当前 HIR）
 
 ```ts
 import {
@@ -58,7 +59,7 @@ const program = defineProgram({
 
 完整示例见 [examples/coder-reviewer.ts](examples/coder-reviewer.ts)。
 
-## Python frontend
+## Python frontend（当前 HIR）
 
 ```python
 from afl import define_program, expr as e, node as n, schema as s
@@ -93,7 +94,13 @@ adapter module 必须显式导出 `RuntimeBindings`。portable IR 不会自动�
 
 - [项目目标](docs/project-goals.md)
 - [语言形态决策](docs/language-form.md)
-- [Core IR 初步定义](docs/core-ir-draft.md)
-- [IR v0.1](docs/ir-v0.1.md)
+- [AFL IR 设计总览](docs/core-ir-draft.md)
+- [AFL IR 语义定义](docs/core-ir-semantics.md)
+- [Memory 基础设施语义](docs/core-ir-memory.md)
+- [AFL IR 文本语法](docs/core-ir-syntax.md)
+- [AFL IR 示例](docs/core-ir-examples.md)
+- [AFL IR 设计说明](docs/core-ir-design-notes.md)
+- [Parallel Voting AFL 案例](docs/afl-case-study-parallel-voting.md)
+- [Structured HIR v0.1](docs/ir-v0.1.md)
 - [Runtime adapters](docs/runtime-adapters.md)
 - [实现状态](docs/implementation-status.md)

@@ -107,7 +107,7 @@ export const reviewLoop = flow.fn("reviewLoop", ({ task, worker, reviewer }) =>
 
 优点：
 
-- discriminated union、generic 和 exhaustive match 很适合定义类型化 IR；
+- discriminated union、generic 和 exhaustive match 很适合定义 IR instruction、handle 和 validator；
 - Promise、AbortSignal、AsyncIterable、event 和 structured result 与以网络 I/O 为主的 Agent runtime 契合；
 - npm 可以快速承载早期私有 package；
 - 与浏览器、语言服务、可视化编辑器和 OpenClaw/Node 生态衔接较好；
@@ -144,7 +144,7 @@ freedom continuation -> constrained compiler ---+                 TypeScript ref
 核心规范由三部分构成：
 
 1. 语义模型：每个构造在状态、事件、并发和失败方面意味着什么；
-2. Canonical Flow IR：语言无关、版本化、可序列化的类型化 AST；
+2. Canonical Flow IR：语言无关、版本化、可序列化的 flow 指令与结构；
 3. Conformance tests：相同输入事件和固定 Agent 输出下应产生的状态与 trace。
 
 文本 DSL、TypeScript builder、Python builder 和可视化编辑器都是 IR 的 frontend，不拥有独立语义。
@@ -177,27 +177,20 @@ flow.emit("task.aflir")
 
 frontend 执行生成器、展开 package 和 generic，最终输出规范化的 `.aflir`。宿主语言的 `if/for` 在这个阶段执行；依赖 reviewer 输出的 `branch/loop` 则必须保留为 IR 节点，留到运行期执行。
 
-生成的 IR 必须通过 schema、类型、控制流、capability、权限和预算检查。任何无法完整翻译成 Canonical Flow IR 的 Python 或 TypeScript 行为都属于宿主扩展，不是可移植 AFL flow。
+生成的 IR 必须通过 Frag/schema 格式、symbol、控制流、capability、权限和预算检查。任何无法完整翻译成 Canonical Flow IR 的 Python 或 TypeScript 行为都属于宿主扩展，不是可移植 AFL flow。
 
 ### 7.3 Execution
 
-TypeScript reference runtime 只接收通过验证的 Canonical Flow IR，不读取或执行原始 Python、TypeScript 或未来 DSL 源码：
+TypeScript reference runtime 只接收通过验证的 Canonical Flow IR，不隐式执行 frontend 的 Python、TypeScript 或未来 DSL 源码：
 
 ```text
 afl validate task.aflir
 afl run task.aflir
 ```
 
-runtime 负责 scheduler、状态与事件、Agent 调用、并发和取消、adapter binding、checkpoint、trace 与 replay。具体模型 SDK、MCP、tool 和存储实现通过显式 adapter 或 capability 绑定。
+runtime 负责 scheduler、状态与事件、Agent 调用、并发和取消、adapter binding、checkpoint、trace 与 replay。具体模型 SDK、MCP、tool 和存储实现通过显式 adapter 或 capability 绑定。IR 中明确写出的 `python`、`typescript`、`shell` 指令是受 runtime policy 管理的宿主执行边界，不等同于加载并执行 frontend 源码。
 
-Agent 控制结果应使用结构化类型，不应把“审核未通过”“调用失败”和“无法判断”都压缩成布尔值。例如：
-
-```ts
-type ReviewResult =
-  | { status: "accepted" }
-  | { status: "revision_required"; issues: Issue[] }
-  | { status: "blocked"; reason: string };
-```
+Agent 的普通业务结果在 Core IR 中使用 role-free `Frag(string)`。Flow 可以选择适合任务的字符串协议：简单 Reviewer 可以在完成时返回精确的 `finish`，有缺陷时返回文本列表；需要稳定字段时可以返回经过外部 schema 校验的 JSON 字符串。Role 只在 Frag 被传给 Agent 或写入 Memory 时确定。
 
 ### 7.4 Dynamic continuation 与 self-modify
 
@@ -208,7 +201,7 @@ type ReviewResult =
 ```text
 freedom
   -> 生成候选 continuation IR 或 IR patch
-  -> schema/type/capability/budget validation
+  -> syntax/format/capability/budget validation
   -> policy 检查与可选人工批准
   -> 创建有作用域的子流程或新的 flow revision
   -> 执行并记录 trace
@@ -230,11 +223,11 @@ TypeScript reference runtime 还需要通过 conformance tests 明确并发分�
 
 builder 必须坚持以下规则：
 
-- 所有运行期控制流使用显式的 `flow.match`、`flow.loop`、`flow.parallel`；
+- 所有运行期控制流都应生成显式 AFL IR 指令与 basic block；
 - native `if/for` 只允许用于编译期生成，并在文档中称为 elaboration；
 - builder 的结果必须可以完整序列化为 Canonical Flow IR；
 - 闭包内不得捕获无法序列化的运行时对象；
-- runtime 不执行原始 TypeScript 源，只执行验证后的 IR；
+- runtime 不执行原始 frontend 源，只执行验证后的 IR；IR 内显式宿主脚本按部署 policy 处理；
 - package 的可移植产物是 IR、prompt 和 manifest，不是 npm 模块本身。
 
 ## 9. Package 的两层形式
@@ -256,7 +249,7 @@ builder 必须坚持以下规则：
 - 依赖范围、lock information 和内容哈希；
 - 可选签名。
 
-portable package 加载时不执行任意 Python、JavaScript 或 shell。需要宿主代码的功能通过显式 adapter/FFI capability 引用，由部署方绑定。
+portable package 可以禁止内联 Python、JavaScript 或 shell，只允许显式 adapter/FFI capability。需要宿主脚本的环境绑定 package 应在 manifest 中声明运行环境和权限，不能伪装成跨 runtime 可移植 flow。
 
 ## 10. 专用 DSL 的启动条件
 

@@ -4,71 +4,80 @@
 
 ## 当前阶段
 
-Structured HIR 原型已经完成。当前暂停扩展旧 `FlowNode`，进入 instruction-oriented Core IR 的设计复核阶段。
+仓库中的 Structured HIR prototype 已经完成并可运行。新的 AFL IR 正处于设计检阅阶段：文档已从 typed graph/full grammar 方案改写为面向 Agent flow 的简单指令、basic block、node 与 dependency 模型，尚未据此修改 parser、validator 或 runtime。
 
-## 已确认决策
+## 当前方向
 
-- 长期语义核心应是语言无关的 instruction-oriented Core IR；
-- 当前 `AflProgram/FlowNode` 实现重新定位为 structured HIR prototype；
-- TypeScript 用于第一份 builder、validator、simulator 和 reference runtime；
-- Python 作为 generator frontend，只生成 `.aflir`；
-- IR 只定义 workflow，不内建网页、文件、shell 或 MCP tool 行为；
-- Agent 和外部能力只能经声明接口与 runtime adapter 绑定；
-- 并发分支默认 frame 隔离，不隐式合并可变状态；
-- 动态 continuation/revision 必须先验证再执行。
+- AFL IR 作为语言无关的 flow 表示，TypeScript 实现第一份 reference runtime；
+- Python、TypeScript generator 和未来专用 DSL 都生成同一种 IR；
+- IR 采用 `dst = instr arg0, arg1, ...` 为主要指令形式；
+- Agent 保留 `agent.do`、`agent.seqdo` 等直接、易读的工作指令；
+- 无 dependency 的 Agent 工作允许并行，而不是把文本当作全局顺序；
+- `oper` 处理常见关系和逻辑，显式宿主脚本处理复杂计算；
+- 普通业务结果统一为 role-free `Frag(string)`，JSON 只是可选字符串格式；
+- `prompt` 和 `input` 返回 Frag，role 在 Agent/Memory 使用边界决定；
+- Agent 默认绑定 memory，并支持 `memory.append`、`memory.copy` 和 `memory.apply`；
+- Prompt、schema、Agent、flow 和 capability 通过 package symbol 复用；
+- `freedom` 保留为开放式 fallback，并在执行候选 flow 前接受验证与 policy 检查。
+
+这些内容仍属于 v0 草案。具体的 Agent-local 顺序、工作值更新、dispatch/fork mode、memory 扩展和 freedom revision 需要通过案例检验。
 
 ## 实现进度
 
-- [x] 项目目标与语言形态决策
+- [x] 项目目标与语言形态分析
 - [x] Structured HIR v0.1 语义实验
-- [x] TypeScript IR 类型与 validator
-- [x] TypeScript builder
-- [x] TypeScript reference runtime
+- [x] Structured HIR TypeScript 类型、validator 和 builder
+- [x] Structured HIR reference runtime
 - [x] mock adapter 与核心测试
 - [x] OpenAI-compatible Agent adapter 概念验证
 - [x] Python generator frontend
 - [x] 跨语言一致性测试
-- [ ] Core IR 草案检阅与定稿
-- [ ] Core verifier、VM 和 HIR lowering
+- [x] 重写 AFL IR 设计、语法、语义、Memory 和示例文档
+- [x] 用 Parallel Voting 案例检验 list dispatch 与 batch dispatch
+- [x] 区分独立 `dispatch` 与继承 Agent Memory 的 `fork`
+- [ ] 检阅并收敛 AFL IR v0 草案
+- [ ] 选择首批 conformance case
+- [ ] 实现新 IR parser、validator、scheduler 与 HIR lowering
 
-## 验证记录
+## 文档状态
+
+| 文档 | 作用 | 状态 |
+| --- | --- | --- |
+| `project-goals.md` | 项目目标和能力边界 | 已有基线 |
+| `language-form.md` | IR、frontend 和 runtime 的形态分析 | 初步决策 |
+| `core-ir-draft.md` | 新 AFL IR 总览 | 待检阅草案 |
+| `core-ir-syntax.md` | 简单文本语法 | 待检阅草案 |
+| `core-ir-semantics.md` | dependency 与指令行为 | 待检阅草案 |
+| `core-ir-memory.md` | Agent-memory 基础规则 | 待检阅草案 |
+| `core-ir-examples.md` | 代表性 flow | 待案例验证 |
+| `core-ir-design-notes.md` | 推导、取舍和开放问题 | 非规范说明 |
+| `afl-case-study-parallel-voting.md` | 主流 Agent flow 表达力检验 | 待实现验证 |
+| `ir-v0.1.md` | 已实现的旧 Structured HIR | 已实现原型 |
+
+## 已有原型验证记录
 
 2026-08-02：
 
 - TypeScript strict compile 通过；
 - Node test runner 的 validator、runtime 和 Python 跨语言测试通过；
 - Python frontend 4 项 pytest 通过；
-- CLI 对 `.aflir` 的 validate 和 run 通过；
+- CLI 对旧 `.aflir` 的 validate 和 run 通过；
 - OpenAI-compatible chat adapter 的 JSON output、HTTP error 和 secret redaction 测试通过；
-- Python 生成的并行 `forEach` flow 已由 TypeScript runtime 执行并得到预期结果。
+- Python 生成的并行 `forEach` HIR flow 已由 TypeScript runtime 执行并得到预期结果。
 
-当前环境未提供 `update_proxy`，且 `/etc/proxychains.conf` 没有代理端点，因此还没有下载 npm 构建依赖或生成 `package-lock.json`。本轮使用 VS Code 内置 TypeScript 6.0.3 完成严格编译；仓库的正常安装入口仍是 `npm install`。
+这些结果验证的是 Structured HIR prototype，不代表新的 AFL IR 草案已经实现。
 
-提供的 DeepSeek key 没有写入仓库、命令或 trace。OpenAI-compatible adapter 使用注入的 mock Fetch API 完成契约测试；由于代理端点不可用，本轮未执行 live API smoke test。
+当前环境没有生成 `package-lock.json`，也没有执行 live provider smoke test。已有 adapter 契约测试使用注入的 mock Fetch API，不包含真实 secret。
 
-## 后续范围
+## 下一轮实现前需要回答
 
-以下项目不属于本轮四项原型交付，仍需在后续迭代完成：
+- `do` 和 `seqdo` 的 adapter contract；
+- block 内 dependency 与 Agent-local 顺序能否覆盖长任务；
+- Frag formatter 与可选 structured output schema 的 package/linker 接口；
+- batch dispatch 的逻辑 Worker 数量、runtime 并发上限和失败传播；
+- fork 启动动作失败时，branch Agent handle 的状态与后续操作语义；
+- memory append/copy/apply 的一致性与持久 handle 边界；
+- `freedom.move/flow` 的选择、生成、验证和 trace 格式；
+- coder-reviewer、并行 research、三省六部和长期助手的 conformance case。
 
-- 固定 JSON Schema、IR migration 和更完整的静态类型推导；
-- package/module/prompt function 的分发格式；
-- checkpoint resume 与固定 Agent 输出 replay；
-- 三省六部等更大规模真实 flow 的语义验证；
-- live provider conformance、streaming adapter 和长期运行 event transport；
-- 专用 AFL DSL 的需求评估。
-
-## 状态调整记录
-
-### 2026-08-02：IR 与 runtime 实现语言解耦
-
-早期表述中的“IR 执行语言为 TypeScript”调整为“TypeScript 实现第一份 reference runtime”。IR 本身保持语言无关，避免 frontend、portable package 和其他 runtime 被 Node.js 绑定。
-
-### 2026-08-02：限制 v0.1 的动态修改方式
-
-动态修改不直接覆盖正在运行的 Program。`freedom` 可以生成在当前 frame 中运行的 continuation，或生成作为独立 flow revision 运行的新 FlowDefinition。两者都必须经过 validation、policy 和 trace；持久替换已部署 package 留待后续版本定义发布与审批协议。
-
-### 2026-08-02：现有 IR 重新定位为 HIR
-
-设计复核确认，现有 `FlowNode` 将 `loop`、`parallel`、`retry`、`try` 等高层结构直接作为 runtime 节点，未达到最小正交指令集的目标。它不再称为 Canonical Core IR，而作为 structured HIR 和语义实验保留。
-
-新的 Core IR 方向采用 basic block、类型化 SSA register、terminator、`do/seqdo`、`jump/branch`、`fork/sync`、`call`、prompt 与通用 `invoke`。在 `docs/core-ir-draft.md` 通过检阅前，不重写 runtime，也不继续扩充旧节点集合。
+在这些问题通过文档与案例检阅前，不继续扩充旧 `FlowNode`，也不把新草案描述成已实现规范。
