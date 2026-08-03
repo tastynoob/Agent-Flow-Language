@@ -103,3 +103,7 @@ DEEPSEEK_API_KEY=... npm run smoke:deepseek
 ## 文档
 
 [实现文档](docs/README.md)描述当前 parser、validator、VM 与 CLI 已支持的行为。尚未进入实现契约的长期目标和设计讨论保存在仓库的 `proposals/` 目录，不随 npm package 发布。
+
+## License
+
+本仓库中的代码、文档和示例均采用 [Apache License 2.0](LICENSE) 许可。

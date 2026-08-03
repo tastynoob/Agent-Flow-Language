@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "Reference virtual machine for Agent Flow Language IR",
+  "license": "Apache-2.0",
   "type": "module",
   "main": "./dist/src/index.js",
   "types": "./dist/src/index.d.ts",
@@ -17,6 +18,7 @@
     "afl-vm": "./bin/afl-vm.mjs"
   },
   "files": [
+    "LICENSE",
     "bin",
     "dist/src",
     "docs",
