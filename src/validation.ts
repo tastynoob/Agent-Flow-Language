@@ -322,6 +322,10 @@ function validateInstructionKinds(
 ): void {
   switch (instruction.op) {
     case "agent":
+      if (instruction.workspace !== undefined) {
+        validateWorkspaceExpression(module, instruction.workspace, kinds, diagnostics);
+        expectKind(module, instruction.workspace, kinds, ["compute", "unknown"], "Agent Workspace", diagnostics);
+      }
       if (instruction.memory !== undefined) expectNameKind(module, instruction.memory, kinds, ["memory", "unknown"], "Agent Memory", diagnostics);
       break;
     case "agent.sysprompt":
@@ -355,6 +359,39 @@ function validateInstructionKinds(
       break;
     default:
       break;
+  }
+}
+
+function validateWorkspaceExpression(
+  module: AflModule,
+  expression: ValueExpr,
+  kinds: ReadonlyMap<string, ValueKind>,
+  diagnostics: AflDiagnostic[],
+): void {
+  if (expression.kind === "literal") {
+    if (typeof expression.value !== "string" || expression.value.trim().length === 0) {
+      add(diagnostics, module, expression.span, "AGENT_WORKSPACE_INVALID", "Agent Workspace must be a non-empty path");
+    }
+    return;
+  }
+  if (expression.kind === "name") return;
+  if (expression.kind === "list") {
+    for (const item of expression.items) {
+      if (item.kind === "name") {
+        expectNameKind(module, item, kinds, ["compute", "unknown"], "Agent Workspace path", diagnostics);
+      }
+    }
+  }
+  if (expression.kind !== "list" || expression.items.length < 2 || expression.items.some((item) =>
+    item.kind !== "name" &&
+    (item.kind !== "literal" || typeof item.value !== "string" || item.value.trim().length === 0))) {
+    add(
+      diagnostics,
+      module,
+      expression.span,
+      "AGENT_WORKSPACE_INVALID",
+      "Agent Workspace must be a path or a list containing a primary path and at least one read-only path",
+    );
   }
 }
 

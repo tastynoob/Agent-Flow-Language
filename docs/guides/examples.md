@@ -13,7 +13,7 @@ coder_review(task):
 
     review:
         review_memory = memory.copy coder.memory
-        reviewer = agent @agent.reviewer, review_memory
+        reviewer = agent @agent.reviewer,, review_memory
         reviewer.sysprompt @prompt.reviewer
         review_prompt = prompt "Review the implementation. If no defect exists, output exactly finish; otherwise output the defect list"
         review_result = reviewer.do review_prompt
@@ -66,9 +66,9 @@ Reviewer 只看显式传入的 `code` Frag，不继承 Coder 的工作历史。
 ```text
 parallel_review(code):
     entry:
-        security = agent @agent.security_reviewer
-        quality = agent @agent.quality_reviewer
-        tests = agent @agent.test_reviewer
+        security = agent @agent.security_reviewer, "workers/security/"
+        quality = agent @agent.quality_reviewer, "workers/quality/"
+        tests = agent @agent.test_reviewer, "workers/tests/"
 
         security_prompt = prompt "Review security", code
         quality_prompt = prompt "Review maintainability", code
@@ -82,7 +82,7 @@ parallel_review(code):
         ret reports
 ```
 
-三个 Agent 调用彼此没有数据或 Memory 依赖，因此 VM 可以同时启动。三个 Frag 都完成后，Prompt binding 根据 `@prompt.combine_reports` 将它们组合成新的 Frag。
+三个 Agent 调用彼此没有数据或 Memory 依赖，并使用互不重叠的主工作区，因此 VM 可以同时启动。三个 Frag 都完成后，Prompt binding 根据 `@prompt.combine_reports` 将它们组合成新的 Frag。
 
 ## 5. Dispatch Child Flow
 
@@ -117,7 +117,7 @@ explore_alternatives(coder, task):
         ret alternatives
 ```
 
-三条 `fork` 分别从 `coder` 派生一个 Agent，并立即执行各自的首轮工作。每个 branch 的初始 Memory 都是 `coder.memory` 的独立副本，后续工作互不改写。同一 branch 上后续的 `do` 排在启动动作之后，三个 branch 之间仍可并行。
+三条 `fork` 分别从 `coder` 派生一个 Agent，并立即执行各自的首轮工作。每个 branch 的初始 Memory 都是 `coder.memory` 的独立副本，后续工作互不改写。Fork 会继承 Coder Workspace；如果它们共享可写路径，Workspace lock 会串行执行这些 branch。
 
 ## 7. `do` 与交互式路由
 

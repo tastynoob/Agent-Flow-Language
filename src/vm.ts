@@ -16,7 +16,13 @@ import {
   type AgentExecutorBackend,
   type BackendSessionRef,
 } from "./agent-executor.js";
-import { linkedController, ResourceLocks, Semaphore, throwIfAborted } from "./concurrency.js";
+import {
+  linkedController,
+  ResourceLocks,
+  Semaphore,
+  throwIfAborted,
+  WorkspaceLocks,
+} from "./concurrency.js";
 import { buildInstructionDependencies, instructionDestination } from "./dependencies.js";
 import {
   asAgent,
@@ -49,6 +55,8 @@ import {
   type ValueExpr,
 } from "./ir.js";
 import { parseAfl } from "./parser.js";
+import { RunMemoryPersistence } from "./memory-store.js";
+import { AFL_MESSAGE_ROLE_SCHEMA, canonicalModuleDigest, type Message } from "./memory.js";
 import {
   isAgentHandle,
   isMemoryHandle,
@@ -60,11 +68,18 @@ import {
   type TaskGroupHandle,
 } from "./vm-values.js";
 import { assertValidModule } from "./validation.js";
+import {
+  resolveAgentWorkspace,
+  resolveExecutionRoot,
+  type AgentWorkspaceSet,
+  workspaceKey,
+} from "./workspace.js";
 
 export interface VmRunOptions {
   readonly runId?: string;
   readonly signal?: AbortSignal;
   readonly maxSteps?: number;
+  readonly executionRoot?: string;
 }
 
 export interface VmRunResult {
@@ -85,11 +100,21 @@ interface VmRunContext {
   readonly maxSteps: number;
   readonly external: Semaphore;
   readonly locks: ResourceLocks;
+  readonly workspaceLocks: WorkspaceLocks;
+  readonly executionRoot: string;
+  readonly rootModuleDigest: string;
+  readonly persistence: RunMemoryPersistence;
   readonly counters: {
     steps: number;
     trace: number;
     handles: number;
   };
+}
+
+interface ActivationContext {
+  readonly path: string;
+  readonly moduleDigest: string;
+  readonly blockVisits: Map<string, number>;
 }
 
 interface TraceLocation {
@@ -133,17 +158,39 @@ export class AflVm {
       linked.dispose();
       throw new AflVmError("VM_POLICY_INVALID", "maxConcurrency must be a positive integer");
     }
+    const runId = options.runId ?? createRunId();
+    const rootModuleDigest = canonicalModuleDigest(this.module);
+    let persistence: RunMemoryPersistence | undefined;
+    let executionRoot: string;
+    try {
+      executionRoot = await resolveExecutionRoot(options.executionRoot ?? process.cwd(), linked.controller.signal);
+      persistence = await RunMemoryPersistence.open(
+        this.bindings.memoryPersistence,
+        executionRoot,
+        runId,
+        rootModuleDigest,
+        linked.controller.signal,
+      );
+    } catch (error) {
+      linked.dispose();
+      throw normalizeVmError(error);
+    }
     const context: VmRunContext = {
-      runId: options.runId ?? createRunId(),
+      runId,
       signal: linked.controller.signal,
       maxSteps,
       external: new Semaphore(maxConcurrency),
       locks: new ResourceLocks(),
+      workspaceLocks: new WorkspaceLocks(),
+      executionRoot,
+      rootModuleDigest,
+      persistence,
       counters: { steps: 0, trace: 0, handles: 0 },
     };
     try {
       await this.trace(context, "run.started", {}, { entry });
-      const output = await this.executeNode(this.module, entry, [...args], context);
+      const output = await this.executeNode(this.module, entry, [...args], context, context.signal, "root");
+      await persistence.close();
       await this.trace(context, "run.completed", {}, { entry });
       return { runId: context.runId, output };
     } catch (error) {
@@ -151,6 +198,7 @@ export class AflVm {
       await this.trace(context, "run.failed", {}, undefined, vmError);
       throw vmError;
     } finally {
+      await persistence.close().catch(() => {});
       linked.controller.abort(new AflVmError("RUN_CLOSED", "AFL run has closed"));
       linked.dispose();
     }
@@ -162,6 +210,7 @@ export class AflVm {
     args: readonly VmValue[],
     context: VmRunContext,
     invocationSignal: AbortSignal = context.signal,
+    activationPath = "root",
   ): Promise<VmValue> {
     throwIfAborted(invocationSignal);
     this.takeStep(context, `node '${nodeName}'`, invocationSignal);
@@ -182,6 +231,11 @@ export class AflVm {
       values: new Map(node.parameters.map((parameter, index) => [parameter, cloneVmValue(args[index]!)])),
       taskGroups: new Set(),
     };
+    const activation: ActivationContext = {
+      path: activationPath,
+      moduleDigest: canonicalModuleDigest(module),
+      blockVisits: new Map(),
+    };
     await this.trace(context, "node.started", { node: node.name });
     try {
       const blocks = new Map(node.blocks.map((block) => [block.name, block]));
@@ -192,7 +246,9 @@ export class AflVm {
           throw new AflVmError("BLOCK_UNKNOWN", `block '${blockName}' is not declared`, { span: node.span });
         }
         this.takeStep(context, `block '${node.name}.${block.name}'`, invocationSignal);
-        await this.executeBlock(frame, block, context, invocationSignal);
+        const blockVisit = activation.blockVisits.get(block.name) ?? 0;
+        activation.blockVisits.set(block.name, blockVisit + 1);
+        await this.executeBlock(frame, block, context, activation, blockVisit, invocationSignal);
         const terminator = block.terminator;
         if (terminator.op === "ret") {
           this.assertNoOutstandingGroups(frame, terminator.span);
@@ -231,6 +287,8 @@ export class AflVm {
     frame: MutableFrame,
     block: AflBlock,
     context: VmRunContext,
+    activation: ActivationContext,
+    blockVisit: number,
     invocationSignal: AbortSignal,
   ): Promise<void> {
     await this.trace(context, "block.started", { node: frame.node.name, block: block.name });
@@ -264,7 +322,16 @@ export class AflVm {
             started.add(index);
             active += 1;
             const instruction = block.instructions[index]!;
-            void this.executeInstruction(frame, block, instruction, index, context, linked.controller.signal)
+            void this.executeInstruction(
+              frame,
+              block,
+              instruction,
+              index,
+              context,
+              activation,
+              blockVisit,
+              linked.controller.signal,
+            )
               .then((value) => {
                 const destination = instructionDestination(instruction);
                 if (destination !== undefined && value !== undefined) frame.values.set(destination, value);
@@ -305,6 +372,8 @@ export class AflVm {
     instruction: AflInstruction,
     index: number,
     context: VmRunContext,
+    activation: ActivationContext,
+    blockVisit: number,
     signal: AbortSignal,
   ): Promise<VmValue | undefined> {
     throwIfAborted(signal);
@@ -312,7 +381,15 @@ export class AflVm {
     const location = { node: frame.node.name, block: block.name, instruction: index };
     await this.trace(context, "instruction.started", location, { op: instruction.op });
     try {
-      const value = await this.executeInstructionInner(frame, instruction, context, location, signal);
+      const value = await this.executeInstructionInner(
+        frame,
+        instruction,
+        context,
+        activation,
+        blockVisit,
+        location,
+        signal,
+      );
       await this.trace(context, "instruction.completed", location, { op: instruction.op });
       return value;
     } catch (error) {
@@ -326,13 +403,28 @@ export class AflVm {
     frame: MutableFrame,
     instruction: AflInstruction,
     context: VmRunContext,
+    activation: ActivationContext,
+    blockVisit: number,
     location: Required<TraceLocation>,
     signal: AbortSignal,
   ): Promise<VmValue | undefined> {
     switch (instruction.op) {
       case "agent": {
+        const workspaceValue = instruction.workspace === undefined
+          ? undefined
+          : evaluateValue(instruction.workspace, frame);
+        const workspace = await resolveAgentWorkspace(
+          workspaceValue,
+          context.executionRoot,
+          signal,
+          instruction.workspace?.span,
+        );
         const memory = instruction.memory === undefined
-          ? this.createMemory(context)
+          ? this.createMemory(
+              context,
+              this.memorySlot(frame, instruction, activation, blockVisit, location, "working"),
+              activation.moduleDigest,
+            )
           : asMemory(evaluateValue(instruction.memory, frame), instruction.memory.span);
         return context.locks.use([{ key: memory.id, mode: "write" }], signal, () => {
           if (memory.owner !== undefined) {
@@ -340,7 +432,12 @@ export class AflVm {
               span: instruction.span,
             });
           }
-          const agent = this.createAgent(context, { kind: "symbol", name: instruction.agent.name }, memory);
+          const agent = this.createAgent(
+            context,
+            { kind: "symbol", name: instruction.agent.name },
+            memory,
+            workspace,
+          );
           memory.owner = agent.id;
           return agent;
         });
@@ -422,7 +519,14 @@ export class AflVm {
       case "call": {
         const args = instruction.args.map((argument) => evaluateValue(argument, frame));
         return normalizeFlowResult(
-          await this.invokeFlow(frame.module, instruction.target, args, context, signal),
+          await this.invokeFlow(
+            frame.module,
+            instruction.target,
+            args,
+            context,
+            signal,
+            this.childActivationPath(activation, location, blockVisit, "call"),
+          ),
           instruction.span,
         );
       }
@@ -432,7 +536,7 @@ export class AflVm {
           args: call.args.map((argument) => evaluateValue(argument, frame)),
           span: call.span,
         }));
-        return this.startDispatch(frame, calls, context, location, signal);
+        return this.startDispatch(frame, calls, context, activation, blockVisit, location, signal);
       }
       case "dispatch.batch": {
         const count = asCompute(evaluateValue(instruction.count, frame), instruction.count.span, "dispatch count");
@@ -447,7 +551,7 @@ export class AflVm {
           args: [cloneVmValue(task)],
           span: instruction.span,
         }));
-        return this.startDispatch(frame, calls, context, location, signal);
+        return this.startDispatch(frame, calls, context, activation, blockVisit, location, signal);
       }
       case "sync": {
         const group = asTaskGroup(evaluateValue(instruction.taskGroup, frame), instruction.taskGroup.span);
@@ -489,10 +593,17 @@ export class AflVm {
             checkpoint: cloneMemoryCheckpoint(source.memory.checkpoint),
             systemPrompt: source.systemPrompt,
             agent: source.agent,
+            workspace: source.workspace,
           }),
         );
-        const memory = this.createMemory(context, snapshot.messages, snapshot.checkpoint);
-        const branch = this.createAgent(context, snapshot.agent, memory);
+        const memory = this.createMemory(
+          context,
+          this.memorySlot(frame, instruction, activation, blockVisit, location, "fork"),
+          activation.moduleDigest,
+          snapshot.messages,
+          snapshot.checkpoint,
+        );
+        const branch = this.createAgent(context, snapshot.agent, memory, snapshot.workspace);
         memory.owner = branch.id;
         if (snapshot.systemPrompt !== undefined) branch.systemPrompt = snapshot.systemPrompt;
         const input = asFrag(evaluateValue(instruction.action.input, frame), instruction.action.input.span, "fork input");
@@ -537,8 +648,9 @@ export class AflVm {
       case "memory.append": {
         const memory = asMemory(evaluateValue(instruction.memory, frame), instruction.memory.span);
         const value = asFrag(evaluateValue(instruction.frag, frame), instruction.frag.span, "memory.append value");
-        await context.locks.use([{ key: memory.id, mode: "write" }], signal, () => {
+        await context.locks.use([{ key: memory.id, mode: "write" }], signal, async () => {
           appendMemoryMessage(memory, { role: instruction.role, content: value.content });
+          await this.persistMemory(context, memory, signal);
         });
         return undefined;
       }
@@ -552,7 +664,15 @@ export class AflVm {
             checkpoint: cloneMemoryCheckpoint(memory.checkpoint),
           }),
         );
-        return this.createMemory(context, snapshot.messages, snapshot.checkpoint);
+        const copy = this.createMemory(
+          context,
+          this.memorySlot(frame, instruction, activation, blockVisit, location, "copy"),
+          activation.moduleDigest,
+          snapshot.messages,
+          snapshot.checkpoint,
+        );
+        await this.persistMemory(context, copy, signal);
+        return copy;
       }
       case "memory.apply": {
         const source = asAgent(evaluateValue(instruction.sourceAgent, frame), instruction.sourceAgent.span);
@@ -566,7 +686,7 @@ export class AflVm {
                 span: instruction.span,
               });
             }
-            const agent = this.createAgent(context, source.agent, memory);
+            const agent = this.createAgent(context, source.agent, memory, source.workspace);
             if (source.systemPrompt !== undefined) agent.systemPrompt = source.systemPrompt;
             memory.owner = agent.id;
             return agent;
@@ -575,7 +695,7 @@ export class AflVm {
       }
       case "freedom.move":
       case "freedom.flow":
-        return this.executeFreedom(frame, instruction, context, location, signal);
+        return this.executeFreedom(frame, instruction, context, activation, blockVisit, location, signal);
     }
   }
 
@@ -598,66 +718,127 @@ export class AflVm {
     return context.locks.use(
       [{ key: agent.id, mode: "write" }, { key: agent.memory.id, mode: "write" }],
       signal,
-      async () => {
-        appendMemoryMessage(agent.memory, { role, content: input.content });
-        await this.restoreAgentSession(agent, executor, context, signal);
-        const policyRequest: AgentRunRequest = {
-          runId: context.runId,
-          node: location.node,
-          block: location.block,
-          agent: agent.agent,
-          ...(agent.systemPrompt === undefined ? {} : { systemPrompt: agent.systemPrompt }),
-          messages: cloneMessages(agent.memory.messages),
-          ...(schema === undefined ? {} : { schema: toSymbol(schema) }),
-          signal,
-        };
-        const approved = await this.bindings.policy?.authorizeAgent?.(policyRequest);
-        if (approved === false) {
-          throw new AflVmError("AGENT_DENIED", `Agent '${agent.agent.name}' was denied`);
-        }
-        const request: AgentExecutionRequest = {
-          runId: context.runId,
-          node: location.node,
-          block: location.block,
-          agent: agent.agent,
-          ...(agent.systemPrompt === undefined ? {} : { systemPrompt: agent.systemPrompt }),
-          memory: cloneMessages(agent.memory.messages),
-          memoryRevision: agent.memory.revision,
-          ...(agent.session === undefined ? {} : { session: agent.session }),
-          ...(agent.sessionMemoryRevision === undefined
-            ? {}
-            : { sessionMemoryRevision: agent.sessionMemoryRevision }),
-          ...(schema === undefined ? {} : { schema: toSymbol(schema) }),
-          signal,
-        };
-        const host = this.createAgentHost(context, location);
-        await this.trace(context, "agent.started", location, { agent: agent.id });
-        try {
-          const result = await context.external.use(signal, () => executor.execute(request, host));
-          if (typeof result.output !== "string") {
-            throw new AflVmError("AGENT_OUTPUT_INVALID", "Agent executor output must be a string");
-          }
-          this.requireCompleted(result.stopReason);
-          await this.validateSchema(result.output, schema, signal);
-          for (const message of result.messages ?? []) {
-            if (typeof message.role !== "string" || typeof message.content !== "string") {
-              throw new AflVmError("AGENT_MESSAGES_INVALID", "Agent executor returned an invalid Message");
+      () => context.workspaceLocks.use(
+        [
+          { path: agent.workspace.primary.root, mode: "write" },
+          ...agent.workspace.readOnly.map((item) => ({ path: item.root, mode: "read" as const })),
+        ],
+        signal,
+        async () => {
+          let returnedSession: BackendSessionRef | undefined;
+          try {
+            this.validateWorkspaceCapabilities(agent.workspace, executor);
+            appendMemoryMessage(agent.memory, { role, content: input.content });
+            await this.persistMemory(context, agent.memory, signal);
+            await this.validateExecutorMemory(executor, agent, signal);
+            await this.restoreAgentSession(agent, executor, context, signal);
+            const policyRequest: AgentRunRequest = {
+              runId: context.runId,
+              node: location.node,
+              block: location.block,
+              agent: agent.agent,
+              ...(agent.systemPrompt === undefined ? {} : { systemPrompt: agent.systemPrompt }),
+              workspace: agent.workspace,
+              messages: cloneMessages(agent.memory.messages),
+              ...(schema === undefined ? {} : { schema: toSymbol(schema) }),
+              signal,
+            };
+            const approved = await this.bindings.policy?.authorizeAgent?.(policyRequest);
+            if (approved === false) {
+              throw new AflVmError("AGENT_DENIED", `Agent '${agent.agent.name}' was denied`);
             }
-            appendMemoryMessage(agent.memory, { role: message.role, content: message.content });
+            const request: AgentExecutionRequest = {
+              runId: context.runId,
+              node: location.node,
+              block: location.block,
+              agent: agent.agent,
+              ...(agent.systemPrompt === undefined ? {} : { systemPrompt: agent.systemPrompt }),
+              memory: cloneMessages(agent.memory.messages),
+              memoryRevision: agent.memory.revision,
+              workspace: agent.workspace,
+              ...(agent.session === undefined ? {} : { session: agent.session }),
+              ...(agent.sessionMemoryRevision === undefined
+                ? {}
+                : { sessionMemoryRevision: agent.sessionMemoryRevision }),
+              ...(schema === undefined ? {} : { schema: toSymbol(schema) }),
+              signal,
+            };
+            const host = this.createAgentHost(context, location);
+            await this.trace(context, "agent.started", location, { agent: agent.id });
+            const result = await context.external.use(signal, () => executor.execute(request, host));
+            returnedSession = result.session;
+            if (typeof result.output !== "string") {
+              throw new AflVmError("AGENT_OUTPUT_INVALID", "Agent executor output must be a string");
+            }
+            this.requireCompleted(result.stopReason);
+            await this.validateSchema(result.output, schema, signal);
+            appendMemoryMessage(agent.memory, { role: "assistant", content: result.output });
+            await this.persistMemory(context, agent.memory, signal);
+            await this.updateAgentSession(agent, executor, result.session, context, signal);
+            await this.trace(context, "agent.completed", location, { agent: agent.id });
+            return frag(result.output);
+          } catch (error) {
+            await this.invalidateAgentSession(agent, executor, returnedSession);
+            const vmError = error instanceof AgentExecutorError
+              ? new AflVmError(error.code, error.message, { cause: error })
+              : normalizeVmError(error);
+            await this.trace(context, "agent.failed", location, { agent: agent.id }, vmError);
+            throw vmError;
           }
-          appendMemoryMessage(agent.memory, { role: "assistant", content: result.output });
-          await this.updateAgentSession(agent, executor, result.session, context, signal);
-          await this.trace(context, "agent.completed", location, { agent: agent.id });
-          return frag(result.output);
-        } catch (error) {
-          const vmError = error instanceof AgentExecutorError
-            ? new AflVmError(error.code, error.message, { cause: error })
-            : normalizeVmError(error);
-          await this.trace(context, "agent.failed", location, { agent: agent.id }, vmError);
-          throw vmError;
-        }
-      },
+        },
+      ),
     );
+  }
+
+  private validateWorkspaceCapabilities(
+    workspace: AgentWorkspaceSet,
+    executor: AgentExecutorBackend,
+  ): void {
+    if (workspace.origin === "explicit" && !executor.capabilities.workspaceContext) {
+      throw new AflVmError(
+        "AGENT_CAPABILITY_UNSUPPORTED",
+        `Agent executor '${executor.name}' does not support explicit Workspace context`,
+      );
+    }
+    if (workspace.readOnly.length > 0 && !executor.capabilities.readOnlyWorkspaceContext) {
+      throw new AflVmError(
+        "AGENT_CAPABILITY_UNSUPPORTED",
+        `Agent executor '${executor.name}' does not support read-only Workspace context`,
+      );
+    }
+  }
+
+  private async validateExecutorMemory(
+    executor: AgentExecutorBackend,
+    agent: AgentHandle,
+    signal: AbortSignal,
+  ): Promise<void> {
+    throwIfAborted(signal);
+    if (!executor.memory.capabilities.roleSchemas.includes(AFL_MESSAGE_ROLE_SCHEMA)) {
+      throw new AflVmError(
+        "AGENT_MEMORY_ROLE_UNSUPPORTED",
+        `Agent executor '${executor.name}' does not support '${AFL_MESSAGE_ROLE_SCHEMA}'`,
+      );
+    }
+    await executor.memory.validateImport(
+      agent.agent,
+      AFL_MESSAGE_ROLE_SCHEMA,
+      cloneMessages(agent.memory.messages),
+    );
+  }
+
+  private async invalidateAgentSession(
+    agent: AgentHandle,
+    executor: AgentExecutorBackend,
+    returnedSession?: BackendSessionRef,
+  ): Promise<void> {
+    const session = returnedSession ?? agent.session;
+    delete agent.session;
+    delete agent.sessionMemoryRevision;
+    delete agent.memory.checkpoint;
+    if (session === undefined || executor.close === undefined) return;
+    const cleanupSignal = new AbortController().signal;
+    await executor.close(session, cleanupSignal).catch(() => {});
   }
 
   private async restoreAgentSession(
@@ -673,11 +854,19 @@ export class AflVm {
       checkpoint.session.backend !== executor.name ||
       checkpoint.agent.name !== agent.agent.name ||
       checkpoint.systemPrompt !== agent.systemPrompt ||
+      checkpoint.workspaceKey !== workspaceKey(agent.workspace) ||
       executor.fork === undefined
     ) {
       return;
     }
-    agent.session = await context.external.use(signal, () => executor.fork!(checkpoint.session, signal));
+    const forked = await context.external.use(signal, () => executor.fork!(checkpoint.session, signal));
+    if (forked.backend !== executor.name) {
+      throw new AflVmError(
+        "AGENT_SESSION_INVALID",
+        `Agent executor '${executor.name}' forked session backend '${forked.backend}'`,
+      );
+    }
+    agent.session = forked;
     agent.sessionMemoryRevision = checkpoint.memoryRevision;
   }
 
@@ -707,11 +896,18 @@ export class AflVm {
       return;
     }
     const checkpoint = await context.external.use(signal, () => executor.checkpoint!(session, signal));
+    if (checkpoint.backend !== executor.name) {
+      throw new AflVmError(
+        "AGENT_SESSION_INVALID",
+        `Agent executor '${executor.name}' returned checkpoint backend '${checkpoint.backend}'`,
+      );
+    }
     agent.session = checkpoint;
     agent.memory.checkpoint = {
       session: checkpoint,
       memoryRevision: agent.memory.revision,
       agent: structuredClone(agent.agent),
+      workspaceKey: workspaceKey(agent.workspace),
       ...(agent.systemPrompt === undefined ? {} : { systemPrompt: agent.systemPrompt }),
     };
   }
@@ -790,9 +986,12 @@ export class AflVm {
     args: readonly VmValue[],
     context: VmRunContext,
     signal: AbortSignal,
+    activationPath: string,
   ): Promise<VmValue> {
     throwIfAborted(signal);
-    if (target.kind === "local") return this.executeNode(module, target.name, args, context, signal);
+    if (target.kind === "local") {
+      return this.executeNode(module, target.name, args, context, signal, activationPath);
+    }
     if (this.bindings.flows === undefined) {
       throw new AflVmError("FLOW_ADAPTER_MISSING", `external flow '${target.name}' requires a Flow binding`, {
         span: target.span,
@@ -806,6 +1005,8 @@ export class AflVm {
     frame: MutableFrame,
     calls: readonly { readonly target: FlowTarget; readonly args: readonly VmValue[]; readonly span: SourceSpan }[],
     context: VmRunContext,
+    activation: ActivationContext,
+    blockVisit: number,
     location: Required<TraceLocation>,
     parentSignal: AbortSignal,
   ): Promise<TaskGroupHandle> {
@@ -826,9 +1027,16 @@ export class AflVm {
     const linked = linkedController(parentSignal);
     const workerLimit = new Semaphore(maxWorkers);
     const id = this.nextHandle(context, "task-group");
-    const tasks = calls.map((call) => {
+    const tasks = calls.map((call, index) => {
       const task = workerLimit.use(linked.controller.signal, async () => normalizeFlowResult(
-        await this.invokeFlow(frame.module, call.target, call.args, context, linked.controller.signal),
+        await this.invokeFlow(
+          frame.module,
+          call.target,
+          call.args,
+          context,
+          linked.controller.signal,
+          `${this.childActivationPath(activation, location, blockVisit, "dispatch")}:${index}`,
+        ),
         call.span,
       ));
       void task.catch((error: unknown) => {
@@ -925,6 +1133,8 @@ export class AflVm {
     frame: MutableFrame,
     instruction: Extract<AflInstruction, { op: "freedom.move" | "freedom.flow" }>,
     context: VmRunContext,
+    activation: ActivationContext,
+    blockVisit: number,
     location: Required<TraceLocation>,
     signal: AbortSignal,
   ): Promise<Frag> {
@@ -963,7 +1173,15 @@ export class AflVm {
       });
     }
     await this.trace(context, "freedom.approved", location, { kind: plan.kind });
-    const result = await this.executeFreedomPlan(frame.module, plan, moves, context, signal, instruction.span);
+    const result = await this.executeFreedomPlan(
+      frame.module,
+      plan,
+      moves,
+      context,
+      signal,
+      instruction.span,
+      this.childActivationPath(activation, location, blockVisit, "call"),
+    );
     const output = normalizeFlowResult(result, instruction.span);
     await this.validateSchema(output.content, instruction.schema, signal);
     return output;
@@ -976,6 +1194,7 @@ export class AflVm {
     context: VmRunContext,
     signal: AbortSignal,
     span: SourceSpan,
+    activationPath: string,
   ): Promise<VmValue> {
     if (plan.kind === "move") {
       if (candidates === undefined || !candidates.some((candidate) => candidate.name === plan.move.name)) {
@@ -1000,7 +1219,7 @@ export class AflVm {
       return this.bindings.flows.invoke({ flow: plan.flow, args: plan.args ?? [], signal });
     }
     const generated = assertValidModule(parseAfl(plan.source, "<freedom-generated>"));
-    return this.executeNode(generated, plan.entry, [...(plan.args ?? [])], context, signal);
+    return this.executeNode(generated, plan.entry, [...(plan.args ?? [])], context, signal, activationPath);
   }
 
   private evaluateMoveCandidates(expression: ValueExpr, frame: MutableFrame): SymbolRef[] {
@@ -1024,21 +1243,76 @@ export class AflVm {
 
   private createMemory(
     context: VmRunContext,
-    messages: readonly { role: string; content: string }[] = [],
+    slot: string,
+    moduleDigest: string,
+    messages: readonly Message[] = [],
     checkpoint?: MemoryCheckpoint,
   ): MemoryHandle {
-    const clonedCheckpoint = cloneMemoryCheckpoint(checkpoint);
+    const claimed = context.persistence.claim(slot, moduleDigest, messages);
+    const clonedCheckpoint = claimed.restored ? undefined : cloneMemoryCheckpoint(checkpoint);
     return {
       kind: "memory",
       id: this.nextHandle(context, "memory"),
-      messages: cloneMessages(messages),
-      revision: messages.length,
+      messages: claimed.messages,
+      revision: claimed.revision,
+      slot,
+      moduleDigest,
       ...(clonedCheckpoint === undefined ? {} : { checkpoint: clonedCheckpoint }),
     };
   }
 
-  private createAgent(context: VmRunContext, agent: SymbolRef, memory: MemoryHandle): AgentHandle {
-    return { kind: "agent", id: this.nextHandle(context, "agent"), agent, memory };
+  private createAgent(
+    context: VmRunContext,
+    agent: SymbolRef,
+    memory: MemoryHandle,
+    workspace: AgentWorkspaceSet,
+  ): AgentHandle {
+    return { kind: "agent", id: this.nextHandle(context, "agent"), agent, memory, workspace };
+  }
+
+  private async persistMemory(
+    context: VmRunContext,
+    memory: MemoryHandle,
+    signal: AbortSignal,
+  ): Promise<void> {
+    await context.persistence.save(
+      memory.slot,
+      memory.moduleDigest,
+      memory.messages,
+      memory.revision,
+      signal,
+    );
+  }
+
+  private memorySlot(
+    frame: MutableFrame,
+    instruction: AflInstruction,
+    activation: ActivationContext,
+    blockVisit: number,
+    location: Required<TraceLocation>,
+    allocation: "working" | "copy" | "fork",
+  ): string {
+    const destination = instructionDestination(instruction) ?? "_";
+    return [
+      `module:${activation.moduleDigest}`,
+      `entry:${encodeURIComponent(frame.node.name)}`,
+      `activation:${activation.path}`,
+      `block:${encodeURIComponent(location.block)}@${blockVisit}`,
+      `instruction:${location.instruction}:${instruction.op}:${encodeURIComponent(destination)}`,
+      `allocation:${allocation}`,
+    ].join("/");
+  }
+
+  private childActivationPath(
+    activation: ActivationContext,
+    location: Required<TraceLocation>,
+    blockVisit: number,
+    kind: "call" | "dispatch",
+  ): string {
+    return [
+      activation.path,
+      `${kind}:${encodeURIComponent(location.node)}.${encodeURIComponent(location.block)}@${blockVisit}.${location.instruction}`,
+    ].join("/");
   }
 
   private nextHandle(context: VmRunContext, prefix: string): string {
@@ -1201,5 +1475,5 @@ function isVmArgument(value: unknown): value is VmArgument {
 
 function createRunId(): string {
   runSequence += 1;
-  return `afl-${Date.now().toString(36)}-${runSequence.toString(36)}`;
+  return `afl-${Date.now().toString(36)}-${process.pid.toString(36)}-${runSequence.toString(36)}`;
 }

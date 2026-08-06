@@ -21,7 +21,9 @@ test("coder-reviewer loop copies current context and returns defects for revisio
     reviewerRuns += 1;
     const contents = request.messages.map((message) => message.content);
     assert.equal(contents.includes(reviewerRuns === 1 ? "draft-v1" : "fixed-v2"), true);
-    return reviewerRuns === 1 ? "P1: add tests" : "finish";
+    return reviewerRuns === 1
+      ? "VERDICT: REVISE\nP1: add tests"
+      : "The implementation is correct.\n\n**Status: APPROVED**";
   });
 
   const vm = AflVm.fromSource(`
@@ -32,9 +34,9 @@ main(task):
         jump review
     review:
         review_memory = memory.copy coder.memory
-        reviewer = agent @agent.reviewer, review_memory
+        reviewer = agent @agent.reviewer,, review_memory
         review_result = reviewer.do "review"
-        finish = oper review_result == "finish"
+        finish = typescript "const lines = String(args[0]).replaceAll('*', '').replaceAll('_', '').toLowerCase().split(String.fromCharCode(10)).map(line => line.trim()); return lines.some(line => ['finish', 'approved', 'pass'].some(verdict => line === verdict || line.startsWith('verdict: ' + verdict) || line.startsWith('status: ' + verdict)))", review_result
         jump finish, done, revise
     revise:
         fix = prompt "fix", review_result
@@ -42,7 +44,15 @@ main(task):
         jump review
     done:
         ret code
-`, { agents });
+`, {
+    agents,
+    scripts: {
+      execute(request) {
+        assert.equal(request.language, "typescript");
+        return Function("args", `"use strict";\n${request.source}`)(request.args);
+      },
+    },
+  });
 
   const result = await vm.run("main", ["build feature"]);
   assert.deepEqual(result.output, { kind: "frag", content: "fixed-v2" });
@@ -65,8 +75,8 @@ test("independent Agents run concurrently while one Agent remains ordered", asyn
   const parallel = AflVm.fromSource(`
 main():
     entry:
-        left = agent @agent.left
-        right = agent @agent.right
+        left = agent @agent.left, "left/"
+        right = agent @agent.right, "right/"
         left_result = left.do "left"
         right_result = right.do "right"
         result = prompt "joined", left_result, right_result
@@ -91,7 +101,7 @@ main():
   assert.deepEqual(last.messages.map((message) => message.content).slice(-3), ["one", "one", "two"]);
 });
 
-test("fork snapshots source Memory, isolates branches, and runs branches concurrently", async () => {
+test("fork snapshots source Memory and isolates branches in one inherited Workspace", async () => {
   const calls = [];
   let branchActive = 0;
   let branchMaximum = 0;
@@ -122,7 +132,7 @@ main():
 `, { agents });
   await vm.run();
 
-  assert.equal(branchMaximum, 2);
+  assert.equal(branchMaximum, 1);
   const leftEnd = calls.find((call) => call.input === "left-end");
   const rightEnd = calls.find((call) => call.input === "right-end");
   const sourceEnd = calls.find((call) => call.input === "source-end");

@@ -12,6 +12,10 @@ export type MockAgentHandler = (
 ) => string | AgentRunResult | Promise<string | AgentRunResult>;
 
 export class MockAgentAdapter implements AgentAdapter {
+  readonly workspaceCapabilities = Object.freeze({
+    workspaceContext: true,
+    readOnlyWorkspaceContext: true,
+  });
   readonly calls: AgentRunRequest[] = [];
   private readonly handlers = new Map<string, MockAgentHandler>();
 

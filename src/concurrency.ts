@@ -1,4 +1,5 @@
 import { AflVmError } from "./errors.js";
+import { workspacePathOverlap } from "./workspace.js";
 
 type Release = () => void;
 
@@ -190,6 +191,101 @@ export class ResourceLocks {
   }
 }
 
+export interface WorkspaceRequest {
+  readonly path: string;
+  readonly mode: "read" | "write";
+}
+
+interface WorkspaceLease {
+  readonly id: number;
+  readonly requests: readonly WorkspaceRequest[];
+}
+
+interface WorkspaceWaiter {
+  readonly requests: readonly WorkspaceRequest[];
+  readonly resolve: (release: Release) => void;
+  readonly reject: (error: unknown) => void;
+  readonly signal: AbortSignal;
+  readonly onAbort: () => void;
+}
+
+export class WorkspaceLocks {
+  private readonly active: WorkspaceLease[] = [];
+  private readonly waiters: WorkspaceWaiter[] = [];
+  private nextId = 0;
+
+  async use<T>(
+    requests: readonly WorkspaceRequest[],
+    signal: AbortSignal,
+    operation: () => Promise<T> | T,
+  ): Promise<T> {
+    const release = await this.acquire(requests, signal);
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
+  acquire(requests: readonly WorkspaceRequest[], signal: AbortSignal): Promise<Release> {
+    throwIfAborted(signal);
+    const normalized = normalizeWorkspaceRequests(requests);
+    if (this.waiters.length === 0 && this.canActivate(normalized)) {
+      return Promise.resolve(this.activate(normalized));
+    }
+    return new Promise<Release>((resolve, reject) => {
+      const waiter: WorkspaceWaiter = {
+        requests: normalized,
+        resolve,
+        reject,
+        signal,
+        onAbort: () => {
+          const index = this.waiters.indexOf(waiter);
+          if (index >= 0) this.waiters.splice(index, 1);
+          reject(abortReason(signal));
+          this.drainWorkspaceWaiters();
+        },
+      };
+      signal.addEventListener("abort", waiter.onAbort, { once: true });
+      this.waiters.push(waiter);
+    });
+  }
+
+  private canActivate(requests: readonly WorkspaceRequest[]): boolean {
+    return this.active.every((lease) => !workspaceRequestsConflict(lease.requests, requests));
+  }
+
+  private activate(requests: readonly WorkspaceRequest[]): Release {
+    this.nextId += 1;
+    const lease: WorkspaceLease = { id: this.nextId, requests };
+    this.active.push(lease);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const index = this.active.findIndex((item) => item.id === lease.id);
+      if (index >= 0) this.active.splice(index, 1);
+      this.drainWorkspaceWaiters();
+    };
+  }
+
+  private drainWorkspaceWaiters(): void {
+    while (this.waiters.length > 0) {
+      const waiter = this.waiters[0]!;
+      if (waiter.signal.aborted) {
+        this.waiters.shift();
+        waiter.signal.removeEventListener("abort", waiter.onAbort);
+        waiter.reject(abortReason(waiter.signal));
+        continue;
+      }
+      if (!this.canActivate(waiter.requests)) return;
+      this.waiters.shift();
+      waiter.signal.removeEventListener("abort", waiter.onAbort);
+      waiter.resolve(this.activate(waiter.requests));
+    }
+  }
+}
+
 export interface LinkedController {
   readonly controller: AbortController;
   dispose(): void;
@@ -232,4 +328,23 @@ function normalizeRequests(requests: readonly ResourceRequest[]): ResourceReques
   }
   return [...modes].sort(([left], [right]) => left.localeCompare(right))
     .map(([key, mode]) => ({ key, mode }));
+}
+
+function normalizeWorkspaceRequests(requests: readonly WorkspaceRequest[]): WorkspaceRequest[] {
+  const modes = new Map<string, "read" | "write">();
+  for (const request of requests) {
+    const previous = modes.get(request.path);
+    modes.set(request.path, previous === "write" || request.mode === "write" ? "write" : "read");
+  }
+  return [...modes].sort(([left], [right]) => left.localeCompare(right))
+    .map(([path, mode]) => ({ path, mode }));
+}
+
+function workspaceRequestsConflict(
+  left: readonly WorkspaceRequest[],
+  right: readonly WorkspaceRequest[],
+): boolean {
+  return left.some((leftRequest) => right.some((rightRequest) =>
+    workspacePathOverlap(leftRequest.path, rightRequest.path) &&
+    (leftRequest.mode === "write" || rightRequest.mode === "write")));
 }

@@ -35,7 +35,7 @@ coder = agent @agent.coder
 
 后续 `coder.do` 自动使用 `coder.memory`，不需要每次显式传入 Memory handle。
 
-Memory 是当前 VM run 中的 handle。实现没有持久化 Memory adapter，也不会在不同 VM run 之间自动恢复 Message。
+Memory 在 flow 中仍表现为当前 run 的 handle，但其 canonical Message 会由 VM 持久化。默认存储位置是执行根目录下的 `.afl/memory/`；再次使用同一 `runId` 和同一 root module 时，VM 按稳定 slot 恢复 Message，然后从 flow entry 重新执行。绑定可以替换存储目录或整个 `MemoryStateStore`。
 
 ## 3. Agent 输入与输出
 
@@ -58,7 +58,7 @@ result = coder.do tool, tool_result
 
 Agent 输出在来源 Memory 中是 assistant Message，但返回 Frag 不带 `assistant`。因此它进入另一个 Agent 时可以重新解释为 `user`、`tool` 或其他 role。
 
-一次 `do` 可以由 Agent executor 完成多个模型或工具步骤。Executor 可以返回中间 Message；VM 依次追加这些 Message，再追加最终 `assistant` 输出，并把最终输出作为 role-free Frag 返回。
+一次 `do` 可以由 Agent executor 完成多个模型或工具步骤。工具调用、thinking 和 compaction 等 backend-native entry 不进入 AFL Memory。Executor 只返回最终输出，VM 是唯一将它追加为 canonical `assistant` Message 的组件，并把同一字符串作为 role-free Frag 返回。
 
 ## 4. `memory.append`
 
@@ -133,7 +133,7 @@ coder.sysprompt @prompt.coder
 
 ```text
 review_memory = memory.copy coder.memory
-reviewer = agent @agent.reviewer, review_memory
+reviewer = agent @agent.reviewer,, review_memory
 reviewer.sysprompt @prompt.reviewer
 review_result = reviewer.do review_prompt
 ```
@@ -181,13 +181,13 @@ Reviewer 只接收显式 Frag，不继承 Coder Memory。这可以减少历史�
 
 同一 Memory 上的 append 和 Agent 调用形成资源依赖，避免并发写入导致 Message 顺序不确定。
 
-不同 Agent 默认拥有不同 Memory，可以在没有其他 dependency 时并行工作。需要把相同上下文分发给多个 Agent 时，可以分别 copy：
+不同 Agent 默认拥有不同 Memory，但默认也共享 AFL 执行根目录作为主工作区，因此涉及 Agent 执行时会被 Workspace lock 串行。需要并行工作时，应为它们指定互不重叠的主工作区；要分发相同上下文时可以分别 copy：
 
 ```text
 security_memory = memory.copy coder.memory
 quality_memory = memory.copy coder.memory
-security = agent @agent.security, security_memory
-quality = agent @agent.quality, quality_memory
+security = agent @agent.security, "workers/security/", security_memory
+quality = agent @agent.quality, "workers/quality/", quality_memory
 ```
 
 两个 Reviewer 从相同 Message 序列开始，但各自写入独立 Memory。
@@ -201,7 +201,7 @@ security = fork coder, security.do security_prompt
 quality = fork coder, quality.do quality_prompt
 ```
 
-每条指令依次完成 `memory.copy`、`memory.apply` 和右侧启动动作。左侧名称可以在同一条指令的启动动作中引用，因此不需要逐个声明临时 Memory 与 Agent。
+每条指令依次完成 `memory.copy`、`memory.apply` 和右侧启动动作。左侧名称可以在同一条指令的启动动作中引用，因此不需要逐个声明临时 Memory 与 Agent。Fork 继承 source Agent 的 Workspace；多个 branch 因而仍可能被同一可写 Workspace 串行化。
 
 Fork 完成后：
 
@@ -215,4 +215,6 @@ Fork 完成后：
 
 ## 13. 当前限制
 
-当前 parser 和 VM 只实现 `memory.append`、`memory.copy`、`memory.apply` 以及 Agent 的 `.memory` 引用。没有 `memory.format`、`memory.select`、`memory.merge`、shared Memory 或 persistent Memory 指令。Backend session 和 checkpoint 也只存在于当前 backend 实例，不构成跨进程 Memory 持久化。
+当前 parser 和 VM 只实现 `memory.append`、`memory.copy`、`memory.apply` 以及 Agent 的 `.memory` 引用。没有 `memory.format`、`memory.select`、`memory.merge` 或 shared Memory 指令；持久化是 VM 内部行为，不增加 AFL 指令。
+
+Version 1 持久化文件保存 role schema、run id、root module digest、稳定 slot、Message 和 revision。默认 working Memory 在首次写入前不会创建空记录，`memory.copy` 即使复制空 Memory 也会创建记录。文件不保存 executor、model、Pi native session 或 checkpoint，也不提供 snapshot 恢复。相同 `runId` 在同一个 store namespace 上一次只允许一个活跃的顶层 VM run；同一 run 内的并发 Agent 共享一条持久化队列。

@@ -69,7 +69,10 @@ export function instructionDestination(instruction: AflInstruction): string | un
 export function instructionReferences(instruction: AflInstruction): NameExpr[] {
   switch (instruction.op) {
     case "agent":
-      return instruction.memory === undefined ? [] : [instruction.memory];
+      return [
+        ...(instruction.workspace === undefined ? [] : valueReferences(instruction.workspace)),
+        ...(instruction.memory === undefined ? [] : [instruction.memory]),
+      ];
     case "agent.sysprompt":
       return [instruction.agent, ...valueReferences(instruction.prompt)];
     case "agent.do":

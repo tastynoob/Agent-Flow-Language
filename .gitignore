@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 *.aflir.trace.json
 .env
+.afl/

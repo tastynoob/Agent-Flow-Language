@@ -1,12 +1,15 @@
-import type { Message } from "./adapters.js";
 import type { BackendSessionRef } from "./agent-executor.js";
 import type { ComputeValue, Frag, SymbolRef } from "./ir.js";
+import type { Message } from "./memory.js";
+import type { AgentWorkspaceSet } from "./workspace.js";
 
 export interface MemoryHandle {
   readonly kind: "memory";
   readonly id: string;
   readonly messages: Message[];
   revision: number;
+  readonly slot: string;
+  readonly moduleDigest: string;
   checkpoint?: MemoryCheckpoint;
   owner?: string;
 }
@@ -15,6 +18,7 @@ export interface MemoryCheckpoint {
   readonly session: BackendSessionRef;
   readonly memoryRevision: number;
   readonly agent: SymbolRef;
+  readonly workspaceKey: string;
   readonly systemPrompt?: string;
 }
 
@@ -23,6 +27,7 @@ export interface AgentHandle {
   readonly id: string;
   readonly agent: SymbolRef;
   readonly memory: MemoryHandle;
+  readonly workspace: AgentWorkspaceSet;
   systemPrompt?: string;
   session?: BackendSessionRef;
   sessionMemoryRevision?: number;
@@ -47,7 +52,7 @@ export type VmValue =
 
 export function isMemoryHandle(value: unknown): value is MemoryHandle {
   return isObject(value) && value.kind === "memory" && typeof value.id === "string" &&
-    Array.isArray(value.messages);
+    typeof value.slot === "string" && typeof value.moduleDigest === "string" && Array.isArray(value.messages);
 }
 
 export function isAgentHandle(value: unknown): value is AgentHandle {

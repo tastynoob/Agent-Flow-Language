@@ -70,6 +70,68 @@ main(task):
   });
 });
 
+test("agent operands reserve Workspace before optional Memory", () => {
+  const module = parseAfl(`
+main(memory, main_workspace):
+    entry:
+        default_agent = agent @agent.default
+        path_agent = agent @agent.path, "worker/"
+        list_agent = agent @agent.list, [main_workspace, "docs/"]
+        memory_agent = agent @agent.memory,, memory
+        full_agent = agent @agent.full, main_workspace, memory
+        ret "done"
+`);
+  const instructions = module.nodes[0].blocks[0].instructions;
+  assert.equal(instructions[0].workspace, undefined);
+  assert.equal(instructions[1].workspace.kind, "literal");
+  assert.equal(instructions[2].workspace.kind, "list");
+  assert.equal(instructions[3].workspace, undefined);
+  assert.equal(instructions[3].memory.name, "memory");
+  assert.equal(instructions[4].workspace.name, "main_workspace");
+  assert.equal(instructions[4].memory.name, "memory");
+
+  for (const source of [
+    "worker = agent @agent.worker,",
+    "worker = agent @agent.worker,,",
+    "worker = agent @agent.worker, \"work/\",",
+  ]) {
+    assert.throws(() => parseAfl(`main():\n    entry:\n        ${source}\n        ret \"done\"\n`), {
+      name: "AflParseError",
+    });
+  }
+
+  const singlePathList = validateModule(parseAfl(`
+main():
+    entry:
+        worker = agent @agent.worker, ["work/"]
+        ret "done"
+`));
+  assert.equal(singlePathList.ok, false);
+  assert.equal(singlePathList.diagnostics.some((item) => item.code === "AGENT_WORKSPACE_INVALID"), true);
+
+  const oldMemoryPosition = validateModule(parseAfl(`
+main():
+    entry:
+        source = agent @agent.source
+        memory = memory.copy source.memory
+        reviewer = agent @agent.reviewer, memory
+        ret "done"
+`));
+  assert.equal(oldMemoryPosition.ok, false);
+  assert.equal(oldMemoryPosition.diagnostics.some((item) => item.code === "VALUE_KIND_INVALID"), true);
+
+  const memoryInsideWorkspaceList = validateModule(parseAfl(`
+main():
+    entry:
+        source = agent @agent.source
+        memory = memory.copy source.memory
+        reviewer = agent @agent.reviewer, [memory, "docs/"]
+        ret "done"
+`));
+  assert.equal(memoryInsideWorkspaceList.ok, false);
+  assert.equal(memoryInsideWorkspaceList.diagnostics.some((item) => item.code === "VALUE_KIND_INVALID"), true);
+});
+
 test("parser reports stable source location for indentation errors", () => {
   assert.throws(
     () => parseAfl("main():\n   entry:\n        ret", "bad.afl"),

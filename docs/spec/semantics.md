@@ -109,7 +109,7 @@ Basic block 的 terminator 建立 flow 依赖。目标 block 只在当前 block 
 
 Agent 调用和 `memory.append` 会读写绑定 Memory。同一 Agent 或同一 Memory 上的状态性指令形成资源依赖，依赖方向按它们在 block 中的文本顺序确定。
 
-不同 Agent 使用不同 Memory 时，不会仅因为文本相邻而互相等待。需要让同类 Agent 并行工作时，可以创建多个 Agent instance，并按需要复制上下文。
+不同 Agent 使用不同 Memory 时，不会仅因为文本相邻而互相等待；但 Agent 工作还必须取得 Workspace lock。主工作区相同或存在父子包含关系时，只要一方可写就串行。需要并行工作时，为 Agent 分配互不重叠的主工作区；多个 Agent 可以同时读取同一个只读工作区。
 
 ### 6.4 Ready
 
@@ -127,10 +127,12 @@ Agent 调用和 `memory.append` 会读写绑定 Memory。同一 Agent 或同一 
 
 ```text
 coder = agent @agent.coder
-reviewer = agent @agent.reviewer, review_memory
+worker = agent @agent.worker, "workers/worker/"
+reviewer = agent @agent.reviewer, ["workers/reviewer/", "docs/"]
+reviewer = agent @agent.reviewer,, review_memory
 ```
 
-`agent` 创建 Agent instance。没有 Memory operand 时同时创建默认 working Memory；有 Memory operand 时绑定该 Memory。
+`agent` 创建 Agent instance。第二个 operand 是可选 Workspace，第三个 operand 是可选 Memory。Workspace 省略时使用执行根目录；没有 Memory operand 时创建默认 working Memory，有 Memory operand 时绑定该 Memory。路径在 Agent 创建时规范化，主工作区会按需创建，只读工作区必须已经存在。主工作区与只读工作区相同或互为祖先时创建失败。
 
 ### 7.2 `agent.sysprompt`
 
@@ -299,7 +301,7 @@ Branch Agent 沿用 source Agent 的 binding 和配置，并绑定独立复制�
 
 `fork` 返回 branch Agent handle。启动动作的输出已经以 `assistant` role 写入 branch Memory，但这条快捷形式不额外返回 Frag。后续对 branch Agent 的 `do`、`sysprompt` 或 Memory 写入，与启动动作形成同一 Agent 的资源依赖。
 
-多条互不依赖的 `fork` 指令可以并行启动分支。需要 list 或 batch child flow、独立结果集合和 `sync` 时使用 `dispatch`。Trace 记录 `fork.started`、内部 Agent 事件和 `fork.completed`。
+多条互不依赖的 `fork` 指令可以同时进入 ready 状态，但 branch 继承 source Workspace，重叠的可写路径仍受 Workspace lock 约束。需要 list 或 batch child flow、独立结果集合和 `sync` 时使用 `dispatch`。Trace 记录 `fork.started`、内部 Agent 事件和 `fork.completed`。
 
 ### 11.4 `sync`
 
@@ -307,7 +309,7 @@ Branch Agent 沿用 source Agent 的 binding 和配置，并绑定独立复制�
 
 Validator 要求每个 dispatch 产生的 TaskGroup 在 node 退出前恰好 sync 一次。VM 也会拒绝未消费或重复消费的 TaskGroup。
 
-Basic block 中互不依赖的普通 Agent 指令本身已经可以并行；`dispatch` 表达独立 child flow 的生命周期，`fork` 表达从 source Agent 复制上下文并立即工作的分支关系。
+Basic block 中互不依赖且 Workspace 不冲突的普通 Agent 指令可以并行；`dispatch` 表达独立 child flow 的生命周期，`fork` 表达从 source Agent 复制上下文并立即工作的分支关系。
 
 ## 12. `invoke`
 

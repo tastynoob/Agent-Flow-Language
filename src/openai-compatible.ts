@@ -1,5 +1,11 @@
-import type { AgentAdapter, AgentRunRequest, AgentRunResult, Message } from "./adapters.js";
+import type { AgentAdapter, AgentRunRequest, AgentRunResult } from "./adapters.js";
 import { AflVmError } from "./errors.js";
+import type { SymbolRef } from "./ir.js";
+import {
+  AFL_MESSAGE_ROLE_SCHEMA,
+  type AgentMemoryContract,
+  type Message,
+} from "./memory.js";
 
 export interface OpenAICompatibleAgentBinding {
   readonly model: string;
@@ -18,6 +24,25 @@ export interface OpenAICompatibleAdapterOptions {
 }
 
 export class OpenAICompatibleAgentAdapter implements AgentAdapter {
+  readonly memory: AgentMemoryContract = Object.freeze({
+    capabilities: Object.freeze({
+      roleSchemas: [AFL_MESSAGE_ROLE_SCHEMA],
+      importRoles: ["system", "user", "assistant", "tool"] as const,
+    }),
+    validateImport: (_agent: SymbolRef, roleSchema: string, messages: readonly Message[]) => {
+      if (roleSchema !== AFL_MESSAGE_ROLE_SCHEMA) {
+        throw new AflVmError("LLM_MESSAGE_ROLE_UNSUPPORTED", `unsupported Memory role schema '${roleSchema}'`);
+      }
+      const unsupported = messages.find((message) =>
+        !new Set(["system", "user", "assistant", "tool"]).has(message.role));
+      if (unsupported !== undefined) {
+        throw new AflVmError(
+          "LLM_MESSAGE_ROLE_UNSUPPORTED",
+          `OpenAI-compatible chat does not support role '${unsupported.role}'`,
+        );
+      }
+    },
+  });
   private readonly baseUrl: string;
   private readonly apiKey: string | (() => string);
   private readonly agents: Readonly<Record<string, OpenAICompatibleAgentBinding>>;

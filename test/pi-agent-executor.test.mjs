@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
@@ -12,6 +15,7 @@ import {
   AflVm,
   MemoryTraceSink,
   PiAgentExecutorBackend,
+  createPiCodingAgentBinding,
 } from "../dist/src/index.js";
 
 test("Pi backend completes a model-tool-model loop and reuses the native session", async () => {
@@ -120,6 +124,40 @@ main():
   assert.equal(contexts.get("source-later").includes("out:seed"), true);
 });
 
+test("memory.apply rebuilds Pi context when the source Workspace is incompatible", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "afl-pi-checkpoint-workspace-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  faux.setResponses([
+    fauxAssistantMessage("seed-output"),
+    (context) => {
+      assert.equal(messageTexts(context.messages).includes("seed-output"), true);
+      return fauxAssistantMessage("branch-output");
+    },
+  ]);
+  const backend = new PiAgentExecutorBackend({
+    models,
+    defaultBinding: { model: faux.getModel() },
+  });
+  const vm = AflVm.fromSource(`
+main():
+    entry:
+        first = agent @agent.worker, "first/"
+        seed = first.do "seed"
+        copied = memory.copy first.memory
+        second = agent @agent.worker, "second/"
+        branch = memory.apply second, copied
+        result = branch.do "branch"
+        ret result
+`, { agentExecutor: backend });
+
+  const result = await vm.run("main", [], { executionRoot: root });
+  assert.equal(result.output.content, "branch-output");
+  assert.equal(faux.state.callCount, 2);
+});
+
 test("Pi tool interception blocks a host-denied call without executing the tool", async () => {
   const faux = fauxProvider();
   const models = createModels();
@@ -201,6 +239,67 @@ main():
   setTimeout(() => controller.abort(), 20);
 
   await assert.rejects(running, { code: "AGENT_CANCELLED" });
+});
+
+test("Pi coding tools are created for each Agent primary Workspace", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "afl-pi-workspace-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  let observedWorkingDirectory;
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("bash", { command: "pwd" }, { id: "pwd-1" }),
+      { stopReason: "toolUse" },
+    ),
+    (context) => {
+      const result = context.messages.findLast((message) => message.role === "toolResult");
+      observedWorkingDirectory = result.content.map((block) => block.text ?? "").join("").trim();
+      return fauxAssistantMessage("workspace-ok");
+    },
+  ]);
+  const backend = new PiAgentExecutorBackend({
+    models,
+    defaultBinding: createPiCodingAgentBinding({ model: faux.getModel() }),
+  });
+  const vm = AflVm.fromSource(`
+main():
+    entry:
+        worker = agent @agent.worker, "work/"
+        result = worker.do "report the working directory"
+        ret result
+`, { agentExecutor: backend });
+
+  const result = await vm.run("main", [], { executionRoot: root });
+  assert.equal(result.output.content, "workspace-ok");
+  assert.equal(observedWorkingDirectory, await realpath(join(root, "work")));
+});
+
+test("Pi Memory facet rejects unsupported AFL roles before model execution", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "afl-pi-memory-role-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const backend = new PiAgentExecutorBackend({
+    models,
+    defaultBinding: { model: faux.getModel() },
+  });
+  const vm = AflVm.fromSource(`
+main():
+    entry:
+        worker = agent @agent.worker
+        memory.append worker.memory, tool, "native detail"
+        result = worker.do "continue"
+        ret result
+`, { agentExecutor: backend });
+
+  await assert.rejects(
+    vm.run("main", [], { executionRoot: root }),
+    { code: "AGENT_MEMORY_ROLE_UNSUPPORTED" },
+  );
+  assert.equal(faux.state.callCount, 0);
 });
 
 function lastUserText(messages) {

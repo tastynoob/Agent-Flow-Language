@@ -60,7 +60,7 @@ Frag 不携带 role。Frag 进入 Agent 或 Memory 时才确定 role。Handle �
 
 Basic block 内的指令不因文本相邻而自动串行。VM 从名称引用建立数据依赖，并为 Agent、Memory 和 TaskGroup handle 补充资源读写依赖。所有依赖完成的指令可以并发执行。
 
-同一 Agent 的工作和同一 Memory 的写入按文本顺序执行。使用不同 Memory 且没有数据依赖的 Agent 工作可以并发执行。Basic block 的 terminator 等待该 block 的全部普通指令完成后执行。
+同一 Agent 的工作和同一 Memory 的写入按文本顺序执行。Agent 工作还使用层次化 Workspace lock：重叠的可写路径串行，互不重叠的主工作区可以并行，共享只读路径不会彼此阻塞。Basic block 的 terminator 等待该 block 的全部普通指令完成后执行。
 
 需要显式 child flow 生命周期时使用：
 
@@ -87,6 +87,7 @@ Basic block 内的指令不因文本相邻而自动串行。VM 从名称引用�
 - `freedom`
 - `policy`
 - `trace`
+- `memoryPersistence`
 
 只有 flow 实际执行到对应能力时，VM 才要求该 binding 存在。纯计算 flow 可以使用空 bindings object。
 
@@ -98,4 +99,4 @@ Basic block 内的指令不因文本相邻而自动串行。VM 从名称引用�
 - [示例](../guides/examples.md)展示可解析的组合方式；
 - [Parallel Voting](../guides/parallel-voting.md)展示两种 dispatch 形式。
 
-当前实现不提供 package 声明语法、持久化 Memory、retry、race、all-settled 或 iterable map。Agent executor 的运行中事件可以进入 Trace 和可选 `agentHost`，但不是 AFL IR 值。
+当前实现不提供 package 声明语法、retry、race、all-settled、iterable map 或 snapshot 恢复。Canonical Memory 可以跨进程落盘和恢复；executor native session 仍仅在当前 backend 实例内有效。Agent executor 的运行中事件可以进入 Trace 和可选 `agentHost`，但不是 AFL IR 值。

@@ -1,12 +1,18 @@
-import type { AgentAdapter, AgentRunRequest, Message } from "./adapters.js";
+import type { AgentAdapter, AgentRunRequest } from "./adapters.js";
 import type { SymbolRef } from "./ir.js";
+import {
+  AFL_MESSAGE_ROLE_SCHEMA,
+  type AgentMemoryContract,
+  type Message,
+} from "./memory.js";
+import type { AgentWorkspaceSet } from "./workspace.js";
 
 export interface AgentExecutorCapabilities {
   readonly nativeSession: boolean;
   readonly checkpoint: boolean;
   readonly fork: boolean;
-  readonly memoryExport: boolean;
-  readonly memoryImportRoles: readonly string[];
+  readonly workspaceContext: boolean;
+  readonly readOnlyWorkspaceContext: boolean;
   readonly structuredOutput: boolean;
   readonly interrupt: boolean;
   readonly toolCallInterception: boolean;
@@ -28,6 +34,7 @@ export interface AgentExecutionRequest {
   readonly systemPrompt?: string;
   readonly memory: readonly Message[];
   readonly memoryRevision: number;
+  readonly workspace: AgentWorkspaceSet;
   readonly session?: BackendSessionRef;
   readonly sessionMemoryRevision?: number;
   readonly schema?: SymbolRef;
@@ -44,7 +51,6 @@ export interface AgentExecutionResult {
   readonly output: string;
   readonly stopReason: AgentExecutionStopReason;
   readonly session?: BackendSessionRef;
-  readonly messages?: readonly Message[];
   readonly usage?: Readonly<Record<string, number>>;
 }
 
@@ -86,11 +92,11 @@ export interface AgentExecutionHost {
 export interface AgentExecutorBackend {
   readonly name: string;
   readonly capabilities: AgentExecutorCapabilities;
+  readonly memory: AgentMemoryContract;
 
   execute(request: AgentExecutionRequest, host: AgentExecutionHost): Promise<AgentExecutionResult>;
   checkpoint?(session: BackendSessionRef, signal: AbortSignal): Promise<BackendSessionRef>;
   fork?(session: BackendSessionRef, signal: AbortSignal): Promise<BackendSessionRef>;
-  exportMemory?(session: BackendSessionRef, signal: AbortSignal): Promise<readonly Message[]>;
   close?(session: BackendSessionRef, signal: AbortSignal): Promise<void>;
 }
 
@@ -114,32 +120,48 @@ export class AgentExecutorError extends Error {
   }
 }
 
-const STATELESS_CAPABILITIES: AgentExecutorCapabilities = Object.freeze({
+const STATELESS_CAPABILITIES = {
   nativeSession: false,
   checkpoint: false,
   fork: false,
-  memoryExport: false,
-  memoryImportRoles: ["*"] as const,
   structuredOutput: false,
   interrupt: true,
   toolCallInterception: false,
   interactiveApproval: false,
   sandboxEnforcement: false,
+} as const;
+
+const PERMISSIVE_MEMORY: AgentMemoryContract = Object.freeze({
+  capabilities: Object.freeze({
+    roleSchemas: [AFL_MESSAGE_ROLE_SCHEMA],
+    importRoles: ["*"] as const,
+  }),
+  validateImport: () => {},
 });
 
 export class AgentAdapterExecutorBackend implements AgentExecutorBackend {
   readonly name = "agent-adapter";
-  readonly capabilities = STATELESS_CAPABILITIES;
+  readonly capabilities: AgentExecutorCapabilities;
+  readonly memory: AgentMemoryContract;
 
-  constructor(private readonly adapter: AgentAdapter) {}
+  constructor(private readonly adapter: AgentAdapter) {
+    this.capabilities = Object.freeze({
+      ...STATELESS_CAPABILITIES,
+      workspaceContext: adapter.workspaceCapabilities?.workspaceContext ?? false,
+      readOnlyWorkspaceContext: adapter.workspaceCapabilities?.readOnlyWorkspaceContext ?? false,
+    });
+    this.memory = adapter.memory ?? PERMISSIVE_MEMORY;
+  }
 
   async execute(request: AgentExecutionRequest, _host: AgentExecutionHost): Promise<AgentExecutionResult> {
+    await this.memory.validateImport(request.agent, AFL_MESSAGE_ROLE_SCHEMA, request.memory);
     const adapterRequest: AgentRunRequest = {
       runId: request.runId,
       node: request.node,
       block: request.block,
       agent: request.agent,
       ...(request.systemPrompt === undefined ? {} : { systemPrompt: request.systemPrompt }),
+      workspace: request.workspace,
       messages: request.memory,
       ...(request.schema === undefined ? {} : { schema: request.schema }),
       signal: request.signal,
@@ -148,7 +170,6 @@ export class AgentAdapterExecutorBackend implements AgentExecutorBackend {
     return {
       output: result.output,
       stopReason: "completed",
-      ...(result.messages === undefined ? {} : { messages: result.messages }),
     };
   }
 }

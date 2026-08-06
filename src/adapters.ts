@@ -6,11 +6,8 @@ import type {
   SymbolRef,
 } from "./ir.js";
 import type { AgentExecutionHost, AgentExecutorBackend } from "./agent-executor.js";
-
-export interface Message {
-  readonly role: string;
-  readonly content: string;
-}
+import type { AgentMemoryContract, MemoryPersistenceBinding, Message } from "./memory.js";
+import type { AgentWorkspaceSet } from "./workspace.js";
 
 export interface AgentRunRequest {
   readonly runId: string;
@@ -18,6 +15,7 @@ export interface AgentRunRequest {
   readonly block: string;
   readonly agent: SymbolRef;
   readonly systemPrompt?: string;
+  readonly workspace: AgentWorkspaceSet;
   readonly messages: readonly Message[];
   readonly schema?: SymbolRef;
   readonly signal: AbortSignal;
@@ -25,10 +23,14 @@ export interface AgentRunRequest {
 
 export interface AgentRunResult {
   readonly output: string;
-  readonly messages?: readonly Message[];
 }
 
 export interface AgentAdapter {
+  readonly workspaceCapabilities?: {
+    readonly workspaceContext: boolean;
+    readonly readOnlyWorkspaceContext: boolean;
+  };
+  readonly memory?: AgentMemoryContract;
   run(request: AgentRunRequest): Promise<AgentRunResult>;
 }
 
@@ -228,4 +230,5 @@ export interface VmBindings {
   readonly freedom?: FreedomAdapter;
   readonly policy?: VmPolicy;
   readonly trace?: TraceSink;
+  readonly memoryPersistence?: MemoryPersistenceBinding;
 }

@@ -36,7 +36,13 @@ import type {
   BackendSessionRef,
 } from "./agent-executor.js";
 import { AgentExecutorError } from "./agent-executor.js";
-import type { Message } from "./adapters.js";
+import type { SymbolRef } from "./ir.js";
+import {
+  AFL_MESSAGE_ROLE_SCHEMA,
+  type AgentMemoryContract,
+  type Message,
+} from "./memory.js";
+import { workspaceKey, type AgentWorkspaceSet } from "./workspace.js";
 
 export interface PiModelRef {
   readonly provider: string;
@@ -52,6 +58,17 @@ export interface PiAgentBinding<TContext extends object | undefined = undefined>
   readonly thinkingLevel?: ThinkingLevel;
   readonly streamOptions?: AgentHarnessStreamOptions;
   readonly resources?: AgentHarnessResources;
+  readonly createExecutionContext?: (
+    workspace: AgentWorkspaceSet,
+  ) => PiExecutionContext<TContext> | Promise<PiExecutionContext<TContext>>;
+}
+
+export interface PiExecutionContext<TContext extends object | undefined = undefined> {
+  readonly tools?: readonly AgentHarnessTool<TContext>[];
+  readonly toolContext?: AgentHarnessToolContextSource<TContext>;
+  readonly activeToolNames?: readonly string[];
+  readonly resources?: AgentHarnessResources;
+  readonly contextPrompt?: string;
 }
 
 export interface PiAgentExecutorOptions {
@@ -63,7 +80,6 @@ export interface PiAgentExecutorOptions {
 
 export interface PiCodingAgentBindingOptions {
   readonly model: Model<Api> | PiModelRef;
-  readonly cwd: string;
   readonly systemPrompt?: string;
   readonly thinkingLevel?: ThinkingLevel;
   readonly streamOptions?: AgentHarnessStreamOptions;
@@ -78,26 +94,52 @@ interface PiSessionRecord {
   readonly agentName: string;
   readonly systemPrompt: string | undefined;
   readonly binding: PiAgentBinding<any>;
+  readonly executionContext: PiExecutionContext<any>;
+  readonly workspaceKey: string;
+  readonly workspace: AgentWorkspaceSet;
 }
 
 const PI_BACKEND_NAME = "pi";
 
 export function createPiCodingAgentBinding(options: PiCodingAgentBindingOptions): PiAgentBinding<ExecutionToolContext> {
-  const env = new NodeExecutionEnv({ cwd: options.cwd });
   return {
     model: options.model,
     ...(options.systemPrompt === undefined ? {} : { systemPrompt: options.systemPrompt }),
-    tools: [createReadTool(), createBashTool(), createEditTool(), createWriteTool()],
-    toolContext: { env },
     ...(options.activeToolNames === undefined ? {} : { activeToolNames: options.activeToolNames }),
     ...(options.thinkingLevel === undefined ? {} : { thinkingLevel: options.thinkingLevel }),
     ...(options.streamOptions === undefined ? {} : { streamOptions: options.streamOptions }),
+    createExecutionContext: (workspace) => ({
+      tools: [createReadTool(), createBashTool(), createEditTool(), createWriteTool()],
+      toolContext: { env: new NodeExecutionEnv({ cwd: workspace.primary.root }) },
+      contextPrompt: workspaceContextPrompt(workspace),
+    }),
   };
 }
 
 export class PiAgentExecutorBackend implements AgentExecutorBackend {
   readonly name = PI_BACKEND_NAME;
   readonly capabilities: AgentExecutorCapabilities;
+  readonly memory: AgentMemoryContract = Object.freeze({
+    capabilities: Object.freeze({
+      roleSchemas: [AFL_MESSAGE_ROLE_SCHEMA],
+      importRoles: ["user", "assistant"] as const,
+    }),
+    validateImport: (_agent: SymbolRef, roleSchema: string, messages: readonly Message[]) => {
+      if (roleSchema !== AFL_MESSAGE_ROLE_SCHEMA) {
+        throw new AgentExecutorError(
+          "AGENT_MEMORY_ROLE_UNSUPPORTED",
+          `Pi cannot import Memory role schema '${roleSchema}'`,
+        );
+      }
+      const unsupported = messages.find((message) => message.role !== "user" && message.role !== "assistant");
+      if (unsupported !== undefined) {
+        throw new AgentExecutorError(
+          "AGENT_MEMORY_ROLE_UNSUPPORTED",
+          `Pi cannot import AFL Memory role '${unsupported.role}'`,
+        );
+      }
+    },
+  });
 
   private readonly models: Models;
   private readonly agents: Readonly<Record<string, PiAgentBinding<any>>>;
@@ -115,8 +157,8 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
       nativeSession: true,
       checkpoint: true,
       fork: true,
-      memoryExport: false,
-      memoryImportRoles: ["user", "assistant"],
+      workspaceContext: true,
+      readOnlyWorkspaceContext: true,
       structuredOutput: false,
       interrupt: true,
       toolCallInterception: true,
@@ -127,6 +169,7 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
 
   async execute(request: AgentExecutionRequest, host: AgentExecutionHost): Promise<AgentExecutionResult> {
     throwIfAborted(request.signal);
+    await this.memory.validateImport(request.agent, AFL_MESSAGE_ROLE_SCHEMA, request.memory);
     if (request.schema !== undefined) {
       throw new AgentExecutorError(
         "AGENT_CAPABILITY_UNSUPPORTED",
@@ -142,11 +185,23 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
 
     const binding = this.resolveBinding(request.agent.name);
     const effectiveSystemPrompt = request.systemPrompt ?? binding.systemPrompt;
+    const requestWorkspaceKey = workspaceKey(request.workspace);
     const existing = request.session === undefined
       ? undefined
-      : this.requireSession(request.session, request.agent.name, effectiveSystemPrompt);
+      : this.requireSession(
+          request.session,
+          request.agent.name,
+          effectiveSystemPrompt,
+          requestWorkspaceKey,
+          binding,
+        );
     const created = existing === undefined;
-    const record = existing ?? await this.createSession(request.agent.name, effectiveSystemPrompt, binding);
+    const record = existing ?? await this.createSession(
+      request.agent.name,
+      effectiveSystemPrompt,
+      binding,
+      request.workspace,
+    );
     const synchronizedRevision = request.session === undefined
       ? 0
       : request.sessionMemoryRevision;
@@ -224,20 +279,29 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     const forkedSession = await this.sessionRepo.fork(metadata, {
       ...(session.checkpoint === undefined ? {} : { entryId: session.checkpoint, position: "at" }),
     });
-    const record = this.buildSessionRecord(
-      forkedSession,
-      source.agentName,
-      source.systemPrompt,
-      source.binding,
-    );
-    const forkedMetadata = await forkedSession.getMetadata();
-    this.sessions.set(forkedMetadata.id, record);
-    const checkpoint = await forkedSession.getLeafId();
-    return {
-      backend: this.name,
-      id: forkedMetadata.id,
-      ...(checkpoint === null ? {} : { checkpoint }),
-    };
+    try {
+      const executionContext = await this.resolveExecutionContext(source.binding, source.workspace);
+      const record = this.buildSessionRecord(
+        forkedSession,
+        source.agentName,
+        source.systemPrompt,
+        source.binding,
+        executionContext,
+        source.workspaceKey,
+        source.workspace,
+      );
+      const forkedMetadata = await forkedSession.getMetadata();
+      this.sessions.set(forkedMetadata.id, record);
+      const checkpoint = await forkedSession.getLeafId();
+      return {
+        backend: this.name,
+        id: forkedMetadata.id,
+        ...(checkpoint === null ? {} : { checkpoint }),
+      };
+    } catch (error) {
+      await this.deleteRawSession(forkedSession).catch(() => {});
+      throw error;
+    }
   }
 
   async close(session: BackendSessionRef, signal: AbortSignal): Promise<void> {
@@ -272,12 +336,27 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     agentName: string,
     systemPrompt: string | undefined,
     binding: PiAgentBinding<any>,
+    workspace: AgentWorkspaceSet,
   ): Promise<PiSessionRecord> {
     const session = await this.sessionRepo.create();
-    const record = this.buildSessionRecord(session, agentName, systemPrompt, binding);
-    const metadata = await session.getMetadata();
-    this.sessions.set(metadata.id, record);
-    return record;
+    try {
+      const executionContext = await this.resolveExecutionContext(binding, workspace);
+      const record = this.buildSessionRecord(
+        session,
+        agentName,
+        systemPrompt,
+        binding,
+        executionContext,
+        workspaceKey(workspace),
+        workspace,
+      );
+      const metadata = await session.getMetadata();
+      this.sessions.set(metadata.id, record);
+      return record;
+    } catch (error) {
+      await this.deleteRawSession(session).catch(() => {});
+      throw error;
+    }
   }
 
   private buildSessionRecord(
@@ -285,26 +364,59 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     agentName: string,
     systemPrompt: string | undefined,
     binding: PiAgentBinding<any>,
+    executionContext: PiExecutionContext<any>,
+    sessionWorkspaceKey: string,
+    workspace: AgentWorkspaceSet,
   ): PiSessionRecord {
+    const harnessSystemPrompt = joinPrompts(systemPrompt, executionContext.contextPrompt);
     const harness = new AgentHarness<any, Skill, PromptTemplate, AgentHarnessTool<any>>({
       session,
       models: this.models,
       model: this.resolveModel(binding.model),
-      ...(systemPrompt === undefined ? {} : { systemPrompt }),
-      ...(binding.tools === undefined ? {} : { tools: [...binding.tools] }),
-      ...(binding.toolContext === undefined ? {} : { toolContext: binding.toolContext }),
-      ...(binding.activeToolNames === undefined ? {} : { activeToolNames: [...binding.activeToolNames] }),
+      ...(harnessSystemPrompt === undefined ? {} : { systemPrompt: harnessSystemPrompt }),
+      ...((executionContext.tools ?? binding.tools) === undefined
+        ? {}
+        : { tools: [...(executionContext.tools ?? binding.tools)!] }),
+      ...((executionContext.toolContext ?? binding.toolContext) === undefined
+        ? {}
+        : { toolContext: executionContext.toolContext ?? binding.toolContext }),
+      ...((executionContext.activeToolNames ?? binding.activeToolNames) === undefined
+        ? {}
+        : { activeToolNames: [...(executionContext.activeToolNames ?? binding.activeToolNames)!] }),
       ...(binding.thinkingLevel === undefined ? {} : { thinkingLevel: binding.thinkingLevel }),
       ...(binding.streamOptions === undefined ? {} : { streamOptions: binding.streamOptions }),
-      ...(binding.resources === undefined ? {} : { resources: binding.resources }),
+      ...((executionContext.resources ?? binding.resources) === undefined
+        ? {}
+        : { resources: executionContext.resources ?? binding.resources }),
     });
-    return { session, harness, agentName, systemPrompt, binding };
+    return {
+      session,
+      harness,
+      agentName,
+      systemPrompt,
+      binding,
+      executionContext,
+      workspaceKey: sessionWorkspaceKey,
+      workspace,
+    };
+  }
+
+  private async resolveExecutionContext(
+    binding: PiAgentBinding<any>,
+    workspace: AgentWorkspaceSet,
+  ): Promise<PiExecutionContext<any>> {
+    const resolved = await binding.createExecutionContext?.(workspace) ?? {};
+    return resolved.contextPrompt === undefined
+      ? { ...resolved, contextPrompt: workspaceContextPrompt(workspace) }
+      : resolved;
   }
 
   private requireSession(
     reference: BackendSessionRef,
     agentName?: string,
     systemPrompt?: string,
+    sessionWorkspaceKey?: string,
+    binding?: PiAgentBinding<any>,
   ): PiSessionRecord {
     if (reference.backend !== this.name) {
       throw new AgentExecutorError(
@@ -321,6 +433,12 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     }
     if (agentName !== undefined && record.systemPrompt !== systemPrompt) {
       throw new AgentExecutorError("AGENT_SESSION_INVALID", "Pi session uses a different system prompt");
+    }
+    if (sessionWorkspaceKey !== undefined && record.workspaceKey !== sessionWorkspaceKey) {
+      throw new AgentExecutorError("AGENT_SESSION_INVALID", "Pi session uses a different Workspace context");
+    }
+    if (binding !== undefined && record.binding !== binding) {
+      throw new AgentExecutorError("AGENT_SESSION_INVALID", "Pi session uses a different Agent binding");
     }
     return record;
   }
@@ -413,6 +531,10 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     this.sessions.delete(metadata.id);
     await this.sessionRepo.delete(metadata);
   }
+
+  private async deleteRawSession(session: Session): Promise<void> {
+    await this.sessionRepo.delete(await session.getMetadata());
+  }
 }
 
 function importedAssistantMessage(model: Model<Api>, content: string, timestamp: number): AssistantMessage {
@@ -468,6 +590,25 @@ function emptyUsage(): Usage {
     totalTokens: 0,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
   };
+}
+
+function workspaceContextPrompt(workspace: AgentWorkspaceSet): string {
+  const lines = [
+    `Primary workspace: ${workspace.primary.root}`,
+    "Use the primary workspace as the working directory for file and command operations.",
+  ];
+  if (workspace.readOnly.length > 0) {
+    lines.push(
+      "Read-only workspaces (context only; do not modify them):",
+      ...workspace.readOnly.map((item) => `- ${item.root}`),
+    );
+  }
+  return lines.join("\n");
+}
+
+function joinPrompts(left: string | undefined, right: string | undefined): string | undefined {
+  const parts = [left, right].filter((value): value is string => value !== undefined && value.length > 0);
+  return parts.length === 0 ? undefined : parts.join("\n\n");
 }
 
 function throwIfAborted(signal: AbortSignal): void {

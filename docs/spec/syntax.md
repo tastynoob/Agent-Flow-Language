@@ -152,10 +152,12 @@ Terminator 和 `memory.append` 等 effect instruction 不需要产生结果。
 
 ```text
 coder = agent @agent.coder
-reviewer = agent @agent.reviewer, review_memory
+worker = agent @agent.worker, "workers/worker/"
+reviewer = agent @agent.reviewer, ["workers/reviewer/", "docs/", "src/"]
+reviewer = agent @agent.reviewer,, review_memory
 ```
 
-第二个 operand 如果存在，表示创建 Agent 时绑定已有 memory；省略时自动创建 memory。
+第二个 operand 固定表示 Workspace：单个路径是主工作区；列表第一项是主工作区，后续至少一项是只读工作区。只有主工作区时必须使用字符串形式。省略时主工作区为 AFL 执行根目录。第三个 operand 才是已有 Memory；省略 Workspace 但传入 Memory 时必须保留空的第二个位置，如 `agent @agent.reviewer,, review_memory`。
 
 设置 system prompt：
 
@@ -276,7 +278,7 @@ security = fork coder, security.do security_prompt
 quality = fork coder, quality.do quality_prompt
 ```
 
-两条 `fork` 都只读取 fork 时的 `coder` 状态，彼此没有依赖，因此可以并行。Source Agent、各 branch Agent 和各份 Memory 在 fork 后互相独立。后续对 branch Agent 的状态性调用排在其启动动作之后。
+两条 `fork` 都只读取 fork 时的 `coder` Memory，Source Agent、各 branch Agent 和各份 Memory 在 fork 后互相独立。Branch 继承 source Workspace；如果它们共享可写路径，实际 Agent 执行会由 Workspace lock 串行。后续对 branch Agent 的状态性调用排在其启动动作之后。
 
 等待 child flow：
 
@@ -313,7 +315,7 @@ memory.append coder.memory, tool, tool_result
 
 ```text
 review_memory = memory.copy coder.memory
-reviewer = agent @agent.reviewer, review_memory
+reviewer = agent @agent.reviewer,, review_memory
 ```
 
 把 Memory 应用到已有 Agent 的配置副本：
@@ -348,7 +350,7 @@ result = freedom.flow planner, prompt, context, @schema.Result
 ## 14. 指令形式汇总
 
 ```text
-dst = agent symbol [, memory]
+dst = agent symbol [, workspace [, memory]]
 agent.sysprompt prompt
 dst = agent.do [role,] frag [, schema]
 

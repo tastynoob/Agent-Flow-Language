@@ -45,6 +45,7 @@ if ((command !== "validate" && command !== "run") || file === undefined) {
       if (!Array.isArray(vmArgs)) throw new Error("--args must decode to a JSON array");
       const result = await vm.run(options.entry ?? "main", vmArgs, {
         ...(options.runId === undefined ? {} : { runId: options.runId }),
+        executionRoot: process.cwd(),
       });
       process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
       if (trace !== undefined && options.trace !== undefined) {

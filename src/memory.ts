@@ -1,0 +1,82 @@
+import { createHash } from "node:crypto";
+
+import type { AflModule, SymbolRef } from "./ir.js";
+
+export const AFL_MESSAGE_ROLE_SCHEMA = "afl.message-role/v1";
+
+export interface Message {
+  readonly role: string;
+  readonly content: string;
+}
+
+export interface AgentMemoryCapabilities {
+  readonly roleSchemas: readonly string[];
+  readonly importRoles: readonly string[];
+}
+
+export interface AgentMemoryContract {
+  readonly capabilities: AgentMemoryCapabilities;
+  validateImport(
+    agent: SymbolRef,
+    roleSchema: string,
+    messages: readonly Message[],
+  ): void | Promise<void>;
+}
+
+export interface PersistedMemorySlot {
+  readonly moduleDigest: string;
+  readonly messages: readonly Message[];
+  readonly revision: number;
+}
+
+export interface PersistedRunMemoryState {
+  readonly version: 1;
+  readonly format: "afl.memory-run";
+  readonly roleSchema: typeof AFL_MESSAGE_ROLE_SCHEMA;
+  readonly runId: string;
+  readonly rootModuleDigest: string;
+  readonly memories: Readonly<Record<string, PersistedMemorySlot>>;
+}
+
+export interface MemoryStateStore {
+  loadRun(runId: string, signal: AbortSignal): Promise<PersistedRunMemoryState | undefined>;
+  saveRun(state: PersistedRunMemoryState, signal: AbortSignal): Promise<void>;
+}
+
+export interface MemoryPersistenceBinding {
+  readonly directory?: string;
+  readonly store?: MemoryStateStore;
+}
+
+export function canonicalModuleDigest(module: AflModule): string {
+  return `sha256:${createHash("sha256").update(JSON.stringify(canonicalize(module, "module"))).digest("hex")}`;
+}
+
+type CanonicalContext = "module" | "ir" | "recordEntries" | "data";
+
+function canonicalize(value: unknown, context: CanonicalContext): unknown {
+  if (Array.isArray(value)) return value.map((item) => canonicalize(item, context));
+  if (typeof value !== "object" || value === null) return value;
+  const entries = Object.entries(value)
+    .filter(([key]) => !(
+      (context === "module" && key === "sourceName") ||
+      (context === "ir" && key === "span")
+    ))
+    .sort(([left], [right]) => left.localeCompare(right));
+  return Object.fromEntries(entries.map(([key, item]) => [
+    key,
+    canonicalize(item, childCanonicalContext(value, key, context)),
+  ]));
+}
+
+function childCanonicalContext(
+  parent: object,
+  key: string,
+  context: CanonicalContext,
+): CanonicalContext {
+  if (context === "data") return "data";
+  if (context === "recordEntries") return "ir";
+  if (key === "value" && "kind" in parent && parent.kind === "literal") return "data";
+  if (key === "entries" && "kind" in parent && parent.kind === "record") return "recordEntries";
+  return "ir";
+}

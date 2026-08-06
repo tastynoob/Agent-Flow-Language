@@ -87,8 +87,8 @@ export interface AgentExecutorCapabilities {
   readonly nativeSession: boolean;
   readonly checkpoint: boolean;
   readonly fork: boolean;
-  readonly memoryExport: boolean;
-  readonly memoryImportRoles: readonly string[];
+  readonly workspaceContext: boolean;
+  readonly readOnlyWorkspaceContext: boolean;
   readonly structuredOutput: boolean;
   readonly interrupt: boolean;
   readonly toolCallInterception: boolean;
@@ -110,6 +110,7 @@ export interface AgentExecutionRequest {
   readonly systemPrompt?: string;
   readonly memory: readonly Message[];
   readonly memoryRevision: number;
+  readonly workspace: AgentWorkspaceSet;
   readonly session?: BackendSessionRef;
   readonly sessionMemoryRevision?: number;
   readonly schema?: SymbolRef;
@@ -124,12 +125,13 @@ export interface AgentExecutionResult {
     | "budget_exhausted"
     | "cancelled";
   readonly session?: BackendSessionRef;
-  readonly messages?: readonly Message[];
   readonly usage?: Readonly<Record<string, number>>;
 }
 
 export interface AgentExecutorBackend {
+  readonly name: string;
   readonly capabilities: AgentExecutorCapabilities;
+  readonly memory: AgentMemoryContract;
 
   execute(
     request: AgentExecutionRequest,
@@ -146,11 +148,6 @@ export interface AgentExecutorBackend {
     signal: AbortSignal,
   ): Promise<BackendSessionRef>;
 
-  exportMemory?(
-    session: BackendSessionRef,
-    signal: AbortSignal,
-  ): Promise<readonly Message[]>;
-
   close?(
     session: BackendSessionRef,
     signal: AbortSignal,
@@ -160,7 +157,9 @@ export interface AgentExecutorBackend {
 
 `AgentExecutorBackend.execute()` 自身就承诺推进一次完整的 Agent 工作激活，因此接口不再需要 `mode` 或 sequence capability。普通的无状态模型 adapter 可以根据 AFL Memory 发起一次请求，并在得到无需继续处理的模型输出后返回 `completed`；它不需要伪造多轮 session。
 
-`BackendSessionRef` 是 VM 基础设施数据，不是 Frag，也不能由 AFL flow 读取、拼接或发送给另一个 flow。首版可以只在当前 VM run 中使用；持久化 VM run 时再为 backend 增加显式的编码与恢复契约。
+`BackendSessionRef` 是 VM 基础设施数据，不是 Frag，也不能由 AFL flow 读取、拼接或发送给另一个 flow。它只在当前 backend 实例中使用，不写入 AFL canonical Memory；native session 或 snapshot 恢复需要后续独立契约。
+
+`AgentMemoryContract` 声明 executor 可导入的 AFL role schema 和 role，并在每次执行前校验完整 canonical Memory。Backend 只返回最终 role-free output，VM 负责追加唯一的 canonical `assistant` Message。
 
 普通 Chat Completions adapter 不需要伪造原生 session。它可以声明 `nativeSession: false`，每次根据 AFL Memory 构造请求。现有 `AgentAdapter.run()` 可以通过兼容包装器继续工作。
 
@@ -296,7 +295,9 @@ Pi、Codex、Claude Code 等 coding Agent 会修改文件，因此 Agent Memory 
 - session fork 通常只复制对话，不复制文件系统；
 - AFL `fork` 当前只承诺 Memory 隔离，不承诺 workspace 隔离。
 
-初版 Pi Backend 可以在 binding 中固定 `cwd`，并明确同一 workspace 上的写操作风险。后续如需可靠的并行 coding flow，可以增加独立的 Workspace/Environment 基础设施，通过 Git worktree、临时目录、容器或远程环境提供隔离；这不要求改变 `do` 的基本语义。
+Workspace 已作为 Agent declaration 的第二个 operand 进入 IR，而不是独立 handle 或指令。VM 将路径规范化后通过 `AgentExecutionRequest.workspace` 传给 Backend，并用层次化 read/write lock 控制重叠路径；省略时使用 AFL execution root。Pi binding 保留模型和稳定配置，`createExecutionContext(workspace)` 按 session 创建 `NodeExecutionEnv`、tools 和 tool context，因此不再固定全局 `cwd`。
+
+Workspace lock 只协调当前 VM 进程，read-only descriptor 也只是 executor 上下文，不是权限边界。Git worktree、容器、远程环境和 OS sandbox 仍由 host/backend 负责，不进入 AFL 文件系统编程语义。
 
 ## 10. 错误与兼容性
 
@@ -331,7 +332,7 @@ Agent 工作指令合并已经作为前置步骤完成，所有层只处理 `age
 - fake backend conformance tests，避免测试依赖真实模型或用户账户；
 - 单独的 live smoke，用于验证真实 Pi runtime 和模型 provider，不作为默认测试前置条件。
 
-持久化 VM run、Workspace handle、完整权限系统、Codex Backend 和其他 Agent runtime 可以在上述接口稳定后分别扩展。
+Canonical Memory 持久化和 Agent Workspace operand 由 VM 提供；完整 snapshot、Workspace handle、权限系统、Codex Backend 和其他 Agent runtime 仍可在上述接口稳定后分别扩展。
 
 ## 12. 验收行为
 

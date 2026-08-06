@@ -226,14 +226,23 @@ function parseAssignedInstruction(
 ): AflInstruction {
   if (rhs.startsWith("agent ")) {
     const operands = splitTopLevel(rhs.slice(6));
-    if (operands.length < 1 || operands.length > 2) {
-      throw parseError("PARSE_AGENT", "agent expects a symbol and optional Memory", line, sourceName);
+    if (operands.length < 1 || operands.length > 3 || operands[0]!.trim().length === 0) {
+      throw parseError("PARSE_AGENT", "agent expects a symbol, optional Workspace, and optional Memory", line, sourceName);
+    }
+    if (operands.length === 2 && operands[1]!.trim().length === 0) {
+      throw parseError("PARSE_AGENT", "agent cannot end with an empty Workspace operand", line, sourceName);
+    }
+    if (operands.length === 3 && operands[2]!.trim().length === 0) {
+      throw parseError("PARSE_AGENT", "agent cannot end with an empty Memory operand", line, sourceName);
     }
     return {
       op: "agent",
       dst,
       agent: parseSymbol(operands[0]!, line, sourceName),
-      ...(operands[1] === undefined ? {} : { memory: parseName(operands[1], line, sourceName) }),
+      ...(operands[1] === undefined || operands[1].trim().length === 0
+        ? {}
+        : { workspace: parseValue(operands[1], line, sourceName) }),
+      ...(operands[2] === undefined ? {} : { memory: parseName(operands[2], line, sourceName) }),
       span: line.span,
     };
   }

@@ -104,6 +104,7 @@ export interface AgentInstruction extends InstructionBase {
   readonly op: "agent";
   readonly dst: string;
   readonly agent: SymbolExpr;
+  readonly workspace?: ValueExpr;
   readonly memory?: NameExpr;
 }
 

@@ -7,10 +7,10 @@ main(task):
 
     review:
         review_memory = memory.copy coder.memory
-        reviewer = agent @agent.reviewer, review_memory
-        reviewer.sysprompt "Review the current result. Return exactly finish when it is correct; otherwise return a concrete defect list."
+        reviewer = agent @agent.reviewer,, review_memory
+        reviewer.sysprompt "Review the current result. The first line must be VERDICT: FINISH when it is correct or VERDICT: REVISE when defects remain. After VERDICT: REVISE, return a concrete defect list."
         review_result = reviewer.do "Review the latest implementation."
-        finish = oper review_result == "finish"
+        finish = typescript "const lines = String(args[0]).replaceAll('*', '').replaceAll('_', '').toLowerCase().split(String.fromCharCode(10)).map(line => line.trim()); return lines.some(line => ['finish', 'approved', 'pass'].some(verdict => line === verdict || line.startsWith('verdict: ' + verdict) || line.startsWith('status: ' + verdict)))", review_result
         jump finish, done, revise
 
     revise:

@@ -38,6 +38,7 @@ export async function runVmCommand(argv, io = process) {
     const vmArgs = await readVmArgs(options);
     const result = await vm.run(options.entry ?? "main", vmArgs, {
       ...(options.runId === undefined ? {} : { runId: options.runId }),
+      executionRoot: process.cwd(),
     });
     io.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     if (trace !== undefined && options.trace !== undefined) {

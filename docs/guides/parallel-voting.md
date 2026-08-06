@@ -16,9 +16,9 @@ Parallel Voting 是一种常见的 Agent workflow：多个 Worker 独立处理�
 下面的 flow 先让 Planner 给出评审数量，再批量运行同一个评审 flow：
 
 ```text
-review_once(code):
+review_once(code, workspace):
     entry:
-        reviewer = agent @agent.security_reviewer
+        reviewer = agent @agent.security_reviewer, workspace
         reviewer.sysprompt @prompt.security_reviewer
         review_prompt = prompt @prompt.security_review, code
         vote = reviewer.do review_prompt
@@ -30,7 +30,7 @@ parallel_security_review(code):
         count_prompt = prompt @prompt.choose_reviewer_count, code
         count_frag = planner.do count_prompt
         reviewer_count = typescript "return Number(args[0])", count_frag
-        jobs = dispatch reviewer_count, review_once, code
+        jobs = dispatch reviewer_count, @flow.generated_review_once, code
         votes = sync jobs, @format.json_array
         judge = agent @agent.review_judge
         judge_prompt = prompt @prompt.judge_reviews, code, votes
@@ -40,18 +40,18 @@ parallel_security_review(code):
 
 `reviewer_count` 是 compute value。Planner 返回的 Frag 由 Script binding 转换为 number；dispatch 在运行时要求它是非负整数。`maxDispatchTasks` policy 可以限制 task 总数。
 
-`dispatch reviewer_count, review_once, code` 创建 `reviewer_count` 次 `review_once(code)`。每次调用拥有独立的 node invocation、Agent 和默认 Memory，但接收相同的 `code` Frag。各 Worker 之间没有数据或 Memory dependency，因此可以并行运行；`sync` 是它们的汇合点。
+Batch dispatch 会创建 `reviewer_count` 个独立 node invocation。当前 batch 形式只向每个 child 传同一个 task，不传 ordinal，因此上例用外部 generator 提供的 `@flow.generated_review_once`：generator 为每个实例生成 `workers/0/`、`workers/1/` 等 sibling 主工作区。若所有 Worker 都省略 Workspace，它们会共享执行根目录，并因写锁而串行；`sync` 仍是结果汇合点。
 
 ## 3. List Dispatch 表达
 
 当多个 Worker 需要不同的 flow、prompt 或参数时，可以手动列出 flow call：
 
 ```text
-jobs = dispatch [security_review(code), correctness_review(code), test_review(code)]
+jobs = dispatch [review_once(code, "workers/security/"), review_once(code, "workers/correctness/"), review_once(code, "workers/tests/")]
 reviews = sync jobs, @format.json_array
 ```
 
-这一形式的三个 child 分别调用不同 flow。列表本身已经描述了 Worker 数量、类型和参数，因此不需要额外的 `count`。
+这一形式显式给每个 child 传入 sibling Workspace。列表本身已经描述了 Worker 数量、类型和参数，因此不需要额外的 `count`；也可以把三个位置换成不同的 review flow。
 
 两种形式的含义不同：
 
@@ -82,7 +82,7 @@ List 版本说明，同一个并行原语也可以描述固定的多专家审查
 
 ## 6. 当前行为与限制
 
-- Batch Worker 不接收实例序号或 metadata；
+- Batch Worker 不接收实例序号或 metadata；需要编号 Workspace 时由 AFL generator 或外部 flow binding 补充；
 - `count` 在 VM 运行时校验，默认 task 总数上限为 10,000；
 - 默认最多同时运行 16 个 dispatch worker；
 - 任一 child 失败会取消同组其他 child，`sync` 不提供 all-settled 结果；

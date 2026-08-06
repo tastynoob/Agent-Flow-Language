@@ -26,10 +26,10 @@ main(task):
 
     review:
         review_memory = memory.copy coder.memory
-        reviewer = agent @agent.reviewer, review_memory
-        reviewer.sysprompt "Return exactly finish when correct; otherwise return a defect list."
+        reviewer = agent @agent.reviewer,, review_memory
+        reviewer.sysprompt "Begin with VERDICT: FINISH when correct or VERDICT: REVISE when defects remain."
         review_result = reviewer.do "Review the latest implementation."
-        finish = oper review_result == "finish"
+        finish = typescript "const lines = String(args[0]).replaceAll('*', '').replaceAll('_', '').toLowerCase().split(String.fromCharCode(10)).map(line => line.trim()); return lines.some(line => ['finish', 'approved', 'pass'].some(verdict => line === verdict || line.startsWith('verdict: ' + verdict) || line.startsWith('status: ' + verdict)))", review_result
         jump finish, done, revise
 
     revise:
@@ -47,7 +47,7 @@ task -> Coder -> copy Memory -> Reviewer -> finish -> result
           +------ defect list ------+
 ```
 
-这里的 Agent 调用、Memory 复制、结果依赖、条件跳转和循环都是 VM 执行的 flow 语义，不是宿主代码中的隐藏编排。相同 primitive 还能通过 `dispatch/sync` 表达并行 Worker，通过 `fork` 创建继承上下文的 Agent 分支，并在预定义路径不足时使用受验证的 `freedom` fallback。完整文件见 [`examples/coder-reviewer.afl`](examples/coder-reviewer.afl)，并行案例见 [`docs/guides/parallel-voting.md`](docs/guides/parallel-voting.md)。
+这里的 Agent 调用、Memory 复制、结果依赖、条件跳转和循环都是 VM 执行的 flow 语义，不是宿主代码中的隐藏编排。Reviewer prompt 提供明确的 verdict 协议，Script binding 再对大小写、Markdown 包裹和常见的 `Status: APPROVED` 变体做宽松解析，避免直接依赖模型输出的字面相等。相同 primitive 还能通过 `dispatch/sync` 表达并行 Worker，通过 `fork` 创建继承上下文的 Agent 分支，并在预定义路径不足时使用受验证的 `freedom` fallback。完整文件见 [`examples/coder-reviewer.afl`](examples/coder-reviewer.afl)，并行案例见 [`docs/guides/parallel-voting.md`](docs/guides/parallel-voting.md)。
 
 ## AFL VM
 
@@ -88,7 +88,6 @@ import {
 
 const binding = createPiCodingAgentBinding({
   model: { provider: process.env.AFL_PI_PROVIDER, id: process.env.AFL_PI_MODEL },
-  cwd: process.env.AFL_PI_CWD ?? process.cwd(),
 });
 
 export default {
@@ -98,7 +97,9 @@ export default {
 
 完整 bindings 文件见 [`examples/pi-bindings.mjs`](examples/pi-bindings.mjs)。`defaultBinding` 可供所有 Agent symbol 使用；需要为 Coder、Reviewer 等选择不同模型或工具时，改用 `agents` map，以 `@agent.*` symbol 为 key。
 
-`createPiCodingAgentBinding` 显式启用 Pi core 的 `read`、`bash`、`edit` 和 `write` 工具。这些工具继承 AFL VM 进程的文件和命令权限，不提供强制 sandbox；默认也不加载 pi-coding-agent 的 CLI、extensions 或交互 UI。Pi session 当前保存在 backend 实例内存中，支持同一 run 内的续接、Memory checkpoint 与 fork，但不提供跨进程持久化。Pi backend 暂不支持带 schema 的 `do`。
+`createPiCodingAgentBinding` 显式启用 Pi core 的 `read`、`bash`、`edit` 和 `write` 工具，并为每个 Agent activation 按 AFL Workspace 创建执行上下文。工具的 `cwd` 是 Agent 主工作区；只读工作区作为上下文信息提供，目前尚无 OS 级只读 sandbox。默认也不加载 pi-coding-agent 的 CLI、extensions 或交互 UI。
+
+AFL canonical Memory 默认保存在执行根目录的 `.afl/memory/`，同一 `runId` 再次执行时会恢复对应 slot。Pi native session 和 checkpoint 仍只存在于当前 backend 实例，不属于持久化文件，也不支持 snapshot 恢复。Pi backend 暂不支持带 schema 的 `do`。
 
 `afl` 命令负责静态验证；旧 `afl run` 形式暂时保留兼容：
 

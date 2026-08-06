@@ -10,7 +10,6 @@ export default {
   agentExecutor: new PiAgentExecutorBackend({
     defaultBinding: createPiCodingAgentBinding({
       model: { provider, id: model },
-      cwd: process.env.AFL_PI_CWD ?? process.cwd(),
     }),
   }),
 };
