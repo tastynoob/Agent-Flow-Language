@@ -78,7 +78,7 @@ Memory handle 还记录 VM 内部 identity 和可选 owner，用于资源依赖�
 
 指令结果分为三类：
 
-- 数据结果：`do`、`seqdo`、`prompt`、`input`、`invoke`、`call`、`sync` 等返回 Frag；
+- 数据结果：`do`、`prompt`、`input`、`invoke`、`call`、`sync` 等返回 Frag；
 - 计算结果：`oper` 与 script executor 返回 bool、number、string 或宿主结构等本地 compute value；
 - 资源结果：`agent`、`memory.copy`、`memory.apply`、`dispatch`、`fork` 返回 VM handle。
 
@@ -93,7 +93,7 @@ JSON 是 Frag content 的一种可选编码，不是 Core IR 的内部数据模�
 指令读取另一条指令的 `dst` 时形成数据依赖：
 
 ```text
-review_result = reviewer.seqdo review_prompt
+review_result = reviewer.do review_prompt
 finish = oper review_result == "finish"
 ```
 
@@ -140,7 +140,7 @@ reviewer = agent @agent.reviewer, review_memory
 
 Prompt source 是 symbol 时，VM 调用 Prompt binding 的 `render`。Source 是 literal、Frag 或 compute value 时，VM 将 source 与格式化后的参数用两个换行符连接。两种形式都返回 Frag。
 
-`prompt` 返回的 Frag 没有 role。它被传给 `agent.do/seqdo` 或 `memory.append` 时才形成带 role 的 Message。
+`prompt` 返回的 Frag 没有 role。它被传给 `agent.do` 或 `memory.append` 时才形成带 role 的 Message。
 
 ### 7.4 `input`
 
@@ -148,27 +148,23 @@ Prompt source 是 symbol 时，VM 调用 Prompt binding 的 `render`。Source �
 
 ### 7.5 `do`
 
-`agent.do` 表示一次 Agent 工作单元。其基本过程为：
+`agent.do` 表示一次完整的 Agent 工作激活，而不是一次模型请求或单个 runtime turn。其基本过程为：
 
 1. 将输入 Frag 以显式 role 加入 Agent Memory；省略 role 时使用 `user`；
-2. 执行一次由 Agent adapter 定义的工作单元；
+2. 调用一次 `AgentAdapter.run`；adapter 负责在返回前完成内部需要的模型 turn 和工具步骤；
 3. 将模型可见输出以 `assistant` role 加入该 Agent Memory；
 4. 返回包含同一输出字符串、但不带 role 的 Frag。
 
 Role-free 返回值可以被另一个 Agent 作为 `user` message 接收，也可以用其他 role 显式 append。
 
-### 7.6 `seqdo`
-
-`agent.seqdo` 与 `do` 使用相同的输入和最终输出规则。VM 对两者都调用一次 `AgentAdapter.run`，并通过 `mode` 字段区分；多步执行与停止条件由 adapter 实现。
-
 Adapter 可以在 `messages` 中返回中间 Message。VM 依次追加这些 Message，再以 `assistant` role 追加 `output`，指令返回包装 `output` 的 Frag。
 
-### 7.7 输出格式约束
+### 7.6 输出格式约束
 
 Agent 调用可以带 schema symbol：
 
 ```text
-report = reviewer.seqdo prompt, @schema.Report
+report = reviewer.do prompt, @schema.Report
 ```
 
 存在 schema operand 时，VM 要求 Schema binding 存在，并用它校验 Agent 输出字符串。校验后的 `report` 仍是 Frag，不会自动变成 Core IR record。
@@ -176,7 +172,7 @@ report = reviewer.seqdo prompt, @schema.Report
 简单 flow 不必使用 JSON。例如 Reviewer 可以约定：没有缺陷时精确输出 `finish`，否则输出文本缺陷列表：
 
 ```text
-review_result = reviewer.seqdo review_prompt
+review_result = reviewer.do review_prompt
 finish = oper review_result == "finish"
 ```
 
@@ -283,7 +279,6 @@ VM 默认允许一次 dispatch 创建最多 10,000 个 task，并最多同时运
 
 ```text
 new_agent = fork source_agent, new_agent.do prompt
-new_agent = fork source_agent, new_agent.seqdo task
 ```
 
 左侧 `dst` 在该条指令的第二个 operand 中是合法的 branch Agent 绑定，在其他 operand 或定义前的普通指令中仍不可引用。`fork` 执行以下概念操作：
@@ -296,7 +291,7 @@ new_agent.do prompt
 
 Branch Agent 沿用 source Agent 的 binding 和配置，并绑定独立复制的 Memory。Source Agent 和 branch Agent 在 fork 后的消息写入互不传播。
 
-`fork` 返回 branch Agent handle。启动动作的输出已经以 `assistant` role 写入 branch Memory，但这条快捷形式不额外返回 Frag。后续对 branch Agent 的 `do`、`seqdo`、`sysprompt` 或 Memory 写入，与启动动作形成同一 Agent 的资源依赖。
+`fork` 返回 branch Agent handle。启动动作的输出已经以 `assistant` role 写入 branch Memory，但这条快捷形式不额外返回 Frag。后续对 branch Agent 的 `do`、`sysprompt` 或 Memory 写入，与启动动作形成同一 Agent 的资源依赖。
 
 多条互不依赖的 `fork` 指令可以并行启动分支。需要 list 或 batch child flow、独立结果集合和 `sync` 时使用 `dispatch`。Trace 记录 `fork.started`、内部 Agent 事件和 `fork.completed`。
 
@@ -312,7 +307,7 @@ Basic block 中互不依赖的普通 Agent 指令本身已经可以并行；`dis
 
 `invoke` 调用已绑定的 skill、MCP method 或 capability。Binding 负责把外部输出格式化成 role-free Frag。
 
-Agent 在 `do/seqdo` 内部自行使用 tool，与 flow 显式执行 `invoke` 是两种语义：前者由 Agent 决策，后者由 AFL flow 决策。
+Agent 在 `do` 内部自行使用 tool，与 flow 显式执行 `invoke` 是两种语义：前者由 Agent 决策，后者由 AFL flow 决策。
 
 ## 13. `freedom`
 
@@ -325,7 +320,7 @@ VM 把 planner Agent 的 system prompt 和 Memory messages 交给 Freedom bindin
 指令可以完成、等待 adapter 或失败：
 
 - `input` 可以等待外部输入；
-- `do/seqdo` 等待 Agent binding；
+- `do` 等待 Agent binding；
 - `sync` 可以等待 child flow；
 - VM error、格式校验失败、权限拒绝和显式 `fail` 会使当前路径失败。
 

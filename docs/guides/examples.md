@@ -8,7 +8,7 @@ coder_review(task):
         coder = agent @agent.coder
         coder.sysprompt @prompt.coder
         task_prompt = prompt "Implement the task", task
-        code = coder.seqdo task_prompt
+        code = coder.do task_prompt
         jump review
 
     review:
@@ -16,20 +16,20 @@ coder_review(task):
         reviewer = agent @agent.reviewer, review_memory
         reviewer.sysprompt @prompt.reviewer
         review_prompt = prompt "Review the implementation. If no defect exists, output exactly finish; otherwise output the defect list"
-        review_result = reviewer.seqdo review_prompt
+        review_result = reviewer.do review_prompt
         finish = oper review_result == "finish"
         jump finish, done, revise
 
     revise:
         fix_prompt = prompt "Fix the following defects", review_result
-        code = coder.seqdo fix_prompt
+        code = coder.do fix_prompt
         jump review
 
     done:
         ret code
 ```
 
-`review_result` 始终是 role-free Frag。它包含精确的 `finish` 或文本缺陷列表，不需要为了这个分支定义 JSON BugList。`fix_prompt` 也是 Frag；传给 `coder.seqdo` 时默认以 `user` role 加入 Coder Memory。
+`review_result` 始终是 role-free Frag。它包含精确的 `finish` 或文本缺陷列表，不需要为了这个分支定义 JSON BugList。`fix_prompt` 也是 Frag；传给 `coder.do` 时默认以 `user` role 加入 Coder Memory。
 
 每次进入 `review` 都从最新 Coder Memory 创建独立 copy。Reviewer 可以看到完整上下文，但其审查过程不会改写 Coder Memory。
 
@@ -41,7 +41,7 @@ coder_review(task):
 revise:
     memory.append coder.memory, user, review_result
     fix_command = prompt @prompt.fix_current_defects
-    code = coder.seqdo fix_command
+    code = coder.do fix_command
     jump review
 ```
 
@@ -55,7 +55,7 @@ blind_review(code):
         reviewer = agent @agent.reviewer
         reviewer.sysprompt @prompt.reviewer
         review_prompt = prompt "Review only the supplied code. Return exactly finish when no defect exists", code
-        review_result = reviewer.seqdo review_prompt
+        review_result = reviewer.do review_prompt
         ret review_result
 ```
 
@@ -74,9 +74,9 @@ parallel_review(code):
         quality_prompt = prompt "Review maintainability", code
         test_prompt = prompt "Design missing tests", code
 
-        security_report = security.seqdo security_prompt
-        quality_report = quality.seqdo quality_prompt
-        test_report = tests.seqdo test_prompt
+        security_report = security.do security_prompt
+        quality_report = quality.do quality_prompt
+        test_report = tests.do test_prompt
 
         reports = prompt @prompt.combine_reports, security_report, quality_report, test_report
         ret reports
@@ -110,14 +110,14 @@ explore_alternatives(coder, task):
         simple = fork coder, simple.do simple_prompt
 
         finish_prompt = prompt "Finish and return the proposed result"
-        fast_result = fast.seqdo finish_prompt
-        safe_result = safe.seqdo finish_prompt
-        simple_result = simple.seqdo finish_prompt
+        fast_result = fast.do finish_prompt
+        safe_result = safe.do finish_prompt
+        simple_result = simple.do finish_prompt
         alternatives = prompt @prompt.combine_alternatives, fast_result, safe_result, simple_result
         ret alternatives
 ```
 
-三条 `fork` 分别从 `coder` 派生一个 Agent，并立即执行各自的首轮工作。每个 branch 的初始 Memory 都是 `coder.memory` 的独立副本，后续工作互不改写。同一 branch 上的 `seqdo` 排在它的启动 `do` 之后，三个 branch 之间仍可并行。
+三条 `fork` 分别从 `coder` 派生一个 Agent，并立即执行各自的首轮工作。每个 branch 的初始 Memory 都是 `coder.memory` 的独立副本，后续工作互不改写。同一 branch 上后续的 `do` 排在启动动作之后，三个 branch 之间仍可并行。
 
 ## 7. `do` 与交互式路由
 
@@ -133,16 +133,16 @@ guided_work(task):
     ask_user:
         answer = input "Provide the missing information"
         resume_prompt = prompt "Continue with this answer", answer
-        result = worker.seqdo resume_prompt
+        result = worker.do resume_prompt
         ret result
 
     continue_work:
         continue_prompt = prompt "Continue and finish the task", task, step
-        result = worker.seqdo continue_prompt
+        result = worker.do continue_prompt
         ret result
 ```
 
-`do` 把一次工作后的决定交还给 flow；`seqdo` 允许 Agent 在一个 AFL 指令内继续多步工作。
+每次 `do` 都表示一次完整的 Agent 工作激活。执行后端可以在其中完成多个模型 turn、工具调用或其他内部步骤；Agent 结束当前工作后，`do` 才把最终结果交还给 flow。
 
 ## 8. JSON 仍然只是 Frag 格式
 
@@ -151,7 +151,7 @@ structured_review(code):
     entry:
         reviewer = agent @agent.reviewer
         review_prompt = prompt "Return the review as JSON", code
-        report = reviewer.seqdo review_prompt, @schema.ReviewReport
+        report = reviewer.do review_prompt, @schema.ReviewReport
         ret report
 ```
 
@@ -178,11 +178,11 @@ inspect_issue(repository, number):
         issue = invoke @mcp.github.get_issue, repository, number
         analyst = agent @agent.analyst
         analysis_prompt = prompt "Analyze this issue", issue
-        report = analyst.seqdo analysis_prompt
+        report = analyst.do analysis_prompt
         ret report
 ```
 
-`invoke` 通过 Capability binding 调用 `@mcp.github.get_issue`，并把返回字符串包装为 role-free Frag。若由 Analyst 在 `seqdo` 内自行调用工具，则属于 Agent adapter 内部行为。
+`invoke` 通过 Capability binding 调用 `@mcp.github.get_issue`，并把返回字符串包装为 role-free Frag。若由 Analyst 在 `do` 内自行调用工具，则属于 Agent executor 内部行为。
 
 ## 11. Freedom Fallback
 

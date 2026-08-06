@@ -18,11 +18,11 @@ Parser 把文本转换为 `AflModule`，validator 检查结构、名称、操作
 main(task):
     entry:
         worker = agent @agent.worker
-        result = worker.seqdo task
+        result = worker.do task
         ret result
 ```
 
-普通结果指令使用 `dst = instr ...`。Agent 工作使用 `dst = agent.do ...` 或 `dst = agent.seqdo ...`。`jump`、`ret` 和 `fail` 结束 basic block。
+普通结果指令使用 `dst = instr ...`。Agent 工作使用 `dst = agent.do ...`。`jump`、`ret` 和 `fail` 结束 basic block。
 
 Node 内的工作值在调用期间保存在同一个 frame 中。`call` 可以同步调用本地 node 或绑定的外部 flow。循环由 `jump` 回到既有 block 表达。
 
@@ -45,7 +45,7 @@ Frag 不携带 role。Frag 进入 Agent 或 Memory 时才确定 role。Handle �
 
 | 类别 | 指令 |
 | --- | --- |
-| Agent | `agent`、`agent.sysprompt`、`agent.do`、`agent.seqdo` |
+| Agent | `agent`、`agent.sysprompt`、`agent.do` |
 | 数据与输入 | `prompt`、`input`、`oper` |
 | Script | `python`、`typescript`、`shell` |
 | Flow | `call`、两种 `dispatch`、`sync`、`fork` |
@@ -67,7 +67,7 @@ Basic block 内的指令不因文本相邻而自动串行。VM 从名称引用�
 - `dispatch [flow_a(...), flow_b(...)]` 启动一组显式调用；
 - `dispatch count, flow, task` 启动 `count` 个同构调用；
 - `sync` 等待 TaskGroup 并收集结果；
-- `fork` 复制 source Agent 的 Memory，创建 branch Agent，并立即执行一次 `do` 或 `seqdo`。
+- `fork` 复制 source Agent 的 Memory，创建 branch Agent，并立即执行一次 `do`。
 
 ## 6. Bindings
 

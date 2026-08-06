@@ -86,7 +86,7 @@ fail error
 
 ```text
 review:
-    review_result = reviewer.seqdo review_prompt
+    review_result = reviewer.do review_prompt
     finish = oper review_result == "finish"
     jump finish, done, revise
 
@@ -140,7 +140,7 @@ String literal 在需要 Frag 的位置自动包装成 Frag。Prompt symbol 需�
 
 | 类别 | 代表指令 | 返回结果 |
 | --- | --- | --- |
-| 数据指令 | `do`、`seqdo`、`prompt`、`input`、`invoke`、`call`、`sync` | role-free Frag |
+| 数据指令 | `do`、`prompt`、`input`、`invoke`、`call`、`sync` | role-free Frag |
 | 计算指令 | `oper`、`python`、`typescript`、`shell` | VM compute value |
 | 资源指令 | `agent`、`memory.copy`、`memory.apply`、`dispatch`、`fork` | Agent、Memory、TaskGroup 等 handle |
 
@@ -174,15 +174,9 @@ step = coder.do user, prompt
 step = coder.do user, prompt, @schema.StepResult
 ```
 
-执行连续多步 Agent 工作：
-
-```text
-result = coder.seqdo prompt
-result = coder.seqdo user, prompt
-result = coder.seqdo user, prompt, @schema.Code
-```
-
 省略 role 时使用 `user`。显式 role 位于输入 Frag 之前。末尾 schema symbol 是可选的输出约束；schema 校验成功后，返回结果仍然是包含格式化字符串的 Frag。
+
+一次 `do` 表示完整的 Agent 工作激活，可以在执行后端内部包含多个模型 turn 和工具步骤。Core IR、validator、VM 和 adapter API 不再区分单步与连续执行 mode。
 
 Agent 输出在其自身 memory 中使用 `assistant` role，但指令返回的 Frag 不继承该 role。它进入另一个 Agent 或 Memory 时重新指定 role。
 
@@ -272,14 +266,14 @@ List 形式逐项启动显式写出的 flow call，可以混用不同 flow 和�
 
 ```text
 new_agent = fork agent, new_agent.do prompt
-long_agent = fork agent, long_agent.seqdo task
+long_agent = fork agent, long_agent.do task
 ```
 
-`fork` 左侧的 `dst` 在同一条指令的启动动作中表示新分支 Agent。VM 复制 source Agent 的 Memory，用相同 Agent binding 创建 `dst`，再在该分支上启动右侧的 `do` 或 `seqdo`：
+`fork` 左侧的 `dst` 在同一条指令的启动动作中表示新分支 Agent。VM 复制 source Agent 的 Memory，用相同 Agent binding 创建 `dst`，再在该分支上启动右侧的 `do`：
 
 ```text
 security = fork coder, security.do security_prompt
-quality = fork coder, quality.seqdo quality_prompt
+quality = fork coder, quality.do quality_prompt
 ```
 
 两条 `fork` 都只读取 fork 时的 `coder` 状态，彼此没有依赖，因此可以并行。Source Agent、各 branch Agent 和各份 Memory 在 fork 后互相独立。后续对 branch Agent 的状态性调用排在其启动动作之后。
@@ -357,7 +351,6 @@ result = freedom.flow planner, prompt, context, @schema.Result
 dst = agent symbol [, memory]
 agent.sysprompt prompt
 dst = agent.do [role,] frag [, schema]
-dst = agent.seqdo [role,] frag [, schema]
 
 dst = prompt prompt_source [, value ...]
 dst = input prompt_source [, schema]
@@ -371,7 +364,6 @@ dst = call flow [, value ...]
 dst = dispatch [flow_call, flow_call, ...]
 dst = dispatch count, flow, task
 dst = fork source_agent, dst.do [role,] frag [, schema]
-dst = fork source_agent, dst.seqdo [role,] frag [, schema]
 dst = sync task_group [, formatter]
 dst = invoke symbol [, value ...]
 

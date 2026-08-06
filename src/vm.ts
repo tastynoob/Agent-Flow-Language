@@ -339,13 +339,11 @@ export class AflVm {
         });
         return undefined;
       }
-      case "agent.do":
-      case "agent.seqdo": {
+      case "agent.do": {
         const agent = asAgent(evaluateValue(instruction.agent, frame), instruction.agent.span);
         const input = asFrag(evaluateValue(instruction.input, frame), instruction.input.span, "Agent input");
         return this.runAgent(
           agent,
-          instruction.mode,
           instruction.role ?? "user",
           input,
           instruction.schema,
@@ -483,7 +481,6 @@ export class AflVm {
         const input = asFrag(evaluateValue(instruction.action.input, frame), instruction.action.input.span, "fork input");
         await this.runAgent(
           branch,
-          instruction.action.mode,
           instruction.action.role ?? "user",
           input,
           instruction.action.schema,
@@ -564,7 +561,6 @@ export class AflVm {
 
   private async runAgent(
     agent: AgentHandle,
-    mode: "do" | "seqdo",
     role: string,
     input: Frag,
     schema: SymbolExpr | undefined,
@@ -588,7 +584,6 @@ export class AflVm {
           runId: context.runId,
           node: location.node,
           block: location.block,
-          mode,
           agent: agent.agent,
           ...(agent.systemPrompt === undefined ? {} : { systemPrompt: agent.systemPrompt }),
           messages: cloneMessages(agent.memory.messages),
@@ -599,7 +594,7 @@ export class AflVm {
         if (approved === false) {
           throw new AflVmError("AGENT_DENIED", `Agent '${agent.agent.name}' was denied`);
         }
-        await this.trace(context, "agent.started", location, { agent: agent.id, mode });
+        await this.trace(context, "agent.started", location, { agent: agent.id });
         try {
           const result = await context.external.use(signal, () => agentAdapter.run(request));
           if (typeof result.output !== "string") {
@@ -613,11 +608,11 @@ export class AflVm {
             agent.memory.messages.push({ role: message.role, content: message.content });
           }
           agent.memory.messages.push({ role: "assistant", content: result.output });
-          await this.trace(context, "agent.completed", location, { agent: agent.id, mode });
+          await this.trace(context, "agent.completed", location, { agent: agent.id });
           return frag(result.output);
         } catch (error) {
           const vmError = normalizeVmError(error);
-          await this.trace(context, "agent.failed", location, { agent: agent.id, mode }, vmError);
+          await this.trace(context, "agent.failed", location, { agent: agent.id }, vmError);
           throw vmError;
         }
       },
@@ -772,7 +767,6 @@ export class AflVm {
         return instruction.memory === undefined ? [] : memory(instruction.memory, "write");
       case "agent.sysprompt":
       case "agent.do":
-      case "agent.seqdo":
         return agent(instruction.agent, "write");
       case "sync": {
         if (!frame.values.has(instruction.taskGroup.name)) return [];

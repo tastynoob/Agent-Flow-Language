@@ -14,7 +14,7 @@ worker(task):
         agent = agent @agent.worker
         agent.sysprompt "work"
         request = prompt @prompt.task, task
-        result = agent.seqdo user, request, @schema.Result
+        result = agent.do user, request, @schema.Result
         ret result
 
 main(task):
@@ -42,6 +42,32 @@ main(task):
   assert.deepEqual(module.nodes.map((node) => node.name), ["worker", "main"]);
   assert.equal(module.nodes[1].blocks[0].instructions[2].op, "dispatch.list");
   assert.equal(module.nodes[1].blocks[1].instructions[1].op, "fork");
+});
+
+test("parser rejects removed seqdo syntax", () => {
+  assert.throws(() => parseAfl(`
+main(task):
+    entry:
+        worker = agent @agent.worker
+        result = worker.seqdo task
+        ret result
+`), (error) => {
+    assert.equal(error instanceof AflParseError, true);
+    assert.equal(error.diagnostics[0].code, "PARSE_OPCODE");
+    return true;
+  });
+
+  assert.throws(() => parseAfl(`
+main(task):
+    entry:
+        worker = agent @agent.worker
+        branch = fork worker, branch.seqdo task
+        ret branch
+`), (error) => {
+    assert.equal(error instanceof AflParseError, true);
+    assert.equal(error.diagnostics[0].code, "PARSE_FORK_ACTION");
+    return true;
+  });
 });
 
 test("parser reports stable source location for indentation errors", () => {

@@ -28,17 +28,17 @@ test("coder-reviewer loop copies current context and returns defects for revisio
 main(task):
     entry:
         coder = agent @agent.coder
-        code = coder.seqdo task
+        code = coder.do task
         jump review
     review:
         review_memory = memory.copy coder.memory
         reviewer = agent @agent.reviewer, review_memory
-        review_result = reviewer.seqdo "review"
+        review_result = reviewer.do "review"
         finish = oper review_result == "finish"
         jump finish, done, revise
     revise:
         fix = prompt "fix", review_result
-        code = coder.seqdo fix
+        code = coder.do fix
         jump review
     done:
         ret code

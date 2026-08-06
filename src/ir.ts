@@ -113,13 +113,10 @@ export interface SystemPromptInstruction extends InstructionBase {
   readonly prompt: ValueExpr;
 }
 
-export type AgentWorkMode = "do" | "seqdo";
-
 export interface AgentWorkInstruction extends InstructionBase {
-  readonly op: "agent.do" | "agent.seqdo";
+  readonly op: "agent.do";
   readonly dst: string;
   readonly agent: NameExpr;
-  readonly mode: AgentWorkMode;
   readonly role?: string;
   readonly input: ValueExpr;
   readonly schema?: SymbolExpr;
@@ -184,7 +181,6 @@ export interface SyncInstruction extends InstructionBase {
 }
 
 export interface ForkAction {
-  readonly mode: AgentWorkMode;
   readonly role?: string;
   readonly input: ValueExpr;
   readonly schema?: SymbolExpr;

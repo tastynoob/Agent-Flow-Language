@@ -21,7 +21,7 @@ review_once(code):
         reviewer = agent @agent.security_reviewer
         reviewer.sysprompt @prompt.security_reviewer
         review_prompt = prompt @prompt.security_review, code
-        vote = reviewer.seqdo review_prompt
+        vote = reviewer.do review_prompt
         ret vote
 
 parallel_security_review(code):
@@ -34,7 +34,7 @@ parallel_security_review(code):
         votes = sync jobs, @format.json_array
         judge = agent @agent.review_judge
         judge_prompt = prompt @prompt.judge_reviews, code, votes
-        result = judge.seqdo judge_prompt
+        result = judge.do judge_prompt
         ret result
 ```
 
@@ -67,7 +67,7 @@ reviews = sync jobs, @format.json_array
 这个案例中的数据传递遵循现有最小规则：
 
 1. `code` 作为 role-free Frag 进入每个 child flow；
-2. `review_prompt` 组合模板与 `code`，并在 `reviewer.seqdo` 的使用边界以默认 `user` role 写入 Reviewer Memory；
+2. `review_prompt` 组合模板与 `code`，并在 `reviewer.do` 的使用边界以默认 `user` role 写入 Reviewer Memory；
 3. 每个 `vote` 是 role-free Frag；
 4. `sync` 用 formatter 把多个 vote 编码为一个 Frag；
 5. Judge 接收原始代码和汇合结果，给出最终 Frag。

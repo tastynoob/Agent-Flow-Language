@@ -33,7 +33,7 @@ JSON 可以作为 Frag content 的一种格式，但 Memory 不要求内容必�
 coder = agent @agent.coder
 ```
 
-后续 `coder.do/seqdo` 自动使用 `coder.memory`，不需要每次显式传入 Memory handle。
+后续 `coder.do` 自动使用 `coder.memory`，不需要每次显式传入 Memory handle。
 
 Memory 是当前 VM run 中的 handle。实现没有持久化 Memory adapter，也不会在不同 VM run 之间自动恢复 Message。
 
@@ -58,7 +58,7 @@ result = coder.do tool, tool_result
 
 Agent 输出在来源 Memory 中是 assistant Message，但返回 Frag 不带 `assistant`。因此它进入另一个 Agent 时可以重新解释为 `user`、`tool` 或其他 role。
 
-`seqdo` 使用相同的边界规则。Agent adapter 可以返回中间 Message；VM 依次追加这些 Message，再追加最终 `assistant` 输出，并把最终输出作为 role-free Frag 返回。
+一次 `do` 可以由 Agent executor 完成多个模型或工具步骤。Executor 可以返回中间 Message；VM 依次追加这些 Message，再追加最终 `assistant` 输出，并把最终输出作为 role-free Frag 返回。
 
 ## 4. `memory.append`
 
@@ -131,7 +131,7 @@ coder.sysprompt @prompt.coder
 review_memory = memory.copy coder.memory
 reviewer = agent @agent.reviewer, review_memory
 reviewer.sysprompt @prompt.reviewer
-review_result = reviewer.seqdo review_prompt
+review_result = reviewer.do review_prompt
 ```
 
 Reviewer 从 Coder 的完整 role/message 历史开始工作。Review 输出写入 Reviewer Memory，同时以 role-free Frag 返回给 flow。
@@ -140,17 +140,17 @@ Reviewer 从 Coder 的完整 role/message 历史开始工作。Review 输出写�
 
 ## 9. 把 Review 交给 Coder
 
-最直接的方式是把 review Frag 作为下一次 Agent 输入。`do/seqdo` 默认使用 `user` role：
+最直接的方式是把 review Frag 作为下一次 Agent 输入。`do` 默认使用 `user` role：
 
 ```text
-fixed = coder.seqdo review_result
+fixed = coder.do review_result
 ```
 
 需要补充固定指令时，可以先生成新的 Frag：
 
 ```text
 fix_prompt = prompt "Fix the following defects", review_result
-fixed = coder.seqdo fix_prompt
+fixed = coder.do fix_prompt
 ```
 
 也可以先显式写入 Memory：
@@ -158,7 +158,7 @@ fixed = coder.seqdo fix_prompt
 ```text
 memory.append coder.memory, user, review_result
 fix_command = prompt @prompt.fix_current_defects
-fixed = coder.seqdo fix_command
+fixed = coder.do fix_command
 ```
 
 三种写法都能传递 review 内容，但 prompt 组织方式和最终进入 Coder Memory 的 Message 数量不同。
@@ -168,7 +168,7 @@ fixed = coder.seqdo fix_command
 ```text
 reviewer = agent @agent.reviewer
 review_prompt = prompt "Review only this artifact", artifact
-review_result = reviewer.seqdo review_prompt
+review_result = reviewer.do review_prompt
 ```
 
 Reviewer 只接收显式 Frag，不继承 Coder Memory。这可以减少历史信息的影响，但也可能缺少需求和实现过程中的上下文。
@@ -194,7 +194,7 @@ quality = agent @agent.quality, quality_memory
 
 ```text
 security = fork coder, security.do security_prompt
-quality = fork coder, quality.seqdo quality_prompt
+quality = fork coder, quality.do quality_prompt
 ```
 
 每条指令依次完成 `memory.copy`、`memory.apply` 和右侧启动动作。左侧名称可以在同一条指令的启动动作中引用，因此不需要逐个声明临时 Memory 与 Agent。

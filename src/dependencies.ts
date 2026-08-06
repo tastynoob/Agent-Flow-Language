@@ -73,7 +73,6 @@ export function instructionReferences(instruction: AflInstruction): NameExpr[] {
     case "agent.sysprompt":
       return [instruction.agent, ...valueReferences(instruction.prompt)];
     case "agent.do":
-    case "agent.seqdo":
       return [instruction.agent, ...valueReferences(instruction.input)];
     case "prompt":
       return [...valueReferences(instruction.source), ...instruction.args.flatMap(valueReferences)];
@@ -136,7 +135,6 @@ function resourceAccesses(instruction: AflInstruction): ResourceAccess[] {
     case "agent.sysprompt":
       return [{ key: agentResource(instruction.agent.name), mode: "write" }];
     case "agent.do":
-    case "agent.seqdo":
       return [
         { key: agentResource(instruction.agent.name), mode: "write" },
         { key: memoryResource(instruction.agent.name), mode: "write" },

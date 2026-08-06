@@ -328,7 +328,6 @@ function validateInstructionKinds(
       expectNameKind(module, instruction.agent, kinds, ["agent", "unknown"], "system prompt receiver", diagnostics);
       break;
     case "agent.do":
-    case "agent.seqdo":
       expectNameKind(module, instruction.agent, kinds, ["agent", "unknown"], "Agent work receiver", diagnostics);
       break;
     case "dispatch.batch":

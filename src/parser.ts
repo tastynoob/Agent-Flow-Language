@@ -5,7 +5,6 @@ import type {
   AflModule,
   AflNode,
   AflTerminator,
-  AgentWorkMode,
   FlowCallExpr,
   FlowTarget,
   ForkAction,
@@ -239,14 +238,13 @@ function parseAssignedInstruction(
     };
   }
 
-  const agentWork = /^([A-Za-z_][A-Za-z0-9_]*)\.(do|seqdo)\s+(.+)$/u.exec(rhs);
+  const agentWork = /^([A-Za-z_][A-Za-z0-9_]*)\.do\s+(.+)$/u.exec(rhs);
   if (agentWork !== null) {
     return {
-      op: agentWork[2] === "do" ? "agent.do" : "agent.seqdo",
+      op: "agent.do",
       dst,
       agent: parseName(agentWork[1]!, line, sourceName),
-      mode: agentWork[2] as AgentWorkMode,
-      ...parseAgentWorkOperands(agentWork[3]!, line, sourceName),
+      ...parseAgentWorkOperands(agentWork[2]!, line, sourceName),
       span: line.span,
     };
   }
@@ -339,13 +337,12 @@ function parseAssignedInstruction(
 
   if (rhs.startsWith("fork ")) {
     const operands = requireOperandCount(splitTopLevel(rhs.slice(5)), 2, line, sourceName, "fork");
-    const actionMatch = /^([A-Za-z_][A-Za-z0-9_]*)\.(do|seqdo)\s+(.+)$/u.exec(operands[1]!.trim());
+    const actionMatch = /^([A-Za-z_][A-Za-z0-9_]*)\.do\s+(.+)$/u.exec(operands[1]!.trim());
     if (actionMatch === null) {
-      throw parseError("PARSE_FORK_ACTION", "fork action must be 'dst.do ...' or 'dst.seqdo ...'", line, sourceName);
+      throw parseError("PARSE_FORK_ACTION", "fork action must be 'dst.do ...'", line, sourceName);
     }
     const action: ForkAction = {
-      mode: actionMatch[2] as AgentWorkMode,
-      ...parseAgentWorkOperands(actionMatch[3]!, line, sourceName),
+      ...parseAgentWorkOperands(actionMatch[2]!, line, sourceName),
       span: line.span,
     };
     return {

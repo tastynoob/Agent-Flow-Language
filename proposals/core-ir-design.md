@@ -9,12 +9,12 @@
 - AFL IR 服务于 Agent flow，不是普通配置文件；
 - 它接近 Verilog 式的连接和依赖描述，而不是只按源码行顺序执行；
 - 大部分指令采用 `dst = instr arg0, arg1, ...`；
-- Agent 指令允许 `coder.do`、`reviewer.seqdo` 这类形式；
+- Agent 工作统一使用 `coder.do` 这类形式；
 - basic block 由指令和末尾跳转组成；
 - node 类似可调用的 flow 函数；
 - `oper` 直接接表达式，承担粗粒度逻辑计算；
 - Python、TypeScript 和 shell 可以作为复杂计算或外部执行的 escape hatch；
-- `seqdo` 是独立 primitive，不应退化成固定的 user/assistant 交替；
+- `do` 表示完整 Agent 工作激活，不固定为一次 user/assistant 交替；
 - Agent 默认绑定 memory，flow 可以 append Frag、copy memory，或把 memory apply 到新的 Agent；
 - 普通业务结果统一为 role-free Frag，Frag 的可见内容是字符串；
 - `prompt` 和 `input` 只产生 Frag，role 在使用 Frag 时决定；
@@ -77,7 +77,7 @@ Agent 输出在来源 Memory 中具有 `assistant` role，但同一内容交给 
 因此 Frag 不带 role：
 
 - `prompt` 和 `input` 返回 role-free Frag；
-- `agent.do/seqdo` 输入默认使用 `user`，也可显式指定 role；
+- `agent.do` 输入默认使用 `user`，也可显式指定 role；
 - `memory.append` 必须指定 role；
 - `memory.copy` 保留已存在 Message 的 role，不重新赋 role。
 
@@ -99,7 +99,7 @@ Agent 输出在来源 Memory 中具有 `assistant` role，但同一内容交给 
 
 以下内容尚不适合在第一轮直接定死：
 
-- `do` 的最小工作边界由 AFL 统一规定，还是由 Agent adapter 声明；
+- `do` 的终止状态如何在不同 Agent executor 之间形成一致契约；
 - dispatch 已区分显式 flow list 与 `count, flow, task` batch；fork 采用 `new_agent = fork source_agent, new_agent.do task` 派生单个上下文分支；iterable map、race、all-settled、并发上限和 cancellation mode 是否进入首版；
 - memory 除 append/copy/apply 外，何时需要 format、select、merge 或受控 shared store；
 - move package 应采用什么统一接口，`freedom.flow` 应返回哪些可审计的生成信息；

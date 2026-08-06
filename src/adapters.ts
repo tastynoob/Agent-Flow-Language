@@ -15,7 +15,6 @@ export interface AgentRunRequest {
   readonly runId: string;
   readonly node: string;
   readonly block: string;
-  readonly mode: "do" | "seqdo";
   readonly agent: SymbolRef;
   readonly systemPrompt?: string;
   readonly messages: readonly Message[];

@@ -39,12 +39,12 @@ future AFL DSL ----------+                         --> Other VM
 
 当前最需要验证的是 Agent flow primitive，而不是完整通用 DSL。简洁的文本 IR 有几个实际作用：
 
-- 可以直接检阅 `do`、`seqdo`、`jump`、`dispatch`、`fork` 和 `sync` 的组合效果；
+- 可以直接检阅 `do`、`jump`、`dispatch`、`fork` 和 `sync` 的组合效果；
 - 可以观察数据依赖与 Memory 依赖，而不被 builder API 隐藏；
 - 便于编写 conformance case，并作为不同 frontend 的共同输出；
 - grammar 规模较小，语义变化时修改成本相对可控。
 
-它仍然面向 flow，而不是模仿传统汇编。普通逻辑由 `oper` 或显式 script executor 承担；Agent 指令保留 `coder.do`、`reviewer.seqdo` 等形式；`fork` 可以组合 Memory 操作，而不要求使用者手工展开所有基础步骤。
+它仍然面向 flow，而不是模仿传统汇编。普通逻辑由 `oper` 或显式 script executor 承担；Agent 工作统一使用 `coder.do` 这类形式；`fork` 可以组合 Memory 操作，而不要求使用者手工展开所有基础步骤。
 
 ## 5. VM 实现语言
 

@@ -10,12 +10,12 @@ main(message):
     entry:
         taizi = agent @agent.edict.taizi
         taizi.sysprompt "You are Taizi, the first recipient. For casual conversation return exactly casual. For work requests, clean up the request and return a concise task brief."
-        triage_result = taizi.seqdo message
+        triage_result = taizi.do message
         is_casual = oper triage_result == "casual"
         jump is_casual, casual_reply, plan
 
     casual_reply:
-        reply = taizi.seqdo "Reply directly to the user's casual message."
+        reply = taizi.do "Reply directly to the user's casual message."
         ret reply
 
     plan:
@@ -24,34 +24,34 @@ main(message):
         menxia = agent @agent.edict.menxia
         menxia.sysprompt "You are Menxia. Review the plan before execution. Return exactly approve when it can proceed; otherwise return a concrete rejection list."
         plan_prompt = prompt "Create an execution plan for this task brief", triage_result
-        execution_plan = zhongshu.seqdo plan_prompt
+        execution_plan = zhongshu.do plan_prompt
         jump review_1
 
     review_1:
         review_prompt_1 = prompt "Review the Zhongshu plan. This is review round 1", execution_plan
-        review_result_1 = menxia.seqdo review_prompt_1
+        review_result_1 = menxia.do review_prompt_1
         approved_1 = oper review_result_1 == "approve"
         jump approved_1, assign, revise_1
 
     revise_1:
         revision_prompt_1 = prompt "Revise the plan to resolve every Menxia rejection", review_result_1
-        execution_plan = zhongshu.seqdo revision_prompt_1
+        execution_plan = zhongshu.do revision_prompt_1
         jump review_2
 
     review_2:
         review_prompt_2 = prompt "Review the revised Zhongshu plan. This is review round 2", execution_plan
-        review_result_2 = menxia.seqdo review_prompt_2
+        review_result_2 = menxia.do review_prompt_2
         approved_2 = oper review_result_2 == "approve"
         jump approved_2, assign, revise_2
 
     revise_2:
         revision_prompt_2 = prompt "Revise the plan to resolve every Menxia rejection", review_result_2
-        execution_plan = zhongshu.seqdo revision_prompt_2
+        execution_plan = zhongshu.do revision_prompt_2
         jump review_3
 
     review_3:
         review_prompt_3 = prompt "Review the revised Zhongshu plan. This is the final review round", execution_plan
-        review_result_3 = menxia.seqdo review_prompt_3
+        review_result_3 = menxia.do review_prompt_3
         approved_3 = oper review_result_3 == "approve"
         jump approved_3, assign, rejected
 
@@ -59,7 +59,7 @@ main(message):
         shangshu = agent @agent.edict.shangshu
         shangshu.sysprompt "You are Shangshu. Select the relevant departments, assign clear subtasks, coordinate execution, and combine their reports. When routing a department, choose its department move only if it has an assignment; otherwise choose @move.edict.skip."
         assignment_prompt = prompt "Select departments and allocate the approved plan. Include enough context for each assigned department to work", execution_plan
-        assignments = shangshu.seqdo assignment_prompt
+        assignments = shangshu.do assignment_prompt
         route_prompt = prompt "Choose one of the allowed moves for this department. Pass its complete assignment as move arguments when dispatching"
         hubu_context = prompt "hubu handles data, resources, accounting, reports, and cost analysis", execution_plan, assignments
         libu_context = prompt "libu handles documents, specifications, reports, and API documentation", execution_plan, assignments
@@ -75,11 +75,11 @@ main(message):
         libu_hr_report = freedom.move shangshu, [@move.edict.libu_hr, @move.edict.skip], route_prompt, libu_hr_context
         reports = prompt "Department reports in hubu, libu, bingbu, xingbu, gongbu, libu_hr order", hubu_report, libu_report, bingbu_report, xingbu_report, gongbu_report, libu_hr_report
         summary_prompt = prompt "Combine the department reports in hubu, libu, bingbu, xingbu, gongbu, libu_hr order. Ignore not_assigned entries and report execution status and unresolved issues", execution_plan, assignments, reports
-        execution_summary = shangshu.seqdo summary_prompt
+        execution_summary = shangshu.do summary_prompt
         memorial_prompt = prompt "Prepare the final report from the approved plan and Shangshu execution summary", triage_result, execution_plan, execution_summary
-        memorial = zhongshu.seqdo memorial_prompt
+        memorial = zhongshu.do memorial_prompt
         reply_prompt = prompt "Return this final report to the user clearly and concisely", memorial
-        reply = taizi.seqdo reply_prompt
+        reply = taizi.do reply_prompt
         ret reply
 
     rejected:
