@@ -7,6 +7,15 @@ import type {
   TraceEvent,
   TraceEventType,
 } from "./adapters.js";
+import {
+  AgentAdapterExecutorBackend,
+  AgentExecutorError,
+  type AgentExecutionHost,
+  type AgentExecutionRequest,
+  type AgentExecutionStopReason,
+  type AgentExecutorBackend,
+  type BackendSessionRef,
+} from "./agent-executor.js";
 import { linkedController, ResourceLocks, Semaphore, throwIfAborted } from "./concurrency.js";
 import { buildInstructionDependencies, instructionDestination } from "./dependencies.js";
 import {
@@ -45,6 +54,7 @@ import {
   isMemoryHandle,
   isSymbolRef,
   type AgentHandle,
+  type MemoryCheckpoint,
   type MemoryHandle,
   type VmValue,
   type TaskGroupHandle,
@@ -93,10 +103,14 @@ let runSequence = 0;
 export class AflVm {
   readonly module: AflModule;
   readonly bindings: VmBindings;
+  private readonly agentExecutor: AgentExecutorBackend | undefined;
 
   constructor(module: AflModule, bindings: VmBindings) {
     this.module = assertValidModule(module);
     this.bindings = bindings;
+    this.agentExecutor = bindings.agentExecutor ?? (
+      bindings.agents === undefined ? undefined : new AgentAdapterExecutorBackend(bindings.agents)
+    );
   }
 
   static fromSource(source: string, bindings: VmBindings, sourceName?: string): AflVm {
@@ -336,6 +350,8 @@ export class AflVm {
         const prompt = await this.renderPrompt(instruction.prompt, [], frame, signal);
         await context.locks.use([{ key: agent.id, mode: "write" }], signal, () => {
           agent.systemPrompt = prompt.content;
+          delete agent.session;
+          delete agent.sessionMemoryRevision;
         });
         return undefined;
       }
@@ -470,11 +486,12 @@ export class AflVm {
           signal,
           () => ({
             messages: cloneMessages(source.memory.messages),
+            checkpoint: cloneMemoryCheckpoint(source.memory.checkpoint),
             systemPrompt: source.systemPrompt,
             agent: source.agent,
           }),
         );
-        const memory = this.createMemory(context, snapshot.messages);
+        const memory = this.createMemory(context, snapshot.messages, snapshot.checkpoint);
         const branch = this.createAgent(context, snapshot.agent, memory);
         memory.owner = branch.id;
         if (snapshot.systemPrompt !== undefined) branch.systemPrompt = snapshot.systemPrompt;
@@ -521,18 +538,21 @@ export class AflVm {
         const memory = asMemory(evaluateValue(instruction.memory, frame), instruction.memory.span);
         const value = asFrag(evaluateValue(instruction.frag, frame), instruction.frag.span, "memory.append value");
         await context.locks.use([{ key: memory.id, mode: "write" }], signal, () => {
-          memory.messages.push({ role: instruction.role, content: value.content });
+          appendMemoryMessage(memory, { role: instruction.role, content: value.content });
         });
         return undefined;
       }
       case "memory.copy": {
         const memory = asMemory(evaluateValue(instruction.memory, frame), instruction.memory.span);
-        const messages = await context.locks.use(
+        const snapshot = await context.locks.use(
           [{ key: memory.id, mode: "read" }],
           signal,
-          () => cloneMessages(memory.messages),
+          () => ({
+            messages: cloneMessages(memory.messages),
+            checkpoint: cloneMemoryCheckpoint(memory.checkpoint),
+          }),
         );
-        return this.createMemory(context, messages);
+        return this.createMemory(context, snapshot.messages, snapshot.checkpoint);
       }
       case "memory.apply": {
         const source = asAgent(evaluateValue(instruction.sourceAgent, frame), instruction.sourceAgent.span);
@@ -568,8 +588,8 @@ export class AflVm {
     location: Required<TraceLocation>,
     signal: AbortSignal,
   ): Promise<Frag> {
-    const agentAdapter = this.bindings.agents;
-    if (agentAdapter === undefined) {
+    const executor = this.agentExecutor;
+    if (executor === undefined) {
       throw new AflVmError(
         "AGENT_ADAPTER_MISSING",
         `Agent '${agent.agent.name}' requires an Agent binding`,
@@ -579,8 +599,9 @@ export class AflVm {
       [{ key: agent.id, mode: "write" }, { key: agent.memory.id, mode: "write" }],
       signal,
       async () => {
-        agent.memory.messages.push({ role, content: input.content });
-        const request: AgentRunRequest = {
+        appendMemoryMessage(agent.memory, { role, content: input.content });
+        await this.restoreAgentSession(agent, executor, context, signal);
+        const policyRequest: AgentRunRequest = {
           runId: context.runId,
           node: location.node,
           block: location.block,
@@ -590,33 +611,141 @@ export class AflVm {
           ...(schema === undefined ? {} : { schema: toSymbol(schema) }),
           signal,
         };
-        const approved = await this.bindings.policy?.authorizeAgent?.(request);
+        const approved = await this.bindings.policy?.authorizeAgent?.(policyRequest);
         if (approved === false) {
           throw new AflVmError("AGENT_DENIED", `Agent '${agent.agent.name}' was denied`);
         }
+        const request: AgentExecutionRequest = {
+          runId: context.runId,
+          node: location.node,
+          block: location.block,
+          agent: agent.agent,
+          ...(agent.systemPrompt === undefined ? {} : { systemPrompt: agent.systemPrompt }),
+          memory: cloneMessages(agent.memory.messages),
+          memoryRevision: agent.memory.revision,
+          ...(agent.session === undefined ? {} : { session: agent.session }),
+          ...(agent.sessionMemoryRevision === undefined
+            ? {}
+            : { sessionMemoryRevision: agent.sessionMemoryRevision }),
+          ...(schema === undefined ? {} : { schema: toSymbol(schema) }),
+          signal,
+        };
+        const host = this.createAgentHost(context, location);
         await this.trace(context, "agent.started", location, { agent: agent.id });
         try {
-          const result = await context.external.use(signal, () => agentAdapter.run(request));
+          const result = await context.external.use(signal, () => executor.execute(request, host));
           if (typeof result.output !== "string") {
-            throw new AflVmError("AGENT_OUTPUT_INVALID", "Agent adapter output must be a string");
+            throw new AflVmError("AGENT_OUTPUT_INVALID", "Agent executor output must be a string");
           }
+          this.requireCompleted(result.stopReason);
           await this.validateSchema(result.output, schema, signal);
           for (const message of result.messages ?? []) {
             if (typeof message.role !== "string" || typeof message.content !== "string") {
-              throw new AflVmError("AGENT_MESSAGES_INVALID", "Agent adapter returned an invalid Message");
+              throw new AflVmError("AGENT_MESSAGES_INVALID", "Agent executor returned an invalid Message");
             }
-            agent.memory.messages.push({ role: message.role, content: message.content });
+            appendMemoryMessage(agent.memory, { role: message.role, content: message.content });
           }
-          agent.memory.messages.push({ role: "assistant", content: result.output });
+          appendMemoryMessage(agent.memory, { role: "assistant", content: result.output });
+          await this.updateAgentSession(agent, executor, result.session, context, signal);
           await this.trace(context, "agent.completed", location, { agent: agent.id });
           return frag(result.output);
         } catch (error) {
-          const vmError = normalizeVmError(error);
+          const vmError = error instanceof AgentExecutorError
+            ? new AflVmError(error.code, error.message, { cause: error })
+            : normalizeVmError(error);
           await this.trace(context, "agent.failed", location, { agent: agent.id }, vmError);
           throw vmError;
         }
       },
     );
+  }
+
+  private async restoreAgentSession(
+    agent: AgentHandle,
+    executor: AgentExecutorBackend,
+    context: VmRunContext,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (agent.session !== undefined) return;
+    const checkpoint = agent.memory.checkpoint;
+    if (
+      checkpoint === undefined ||
+      checkpoint.session.backend !== executor.name ||
+      checkpoint.agent.name !== agent.agent.name ||
+      checkpoint.systemPrompt !== agent.systemPrompt ||
+      executor.fork === undefined
+    ) {
+      return;
+    }
+    agent.session = await context.external.use(signal, () => executor.fork!(checkpoint.session, signal));
+    agent.sessionMemoryRevision = checkpoint.memoryRevision;
+  }
+
+  private async updateAgentSession(
+    agent: AgentHandle,
+    executor: AgentExecutorBackend,
+    session: BackendSessionRef | undefined,
+    context: VmRunContext,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (session === undefined) {
+      delete agent.session;
+      delete agent.sessionMemoryRevision;
+      delete agent.memory.checkpoint;
+      return;
+    }
+    if (session.backend !== executor.name) {
+      throw new AflVmError(
+        "AGENT_SESSION_INVALID",
+        `Agent executor '${executor.name}' returned session backend '${session.backend}'`,
+      );
+    }
+    agent.session = session;
+    agent.sessionMemoryRevision = agent.memory.revision;
+    if (executor.checkpoint === undefined) {
+      delete agent.memory.checkpoint;
+      return;
+    }
+    const checkpoint = await context.external.use(signal, () => executor.checkpoint!(session, signal));
+    agent.session = checkpoint;
+    agent.memory.checkpoint = {
+      session: checkpoint,
+      memoryRevision: agent.memory.revision,
+      agent: structuredClone(agent.agent),
+      ...(agent.systemPrompt === undefined ? {} : { systemPrompt: agent.systemPrompt }),
+    };
+  }
+
+  private createAgentHost(context: VmRunContext, location: Required<TraceLocation>): AgentExecutionHost {
+    return {
+      emit: async (event) => {
+        await this.trace(context, "agent.event", location, structuredClone(event) as ComputeValue);
+        await this.bindings.agentHost?.emit(event);
+      },
+      requestApproval: async (request) => {
+        if (this.bindings.agentHost === undefined) return "denied";
+        return this.bindings.agentHost.requestApproval(request);
+      },
+      requestInput: async (request) => {
+        if (this.bindings.agentHost === undefined) {
+          throw new AgentExecutorError(
+            "AGENT_CAPABILITY_UNSUPPORTED",
+            "Agent executor requested interactive input, but no Agent host is configured",
+          );
+        }
+        return this.bindings.agentHost.requestInput(request);
+      },
+    };
+  }
+
+  private requireCompleted(reason: AgentExecutionStopReason): void {
+    if (reason === "completed") return;
+    const code = reason === "blocked"
+      ? "AGENT_BLOCKED"
+      : reason === "budget_exhausted"
+      ? "AGENT_BUDGET_EXHAUSTED"
+      : "AGENT_CANCELLED";
+    throw new AflVmError(code, `Agent execution ended with '${reason}'`);
   }
 
   private async renderPrompt(
@@ -893,11 +1022,18 @@ export class AflVm {
     throw new AflVmError("FLOW_ARGUMENT_INVALID", "external flow argument cannot be a VM handle", { span });
   }
 
-  private createMemory(context: VmRunContext, messages: readonly { role: string; content: string }[] = []): MemoryHandle {
+  private createMemory(
+    context: VmRunContext,
+    messages: readonly { role: string; content: string }[] = [],
+    checkpoint?: MemoryCheckpoint,
+  ): MemoryHandle {
+    const clonedCheckpoint = cloneMemoryCheckpoint(checkpoint);
     return {
       kind: "memory",
       id: this.nextHandle(context, "memory"),
       messages: cloneMessages(messages),
+      revision: messages.length,
+      ...(clonedCheckpoint === undefined ? {} : { checkpoint: clonedCheckpoint }),
     };
   }
 
@@ -1007,6 +1143,15 @@ function isTaskGroupLike(value: VmValue): value is TaskGroupHandle {
 
 function cloneMessages(messages: readonly { role: string; content: string }[]) {
   return messages.map((message) => ({ role: message.role, content: message.content }));
+}
+
+function appendMemoryMessage(memory: MemoryHandle, message: { role: string; content: string }): void {
+  memory.messages.push(message);
+  memory.revision += 1;
+}
+
+function cloneMemoryCheckpoint(checkpoint: MemoryCheckpoint | undefined): MemoryCheckpoint | undefined {
+  return checkpoint === undefined ? undefined : structuredClone(checkpoint);
 }
 
 function toSymbol(expression: SymbolExpr): SymbolRef {

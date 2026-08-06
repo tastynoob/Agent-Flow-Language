@@ -22,6 +22,8 @@
     "bin",
     "dist/src",
     "docs",
+    "examples",
+    "scripts/live-pi-smoke.mjs",
     "README.md"
   ],
   "scripts": {
@@ -31,13 +33,18 @@
     "test:cli": "node bin/afl.mjs validate test/fixtures/echo.afl && node bin/afl-vm.mjs test/fixtures/noop-bindings.mjs test/fixtures/minimal.afl",
     "test:package": "node scripts/test-vm-package.mjs",
     "smoke:deepseek": "npm run build && node bin/afl-vm.mjs examples/deepseek-bindings.mjs examples/live-smoke.afl",
+    "smoke:pi": "npm run build && node scripts/live-pi-smoke.mjs",
     "prepack": "npm run clean && npm run build",
     "test": "npm run test:ts && npm run test:cli && npm run test:package"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22.19.0"
   },
   "devDependencies": {
     "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "^0.82.1",
+    "@earendil-works/pi-ai": "^0.82.1"
   }
 }

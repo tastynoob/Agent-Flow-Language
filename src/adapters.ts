@@ -5,6 +5,7 @@ import type {
   ScriptLanguage,
   SymbolRef,
 } from "./ir.js";
+import type { AgentExecutionHost, AgentExecutorBackend } from "./agent-executor.js";
 
 export interface Message {
   readonly role: string;
@@ -185,6 +186,7 @@ export type TraceEventType =
   | "agent.started"
   | "agent.completed"
   | "agent.failed"
+  | "agent.event"
   | "dispatch.started"
   | "dispatch.completed"
   | "fork.started"
@@ -213,6 +215,8 @@ export type VmArgument = Frag | ComputeValue | SymbolRef;
 
 export interface VmBindings {
   readonly agents?: AgentAdapter;
+  readonly agentExecutor?: AgentExecutorBackend;
+  readonly agentHost?: AgentExecutionHost;
   readonly prompts?: PromptAdapter;
   readonly input?: InputAdapter;
   readonly scripts?: ScriptAdapter;

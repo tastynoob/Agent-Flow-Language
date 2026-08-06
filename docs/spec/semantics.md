@@ -134,7 +134,7 @@ reviewer = agent @agent.reviewer, review_memory
 
 ### 7.2 `agent.sysprompt`
 
-`agent.sysprompt` 设置或替换 Agent handle 上单独保存的 system prompt。后续 `AgentRunRequest` 通过 `systemPrompt` 字段携带该值；它不会作为普通 Message 写入 Memory。
+`agent.sysprompt` 设置或替换 Agent handle 上单独保存的 system prompt。后续 `AgentExecutionRequest` 通过 `systemPrompt` 字段携带该值；它不会作为普通 Message 写入 Memory。已经建立的原生 backend session 会失效，下一次 `do` 使用当前 Memory 和新 prompt 建立 session。
 
 ### 7.3 `prompt`
 
@@ -151,13 +151,15 @@ Prompt source 是 symbol 时，VM 调用 Prompt binding 的 `render`。Source �
 `agent.do` 表示一次完整的 Agent 工作激活，而不是一次模型请求或单个 runtime turn。其基本过程为：
 
 1. 将输入 Frag 以显式 role 加入 Agent Memory；省略 role 时使用 `user`；
-2. 调用一次 `AgentAdapter.run`；adapter 负责在返回前完成内部需要的模型 turn 和工具步骤；
+2. 调用一次 `AgentExecutorBackend.execute`；backend 负责在返回前完成内部需要的模型 turn 和工具步骤；
 3. 将模型可见输出以 `assistant` role 加入该 Agent Memory；
 4. 返回包含同一输出字符串、但不带 role 的 Frag。
 
 Role-free 返回值可以被另一个 Agent 作为 `user` message 接收，也可以用其他 role 显式 append。
 
-Adapter 可以在 `messages` 中返回中间 Message。VM 依次追加这些 Message，再以 `assistant` role 追加 `output`，指令返回包装 `output` 的 Frag。
+Backend 可以在 `messages` 中返回中间 Message。VM 依次追加这些 Message，再以 `assistant` role 追加 `output`，指令返回包装 `output` 的 Frag。旧 `AgentAdapter` 由无状态兼容 backend 包装，仍会收到完整 Memory。
+
+支持原生 session 的 backend 可以返回 session ref。VM 记录该 session 已同步的 Memory revision，并把运行中的文本、工具和 usage 事件转交 Trace 与可选 `agentHost`。这些事件不是 Message，也不会自动写入 Memory。
 
 ### 7.6 输出格式约束
 
@@ -214,6 +216,8 @@ copied = memory.copy source_memory
 
 `memory.copy` 创建独立 Memory，并按原顺序复制 source 中的 Message。每条 Message 保留原 role；copy 之后双方更新互不自动传播。
 
+当 backend 支持 checkpoint 时，VM 还会复制一份 flow 不可读取的 continuation checkpoint，并绑定复制时的 Memory revision。该元数据只用于兼容的 `memory.apply` 或 `fork`，不改变 Message 序列。
+
 `memory.copy` 不接收新 role，因为它复制的是已经带 role 的 Message，而不是把一个 role-free Frag 加入 Memory。
 
 ### 9.3 `memory.apply`
@@ -223,6 +227,8 @@ new_agent = memory.apply source_agent, memory
 ```
 
 `memory.apply` 使用 source Agent 的 symbol 与 system prompt 创建新的 Agent handle，并把给定 Memory 作为其 working Memory。它不修改 source Agent，也不再次复制 Memory。Memory 已有 owner 时，VM 报告 `MEMORY_ALREADY_BOUND`；调用方需要独立副本时先执行 `memory.copy`。
+
+Memory checkpoint 的 backend、Agent symbol 和 system prompt 都兼容时，首次执行优先从 checkpoint fork 原生 session；否则 backend 只根据可移植 Message 重建 session。
 
 ## 10. 控制流
 

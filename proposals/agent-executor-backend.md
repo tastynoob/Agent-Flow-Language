@@ -2,7 +2,7 @@
 
 ## 1. 状态与范围
 
-本文讨论 AFL 的 Agent 执行器后端。内容尚未成为 parser、validator、VM 或 bindings API 的实现契约。
+本文讨论 AFL 的 Agent 执行器后端。通用接口、无状态 adapter 兼容层和首个 Pi backend 已进入初始实现；持久化、安全隔离及其他 runtime 仍保留为后续设计范围。
 
 AFL 继续负责描述和调度 flow。`agent.do` 是 flow 发起 Agent 工作的执行入口；模型调用、工具循环和原生会话由可替换的 Agent Executor Backend 完成。Sandbox、工具审批等安全能力由 Backend 与 host 按 capability 共同提供，不要求每一种 Backend 具有相同实现。
 
@@ -261,26 +261,26 @@ Pi 的统一模型接口也更符合 AFL 作为通用 flow IR 的定位：flow �
 
 ### 8.2 接入面
 
-首版优先使用 `@earendil-works/pi-coding-agent` 的 SDK 接口，并复用 `@earendil-works/pi-agent-core` 和 `@earendil-works/pi-ai` 提供的底层能力，不包装交互式 CLI。建议映射如下：
+首版直接使用 `@earendil-works/pi-agent-core` 的 harness 接口，并由 `@earendil-works/pi-ai` 提供模型集合与认证。`pi-coding-agent` 是交互式 CLI，不属于 AFL backend 的运行依赖。当前映射如下：
 
-| AFL / Backend 操作 | Pi SDK |
+| AFL / Backend 操作 | Pi core |
 | --- | --- |
-| 创建或恢复 session | `createAgentSession`、`AgentSession` 与 `SessionManager` |
-| `do` | `AgentSession.prompt()`，等待完整 Agent loop 结束 |
-| 读取和同步 Memory | Agent state messages 与 SessionManager entries |
-| 进度和工具事件 | session / Agent event subscription |
-| 取消 | `AgentSession.abort()` 或底层 Agent abort |
-| checkpoint / fork | SessionManager 的会话树、branch / fork；不支持时复制消息状态 |
-| 模型 provider | Pi model runtime 与 `pi-ai` |
-| 工具调用拦截 | `beforeToolCall` 等 Agent hook，按需转交 host |
+| 创建 session | `AgentHarness` 与 `InMemorySessionRepo` |
+| `do` | `AgentHarness.prompt()`，等待完整 Agent loop 结束 |
+| 读取和同步 Memory | `Session` message entries 与 AFL Memory revision |
+| 进度和工具事件 | `AgentHarness.subscribe()` |
+| 取消 | `AgentHarness.abort()` |
+| checkpoint / fork | Session tree leaf 与 `InMemorySessionRepo.fork()` |
+| 模型 provider | `pi-ai` 的 `Models` 与 `builtinModels()` |
+| 工具调用拦截 | `AgentHarness.on("tool_call", ...)`，按配置转交 host |
 
-Pi SDK 文档没有提供与 `outputSchema` 等价的一等接口时，首版声明 `structuredOutput: false`。需要 schema 的 binding 应显式拒绝，或以后增加能够说明验证与重试语义的适配层，不能只解析最终文本后声称原生支持。
+Pi core 没有提供与 `outputSchema` 等价的一等接口，首版声明 `structuredOutput: false` 并拒绝带 schema 的 Pi 请求。以后可以增加能够说明验证与重试语义的适配层，不能只解析最终文本后声称原生支持。
 
 ### 8.3 配置与可移植性边界
 
-Pi coding-agent 还可以发现项目指令、skills、extensions 和默认工具。AFL Backend 应显式配置 ResourceLoader、system prompt、工具集合和 SessionManager，避免 flow 的实际语义被未声明的项目资源隐式改变。
+Pi Backend 显式配置 system prompt、模型、工具、tool context 和可选 resources。它不经过 pi-coding-agent 的 ResourceLoader，也不会隐式发现项目 extensions、skills 或交互配置，避免 flow 的实际语义被未声明的资源改变。
 
-首版 session 可以只存在于当前 VM run。Checkpoint 首先保证消息级 continuation，并与 AFL Memory revision 绑定；若使用 Pi 持久化会话树，文件位置和恢复策略仍属于 host 配置，不暴露给 AFL flow。
+当前 session 存在于 backend 实例的 `InMemorySessionRepo`。Checkpoint 使用 Pi 会话树 leaf，并与 AFL Memory revision 绑定；持久化 repository、文件位置和跨进程恢复策略尚未实现，未来仍属于 host 配置，不暴露给 AFL flow。
 
 Pi 的 subagent、交互 UI 或工作流扩展不进入 AFL Backend。多 Agent 编排继续由 AFL IR 和 VM 负责，Pi 只执行一次 `do` 所代表的 Agent 工作。
 
@@ -324,9 +324,9 @@ Agent 工作指令合并已经作为前置步骤完成，所有层只处理 `age
 - 现有 `AgentAdapter` 的兼容包装；
 - Agent handle 上的 backend session，以及 Memory revision/checkpoint 元数据；
 - `do`、`memory.copy`、`memory.apply` 和 `fork` 对 executor lifecycle 的调用；
-- 基于 Pi SDK 的进程内 Backend，优先使用 `pi-coding-agent` 的 AgentSession 与 SessionManager；
+- 基于 `pi-agent-core` 的进程内 Backend，使用 `AgentHarness` 与 `InMemorySessionRepo`；
 - Pi session 创建/恢复、完整 `do` 周期、事件转发、Memory 同步、消息级 checkpoint/fork 和取消；
-- 显式配置 system prompt、model、tools、ResourceLoader 和工作目录，不默认导入项目 extensions；
+- 显式配置 system prompt、model、tools、tool context 和工作目录，不默认导入项目 extensions；
 - 对 Pi 尚未提供的 structured output、强制 sandbox 和交互审批如实声明 capability；
 - fake backend conformance tests，避免测试依赖真实模型或用户账户；
 - 单独的 live smoke，用于验证真实 Pi runtime 和模型 provider，不作为默认测试前置条件。
@@ -355,6 +355,5 @@ Agent 工作指令合并已经作为前置步骤完成，所有层只处理 `age
 
 - [Pi](https://github.com/earendil-works/pi)
 - [Pi Agent Core](https://github.com/earendil-works/pi/tree/main/packages/agent)
-- [Pi Coding Agent SDK](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/sdk.md)
-- [Pi RPC](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md)
+- [Pi AI](https://github.com/earendil-works/pi/tree/main/packages/ai)
 - [Codex App Server](https://developers.openai.com/codex/app-server/)

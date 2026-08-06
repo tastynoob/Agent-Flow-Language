@@ -1,11 +1,21 @@
 import type { Message } from "./adapters.js";
+import type { BackendSessionRef } from "./agent-executor.js";
 import type { ComputeValue, Frag, SymbolRef } from "./ir.js";
 
 export interface MemoryHandle {
   readonly kind: "memory";
   readonly id: string;
   readonly messages: Message[];
+  revision: number;
+  checkpoint?: MemoryCheckpoint;
   owner?: string;
+}
+
+export interface MemoryCheckpoint {
+  readonly session: BackendSessionRef;
+  readonly memoryRevision: number;
+  readonly agent: SymbolRef;
+  readonly systemPrompt?: string;
 }
 
 export interface AgentHandle {
@@ -14,6 +24,8 @@ export interface AgentHandle {
   readonly agent: SymbolRef;
   readonly memory: MemoryHandle;
   systemPrompt?: string;
+  session?: BackendSessionRef;
+  sessionMemoryRevision?: number;
 }
 
 export interface TaskGroupHandle {

@@ -130,6 +130,9 @@ function readBindings(loaded) {
   if (bindings.agents !== undefined && typeof bindings.agents.run !== "function") {
     throw new Error("VmBindings.agents must implement run(request)");
   }
+  if (bindings.agentExecutor !== undefined && typeof bindings.agentExecutor.execute !== "function") {
+    throw new Error("VmBindings.agentExecutor must implement execute(request, host)");
+  }
   return bindings;
 }
 

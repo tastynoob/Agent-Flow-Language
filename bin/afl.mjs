@@ -92,8 +92,14 @@ function parseRunOptions(args) {
 async function loadBindings(modulePath) {
   const loaded = await import(pathToFileURL(resolve(modulePath)).href);
   const bindings = loaded.default ?? loaded.bindings;
-  if (bindings === undefined || typeof bindings !== "object" || bindings.agents === undefined) {
+  if (bindings === undefined || typeof bindings !== "object") {
     throw new Error("adapter module must export default VmBindings or a named 'bindings'");
+  }
+  if (bindings.agents !== undefined && typeof bindings.agents.run !== "function") {
+    throw new Error("VmBindings.agents must implement run(request)");
+  }
+  if (bindings.agentExecutor !== undefined && typeof bindings.agentExecutor.execute !== "function") {
+    throw new Error("VmBindings.agentExecutor must implement execute(request, host)");
   }
   return bindings;
 }

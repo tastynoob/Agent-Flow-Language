@@ -102,6 +102,8 @@ review_memory = memory.copy coder.memory
 
 Copy 不需要 role operand。它处理的是已经带 role 的完整 Message 序列；把单个 role-free Frag 加入 Memory 应使用 `memory.append`。
 
+执行器支持原生 checkpoint 时，copy 还可以携带一份 flow 不可读取的 continuation checkpoint。Checkpoint 与复制时的 Message revision 绑定；source 后续执行不会改变既有 copy 所指向的位置。它不是 Message，也不影响 Memory 的可移植内容。
+
 ## 6. `memory.apply`
 
 ```text
@@ -115,13 +117,15 @@ branch_memory = memory.copy source_agent.memory
 branch = memory.apply source_agent, branch_memory
 ```
 
+如果 Memory 的隐藏 checkpoint 与 source Agent 配置及当前 executor 兼容，新 Agent 首次执行时会 fork 原生 session；不兼容时只从 Message 重建上下文。
+
 ## 7. System Prompt
 
 ```text
 coder.sysprompt @prompt.coder
 ```
 
-`sysprompt` 设置 Agent handle 上单独保存的 system prompt，不会向 `messages` 追加 Message。后续 Agent 工作通过 `AgentRunRequest.systemPrompt` 接收该值。
+`sysprompt` 设置 Agent handle 上单独保存的 system prompt，不会向 `messages` 追加 Message。后续 Agent 工作通过 `AgentExecutionRequest.systemPrompt` 接收该值。
 
 设置 Reviewer system prompt 不会修改被复制的 Coder Memory，也不会反向影响 Coder 配置。
 
@@ -204,10 +208,11 @@ Fork 完成后：
 - `coder.memory` 保持原 identity；
 - 每个 branch 拥有不同的 Agent 和 Memory identity；
 - fork 时已经完成的 Message 保留 role 与顺序；
+- executor 支持原生 fork 时，branch 从复制时的 checkpoint 派生独立 session；
 - source 或任一 branch 的后续写入不传播给其他分支。
 
 不需要继承上下文的并行 child flow 使用 `dispatch`。显式 `memory.copy` 仍然保留，用于 Reviewer 与 Coder 使用不同 Agent binding、只复制但暂不执行，或需要自行决定 Memory 交给哪个 Agent 的场景。
 
 ## 13. 当前限制
 
-当前 parser 和 VM 只实现 `memory.append`、`memory.copy`、`memory.apply` 以及 Agent 的 `.memory` 引用。没有 `memory.format`、`memory.select`、`memory.merge`、shared Memory 或 persistent Memory 指令。
+当前 parser 和 VM 只实现 `memory.append`、`memory.copy`、`memory.apply` 以及 Agent 的 `.memory` 引用。没有 `memory.format`、`memory.select`、`memory.merge`、shared Memory 或 persistent Memory 指令。Backend session 和 checkpoint 也只存在于当前 backend 实例，不构成跨进程 Memory 持久化。

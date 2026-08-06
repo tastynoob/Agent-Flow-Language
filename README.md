@@ -74,6 +74,32 @@ npm run build
 ./bin/afl-vm.mjs test/fixtures/noop-bindings.mjs test/fixtures/minimal.afl
 ```
 
+当前版本要求 Node.js 22.19.0 或更高版本。
+
+### Pi Agent Executor
+
+`VmBindings.agentExecutor` 可以接入带原生 agent loop 和 session 的执行器。Pi backend 直接使用 `@earendil-works/pi-agent-core` 的 `AgentHarness`，模型和认证由 `@earendil-works/pi-ai` 管理：
+
+```js
+import {
+  PiAgentExecutorBackend,
+  createPiCodingAgentBinding,
+} from "@afl-lang/core";
+
+const binding = createPiCodingAgentBinding({
+  model: { provider: process.env.AFL_PI_PROVIDER, id: process.env.AFL_PI_MODEL },
+  cwd: process.env.AFL_PI_CWD ?? process.cwd(),
+});
+
+export default {
+  agentExecutor: new PiAgentExecutorBackend({ defaultBinding: binding }),
+};
+```
+
+完整 bindings 文件见 [`examples/pi-bindings.mjs`](examples/pi-bindings.mjs)。`defaultBinding` 可供所有 Agent symbol 使用；需要为 Coder、Reviewer 等选择不同模型或工具时，改用 `agents` map，以 `@agent.*` symbol 为 key。
+
+`createPiCodingAgentBinding` 显式启用 Pi core 的 `read`、`bash`、`edit` 和 `write` 工具。这些工具继承 AFL VM 进程的文件和命令权限，不提供强制 sandbox；默认也不加载 pi-coding-agent 的 CLI、extensions 或交互 UI。Pi session 当前保存在 backend 实例内存中，支持同一 run 内的续接、Memory checkpoint 与 fork，但不提供跨进程持久化。Pi backend 暂不支持带 schema 的 `do`。
+
 `afl` 命令负责静态验证；旧 `afl run` 形式暂时保留兼容：
 
 ```bash
@@ -99,6 +125,12 @@ DEEPSEEK_API_KEY=... npm run smoke:deepseek
 ```
 
 `DEEPSEEK_MODEL` 可以覆盖默认的 `deepseek-v4-flash`，`DEEPSEEK_BASE_URL` 可以覆盖默认 API 地址。密钥不会进入 AFL source、fixture 或 trace。
+
+Pi backend 的 live smoke 会验证真实模型调用、一次工具循环和同一 Agent 的 session 续接：
+
+```bash
+DEEPSEEK_API_KEY=... npm run smoke:pi
+```
 
 ## 文档
 

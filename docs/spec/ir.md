@@ -74,6 +74,8 @@ Basic block 内的指令不因文本相邻而自动串行。VM 从名称引用�
 `VmBindings` 中的 adapter 均按需提供：
 
 - `agents`
+- `agentExecutor`
+- `agentHost`
 - `prompts`
 - `input`
 - `scripts`
@@ -96,4 +98,4 @@ Basic block 内的指令不因文本相邻而自动串行。VM 从名称引用�
 - [示例](../guides/examples.md)展示可解析的组合方式；
 - [Parallel Voting](../guides/parallel-voting.md)展示两种 dispatch 形式。
 
-当前实现不提供 package 声明语法、持久化 Memory、event、retry、race、all-settled 或 iterable map。这些能力不属于本规范。
+当前实现不提供 package 声明语法、持久化 Memory、retry、race、all-settled 或 iterable map。Agent executor 的运行中事件可以进入 Trace 和可选 `agentHost`，但不是 AFL IR 值。
