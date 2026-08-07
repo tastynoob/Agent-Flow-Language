@@ -1,5 +1,6 @@
 import type { AgentAdapter, AgentRunRequest } from "./adapters.js";
 import type { SymbolRef } from "./ir.js";
+import type { ComputeValue } from "./ir.js";
 import {
   AFL_MESSAGE_ROLE_SCHEMA,
   type AgentMemoryContract,
@@ -17,7 +18,7 @@ export interface AgentExecutorCapabilities {
   readonly readOnlyWorkspaceContext: boolean;
   readonly structuredOutput: boolean;
   readonly interrupt: boolean;
-  readonly toolCallInterception: boolean;
+  readonly dynamicControlTools: boolean;
   readonly interactiveApproval: boolean;
   readonly sandboxEnforcement: boolean;
 }
@@ -48,7 +49,31 @@ export interface AgentExecutionRequest {
   readonly session?: BackendSessionRef;
   readonly sessionMemoryRevision?: number;
   readonly schema?: SymbolRef;
+  readonly control?: AgentControlActivation;
   readonly signal: AbortSignal;
+}
+
+export interface AgentControlToolDescriptor {
+  readonly name: `afl.${string}`;
+  readonly label: string;
+  readonly description: string;
+  readonly inputSchema: ComputeValue;
+}
+
+export interface AgentControlActivation {
+  readonly tools: readonly AgentControlToolDescriptor[];
+}
+
+export interface AgentControlToolRequest {
+  readonly id: string;
+  readonly name: `afl.${string}`;
+  readonly input: Readonly<Record<string, unknown>>;
+  readonly signal: AbortSignal;
+}
+
+export interface AgentControlToolResult {
+  readonly content: string;
+  readonly details?: ComputeValue;
 }
 
 export type AgentExecutionStopReason =
@@ -98,6 +123,7 @@ export interface AgentExecutionHost {
   persistContinuation(delta: BackendSessionJournalDelta): void | Promise<void>;
   requestApproval(request: AgentApprovalRequest): Promise<AgentApprovalDecision>;
   requestInput(request: AgentInputRequest): Promise<string>;
+  executeControlTool(request: AgentControlToolRequest): Promise<AgentControlToolResult>;
 }
 
 export interface AgentExecutorBackend {
@@ -140,7 +166,7 @@ const STATELESS_CAPABILITIES = {
   fork: false,
   structuredOutput: false,
   interrupt: true,
-  toolCallInterception: false,
+  dynamicControlTools: false,
   interactiveApproval: false,
   sandboxEnforcement: false,
 } as const;
@@ -168,6 +194,12 @@ export class AgentAdapterExecutorBackend implements AgentExecutorBackend {
   }
 
   async execute(request: AgentExecutionRequest, _host: AgentExecutionHost): Promise<AgentExecutionResult> {
+    if (request.control !== undefined) {
+      throw new AgentExecutorError(
+        "AGENT_CAPABILITY_UNSUPPORTED",
+        "Agent adapter backend does not support activation-scoped AFL control tools",
+      );
+    }
     await this.memory.validateImport(request.agent, AFL_MESSAGE_ROLE_SCHEMA, request.memory);
     const adapterRequest: AgentRunRequest = {
       runId: request.runId,

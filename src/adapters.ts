@@ -1,11 +1,6 @@
-import type {
-  AflModule,
-  ComputeValue,
-  Frag,
-  ScriptLanguage,
-  SymbolRef,
-} from "./ir.js";
+import type { AflModule, ComputeValue, Frag, FreedomMode, ScriptLanguage, SymbolRef } from "./ir.js";
 import type { AgentExecutionHost, AgentExecutorBackend } from "./agent-executor.js";
+import type { FreedomPolicyLimits } from "./freedom.js";
 import type { AgentMemoryContract, MemoryPersistenceBinding, Message } from "./memory.js";
 import type { AgentWorkspaceSet } from "./workspace.js";
 
@@ -110,67 +105,39 @@ export interface SchemaAdapter {
   validate(request: SchemaValidationRequest): void | Promise<void>;
 }
 
-export interface MoveRequest {
-  readonly move: SymbolRef;
-  readonly args: readonly VmArgument[];
-  readonly signal: AbortSignal;
-}
-
-export interface MoveAdapter {
-  execute(request: MoveRequest): string | Frag | Promise<string | Frag>;
-}
-
-export interface FreedomMovePlan {
-  readonly kind: "move";
-  readonly move: SymbolRef;
-  readonly args?: readonly VmArgument[];
-}
-
-export interface FreedomExistingFlowPlan {
-  readonly kind: "flow";
-  readonly flow: SymbolRef;
-  readonly args?: readonly VmArgument[];
-}
-
-export interface FreedomGeneratedFlowPlan {
-  readonly kind: "generated";
-  readonly source: string;
-  readonly entry: string;
-  readonly args?: readonly VmArgument[];
-}
-
-export type FreedomPlan = FreedomMovePlan | FreedomExistingFlowPlan | FreedomGeneratedFlowPlan;
-
-export interface FreedomRequest {
-  readonly mode: "move" | "flow";
-  readonly planner: SymbolRef;
-  readonly systemPrompt?: string;
-  readonly messages: readonly Message[];
-  readonly moves?: readonly SymbolRef[];
-  readonly prompt: Frag;
-  readonly context: Frag;
-  readonly signal: AbortSignal;
-}
-
-export interface FreedomAdapter {
-  plan(request: FreedomRequest): FreedomPlan | Promise<FreedomPlan>;
-}
-
 export interface FreedomPolicyRequest {
+  readonly mode: FreedomMode;
   readonly module: AflModule;
-  readonly plan: FreedomPlan;
   readonly runId: string;
   readonly node: string;
   readonly block: string;
+  readonly planner: SymbolRef;
+  readonly nodes: readonly string[];
+  readonly agents: readonly SymbolRef[];
+  readonly constraint: Readonly<Record<string, ComputeValue>>;
+}
+
+export interface FreedomNodePolicyRequest extends FreedomPolicyRequest {
+  readonly target: string;
+  readonly args: readonly VmArgument[];
+}
+
+export interface FreedomIrPolicyRequest extends FreedomPolicyRequest {
+  readonly source: string;
+  readonly entry: string;
+  readonly digest: string;
 }
 
 export interface VmPolicy {
   readonly maxConcurrency?: number;
   readonly maxDispatchWorkers?: number;
   readonly maxDispatchTasks?: number;
+  readonly freedomLimits?: Partial<FreedomPolicyLimits>;
   authorizeAgent?(request: AgentRunRequest): boolean | Promise<boolean>;
   authorizeCapability?(request: CapabilityRequest): boolean | Promise<boolean>;
-  approveFreedom?(request: FreedomPolicyRequest): boolean | Promise<boolean>;
+  authorizeFreedom?(request: FreedomPolicyRequest): boolean | Promise<boolean>;
+  authorizeFreedomNode?(request: FreedomNodePolicyRequest): boolean | Promise<boolean>;
+  authorizeFreedomIr?(request: FreedomIrPolicyRequest): boolean | Promise<boolean>;
 }
 
 export type TraceEventType =
@@ -193,9 +160,9 @@ export type TraceEventType =
   | "dispatch.completed"
   | "fork.started"
   | "fork.completed"
-  | "freedom.planned"
-  | "freedom.approved"
-  | "freedom.rejected";
+  | "freedom.started"
+  | "freedom.tool"
+  | "freedom.completed";
 
 export interface TraceEvent {
   readonly sequence: number;
@@ -226,8 +193,6 @@ export interface VmBindings {
   readonly flows?: ExternalFlowAdapter;
   readonly formatters?: FormatterAdapter;
   readonly schemas?: SchemaAdapter;
-  readonly moves?: MoveAdapter;
-  readonly freedom?: FreedomAdapter;
   readonly policy?: VmPolicy;
   readonly trace?: TraceSink;
   readonly memoryPersistence?: MemoryPersistenceBinding;

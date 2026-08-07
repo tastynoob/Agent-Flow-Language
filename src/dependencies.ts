@@ -103,13 +103,13 @@ export function instructionReferences(instruction: AflInstruction): NameExpr[] {
       return [instruction.memory];
     case "memory.apply":
       return [instruction.sourceAgent, instruction.memory];
-    case "freedom.move":
+    case "freedom.route":
     case "freedom.flow":
       return [
         instruction.planner,
-        ...(instruction.moves === undefined ? [] : valueReferences(instruction.moves)),
         ...valueReferences(instruction.prompt),
-        ...valueReferences(instruction.context),
+        ...valueReferences(instruction.constraint),
+        ...valueReferences(instruction.params),
       ];
   }
 }
@@ -158,11 +158,11 @@ function resourceAccesses(instruction: AflInstruction): ResourceAccess[] {
         { key: agentResource(instruction.sourceAgent.name), mode: "read" },
         { key: memoryResource(instruction.memory.name), mode: "write" },
       ];
-    case "freedom.move":
+    case "freedom.route":
     case "freedom.flow":
       return [
-        { key: agentResource(instruction.planner.name), mode: "read" },
-        { key: memoryResource(instruction.planner.name), mode: "read" },
+        { key: agentResource(instruction.planner.name), mode: "write" },
+        { key: memoryResource(instruction.planner.name), mode: "write" },
       ];
     default:
       return [];

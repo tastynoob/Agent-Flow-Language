@@ -9,7 +9,9 @@ import type {
   FlowTarget,
   ForkAction,
   NameExpr,
+  NodeDocumentation,
   OperExpr,
+  RecordExpr,
   SourceSpan,
   SymbolExpr,
   ValueExpr,
@@ -28,6 +30,7 @@ const ROLE_NAMES = new Set(["system", "user", "assistant", "tool"]);
 export function parseAfl(source: string, sourceName?: string): AflModule {
   const diagnostics: AflDiagnostic[] = [];
   const lines = prepareLines(source, sourceName, diagnostics);
+  const rawLines = source.replace(/\r\n?/gu, "\n").split("\n");
   if (diagnostics.length > 0) {
     throw new AflParseError(diagnostics);
   }
@@ -50,6 +53,7 @@ export function parseAfl(source: string, sourceName?: string): AflModule {
         throw parseError("PARSE_PARAMETER", `invalid parameter '${parameter}'`, header, sourceName);
       }
     }
+    const documentation = parseNodeDocumentation(rawLines, header, sourceName);
     cursor += 1;
     const blocks: AflBlock[] = [];
     while (cursor < lines.length && lines[cursor]!.indent > 0) {
@@ -88,10 +92,85 @@ export function parseAfl(source: string, sourceName?: string): AflModule {
     if (blocks.length === 0) {
       throw parseError("PARSE_BLOCK_MISSING", `node '${name}' requires at least one block`, header, sourceName);
     }
-    nodes.push({ name, parameters, blocks, span: header.span });
+    nodes.push({
+      name,
+      parameters,
+      ...(documentation === undefined ? {} : { documentation }),
+      blocks,
+      span: header.span,
+    });
   }
 
   return { nodes, ...(sourceName === undefined ? {} : { sourceName }) };
+}
+
+function parseNodeDocumentation(
+  rawLines: readonly string[],
+  header: SourceLine,
+  sourceName?: string,
+): NodeDocumentation | undefined {
+  let description: string | undefined;
+  let returns: string | undefined;
+  const parameters: Record<string, string> = {};
+  let found = false;
+  for (let index = header.number; index < rawLines.length; index += 1) {
+    const raw = rawLines[index]!;
+    const trimmed = raw.trim();
+    if (trimmed.length === 0) continue;
+    const indent = raw.length - raw.trimStart().length;
+    if (indent !== 4 || !trimmed.startsWith("#")) break;
+    const directive = /^#\s+@(description|param|returns)\b\s*(.*)$/u.exec(trimmed);
+    if (directive === null) continue;
+    found = true;
+    const line = sourceLineForDocumentation(raw, index + 1);
+    const kind = directive[1]!;
+    const body = directive[2]!.trim();
+    if (kind === "description") {
+      if (body.length === 0) {
+        throw parseError("PARSE_NODE_DOCUMENTATION", "@description requires text", line, sourceName);
+      }
+      if (description !== undefined) {
+        throw parseError("PARSE_NODE_DOCUMENTATION", "Node has more than one @description", line, sourceName);
+      }
+      description = body;
+      continue;
+    }
+    if (kind === "returns") {
+      if (body.length === 0) {
+        throw parseError("PARSE_NODE_DOCUMENTATION", "@returns requires text", line, sourceName);
+      }
+      if (returns !== undefined) {
+        throw parseError("PARSE_NODE_DOCUMENTATION", "Node has more than one @returns", line, sourceName);
+      }
+      returns = body;
+      continue;
+    }
+    const parameter = /^([A-Za-z_][A-Za-z0-9_]*)\s+(.+)$/u.exec(body);
+    if (parameter === null) {
+      throw parseError("PARSE_NODE_DOCUMENTATION", "@param requires a parameter name and text", line, sourceName);
+    }
+    const name = parameter[1]!;
+    if (parameters[name] !== undefined) {
+      throw parseError("PARSE_NODE_DOCUMENTATION", `@param '${name}' is documented more than once`, line, sourceName);
+    }
+    parameters[name] = parameter[2]!.trim();
+  }
+  if (!found) return undefined;
+  return {
+    ...(description === undefined ? {} : { description }),
+    parameters,
+    ...(returns === undefined ? {} : { returns }),
+  };
+}
+
+function sourceLineForDocumentation(raw: string, number: number): SourceLine {
+  const indent = raw.length - raw.trimStart().length;
+  return {
+    number,
+    indent,
+    text: raw.slice(indent),
+    span: { line: number, column: indent + 1, endColumn: raw.length + 1 },
+  };
 }
 
 function prepareLines(
@@ -407,37 +486,47 @@ function parseAssignedInstruction(
     };
   }
 
-  if (rhs.startsWith("freedom.move ")) {
+  if (rhs.startsWith("freedom.route ")) {
     const operands = splitTopLevel(rhs.slice(13));
-    if (operands.length < 4 || operands.length > 5) {
-      throw parseError("PARSE_FREEDOM_MOVE", "freedom.move expects planner, moves, prompt, context, and optional schema", line, sourceName);
+    if (operands.length !== 5) {
+      throw parseError(
+        "PARSE_FREEDOM_ROUTE",
+        "freedom.route expects planner, prompt, constraint, Node allowlist, and controlled params",
+        line,
+        sourceName,
+      );
     }
     return {
-      op: "freedom.move",
-      mode: "move",
+      op: "freedom.route",
       dst,
       planner: parseName(operands[0]!, line, sourceName),
-      moves: parseValue(operands[1]!, line, sourceName),
-      prompt: parseValue(operands[2]!, line, sourceName),
-      context: parseValue(operands[3]!, line, sourceName),
-      ...(operands[4] === undefined ? {} : { schema: parseSchema(operands[4], line, sourceName) }),
+      prompt: parseValue(operands[1]!, line, sourceName),
+      constraint: parseRecord(operands[2]!, line, sourceName, "Freedom constraint"),
+      nodes: parseLocalNodeList(operands[3]!, line, sourceName),
+      params: parseRecord(operands[4]!, line, sourceName, "Freedom controlled params"),
       span: line.span,
     };
   }
 
   if (rhs.startsWith("freedom.flow ")) {
     const operands = splitTopLevel(rhs.slice(13));
-    if (operands.length < 3 || operands.length > 4) {
-      throw parseError("PARSE_FREEDOM_FLOW", "freedom.flow expects planner, prompt, context, and optional schema", line, sourceName);
+    if (operands.length !== 6) {
+      throw parseError(
+        "PARSE_FREEDOM_FLOW",
+        "freedom.flow expects writer, prompt, constraint, Node allowlist, Agent allowlist, and controlled params",
+        line,
+        sourceName,
+      );
     }
     return {
       op: "freedom.flow",
-      mode: "flow",
       dst,
       planner: parseName(operands[0]!, line, sourceName),
       prompt: parseValue(operands[1]!, line, sourceName),
-      context: parseValue(operands[2]!, line, sourceName),
-      ...(operands[3] === undefined ? {} : { schema: parseSchema(operands[3], line, sourceName) }),
+      constraint: parseRecord(operands[2]!, line, sourceName, "Freedom constraint"),
+      nodes: parseLocalNodeList(operands[3]!, line, sourceName),
+      agents: parseAgentSymbolList(operands[4]!, line, sourceName),
+      params: parseRecord(operands[5]!, line, sourceName, "Freedom controlled params"),
       span: line.span,
     };
   }
@@ -497,6 +586,54 @@ function parseFlowTarget(text: string, line: SourceLine, sourceName?: string): F
   }
   requireName(value, line, sourceName, "flow name");
   return { kind: "local", name: value, span: line.span };
+}
+
+function parseLocalNodeList(text: string, line: SourceLine, sourceName?: string): FlowTarget[] {
+  const value = text.trim();
+  if (!value.startsWith("[") || !value.endsWith("]")) {
+    throw parseError("PARSE_FREEDOM_NODES", "Freedom Node allowlist must be a list", line, sourceName);
+  }
+  const body = value.slice(1, -1).trim();
+  if (body.length === 0) return [];
+  return splitTopLevel(body).map((item) => {
+    const name = item.trim();
+    requireName(name, line, sourceName, "Freedom Node");
+    return { kind: "local", name, span: line.span };
+  });
+}
+
+function parseAgentSymbolList(text: string, line: SourceLine, sourceName?: string): SymbolExpr[] {
+  const value = text.trim();
+  if (!value.startsWith("[") || !value.endsWith("]")) {
+    throw parseError("PARSE_FREEDOM_AGENTS", "Freedom Agent allowlist must be a list", line, sourceName);
+  }
+  const body = value.slice(1, -1).trim();
+  if (body.length === 0) return [];
+  return splitTopLevel(body).map((item) => {
+    const agent = parseSymbol(item, line, sourceName);
+    if (!agent.name.startsWith("@agent.")) {
+      throw parseError(
+        "PARSE_FREEDOM_AGENT_SYMBOL",
+        "Freedom Agent symbols must start with '@agent.'",
+        line,
+        sourceName,
+      );
+    }
+    return agent;
+  });
+}
+
+function parseRecord(
+  text: string,
+  line: SourceLine,
+  sourceName: string | undefined,
+  label: string,
+): RecordExpr {
+  const value = parseValue(text, line, sourceName);
+  if (value.kind !== "record") {
+    throw parseError("PARSE_FREEDOM_RECORD", `${label} must be a record`, line, sourceName);
+  }
+  return value;
 }
 
 function parseSchema(text: string, line: SourceLine, sourceName?: string): SymbolExpr {

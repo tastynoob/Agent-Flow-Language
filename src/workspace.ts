@@ -1,4 +1,5 @@
 import { mkdir, realpath, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { isAbsolute, relative, resolve } from "node:path";
 
 import { AflVmError } from "./errors.js";
@@ -36,11 +37,13 @@ export async function resolveExecutionRoot(root: string, signal: AbortSignal): P
 export async function resolveAgentWorkspace(
   value: unknown,
   executionRoot: string,
+  defaultPrimary: string,
   signal: AbortSignal,
   span?: SourceSpan,
 ): Promise<AgentWorkspaceSet> {
   if (value === undefined) {
-    return workspaceSet(descriptor(executionRoot), [], "default");
+    const primary = await canonicalPrimary(defaultPrimary, executionRoot, signal, span);
+    return workspaceSet(descriptor(primary), [], "default");
   }
 
   const paths = typeof value === "string"
@@ -70,6 +73,16 @@ export async function resolveAgentWorkspace(
     readOnly.push(descriptor(canonical));
   }
   return workspaceSet(descriptor(primary), readOnly, "explicit");
+}
+
+export function defaultAgentWorkspacePath(
+  executionRoot: string,
+  runId: string,
+  allocation: string,
+): string {
+  const run = encodeURIComponent(runId).replaceAll(".", "%2E");
+  const digest = createHash("sha256").update(allocation).digest("hex").slice(0, 24);
+  return resolve(executionRoot, ".afl", "tmpworkspace", run, digest);
 }
 
 export function workspacePathOverlap(left: string, right: string): boolean {

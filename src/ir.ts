@@ -223,18 +223,27 @@ export interface MemoryApplyInstruction extends InstructionBase {
   readonly memory: NameExpr;
 }
 
-export type FreedomMode = "move" | "flow";
+export type FreedomMode = "route" | "flow";
 
-export interface FreedomInstruction extends InstructionBase {
-  readonly op: "freedom.move" | "freedom.flow";
+interface FreedomInstructionBase extends InstructionBase {
   readonly dst: string;
-  readonly mode: FreedomMode;
   readonly planner: NameExpr;
-  readonly moves?: ValueExpr;
   readonly prompt: ValueExpr;
-  readonly context: ValueExpr;
-  readonly schema?: SymbolExpr;
+  readonly constraint: RecordExpr;
+  readonly nodes: readonly FlowTarget[];
+  readonly params: RecordExpr;
 }
+
+export interface FreedomRouteInstruction extends FreedomInstructionBase {
+  readonly op: "freedom.route";
+}
+
+export interface FreedomFlowInstruction extends FreedomInstructionBase {
+  readonly op: "freedom.flow";
+  readonly agents: readonly SymbolExpr[];
+}
+
+export type FreedomInstruction = FreedomRouteInstruction | FreedomFlowInstruction;
 
 export type AflInstruction =
   | AgentInstruction
@@ -284,8 +293,15 @@ export interface AflBlock {
 export interface AflNode {
   readonly name: string;
   readonly parameters: readonly string[];
+  readonly documentation?: NodeDocumentation;
   readonly blocks: readonly AflBlock[];
   readonly span: SourceSpan;
+}
+
+export interface NodeDocumentation {
+  readonly description?: string;
+  readonly parameters: Readonly<Record<string, string>>;
+  readonly returns?: string;
 }
 
 export interface AflModule {
@@ -320,7 +336,19 @@ export function isComputeValue(value: unknown): value is ComputeValue {
   if (Array.isArray(value)) {
     return value.every(isComputeValue);
   }
-  return isObject(value) && Object.values(value).every(isComputeValue);
+  if (!isObject(value)) return false;
+  const prototype = Object.getPrototypeOf(value) as unknown;
+  if (prototype !== Object.prototype && prototype !== null) return false;
+  if (isAflRuntimeValue(value)) return false;
+  return Object.values(value).every(isComputeValue);
+}
+
+function isAflRuntimeValue(value: Record<string, unknown>): boolean {
+  if (value.kind === "frag") return typeof value.content === "string";
+  if (value.kind === "symbol") return typeof value.name === "string" && value.name.startsWith("@");
+  if (value.kind === "memory") return typeof value.id === "string" && Array.isArray(value.messages);
+  if (value.kind === "agent") return typeof value.id === "string" && typeof value.memory === "object";
+  return value.kind === "taskGroup" && typeof value.id === "string" && Array.isArray(value.tasks);
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

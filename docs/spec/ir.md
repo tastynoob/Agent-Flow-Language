@@ -51,7 +51,7 @@ Frag 不携带 role。Frag 进入 Agent 或 Memory 时才确定 role。Handle �
 | Flow | `call`、两种 `dispatch`、`sync`、`fork` |
 | Capability | `invoke` |
 | Memory | `memory.append`、`memory.copy`、`memory.apply` |
-| 动态 Flow | `freedom.move`、`freedom.flow` |
+| 动态 Flow | `freedom.route`、`freedom.flow` |
 | 控制流 | `jump`、`ret`、`fail` |
 
 完整操作数格式见[文本语法](syntax.md)，运行行为见[执行语义](semantics.md)。
@@ -83,13 +83,13 @@ Basic block 内的指令不因文本相邻而自动串行。VM 从名称引用�
 - `flows`
 - `formatters`
 - `schemas`
-- `moves`
-- `freedom`
 - `policy`
 - `trace`
 - `memoryPersistence`
 
 只有 flow 实际执行到对应能力时，VM 才要求该 binding 存在。纯计算 flow 可以使用空 bindings object。
+
+Freedom 不使用单独的 Move 或 Freedom binding。它要求 `agentExecutor` 支持 activation-scoped control tools；候选 Node、Agent 和参数范围直接来自当前 AFL 指令。
 
 ## 7. 文档边界
 

@@ -1,6 +1,7 @@
+import { isAbsolute, resolve } from "node:path";
+
 import type {
   AgentRunRequest,
-  FreedomPlan,
   PromptArgument,
   VmArgument,
   VmBindings,
@@ -9,6 +10,9 @@ import type {
 } from "./adapters.js";
 import {
   AgentAdapterExecutorBackend,
+  type AgentControlActivation,
+  type AgentControlToolRequest,
+  type AgentControlToolResult,
   AgentExecutorError,
   type AgentExecutionHost,
   type AgentExecutionRequest,
@@ -29,13 +33,17 @@ import {
   asCompute,
   asFrag,
   asMemory,
-  asSymbol,
   asTaskGroup,
   evaluateOper,
   evaluateValue,
   formatCompute,
 } from "./evaluator.js";
-import { AflVmError, normalizeVmError } from "./errors.js";
+import { AflParseError, AflValidationError, AflVmError, normalizeVmError, type AflDiagnostic } from "./errors.js";
+import {
+  freedomControlTools,
+  parseFreedomLimits,
+  type FreedomLimits,
+} from "./freedom.js";
 import {
   frag,
   isComputeValue,
@@ -48,6 +56,8 @@ import {
   type ComputeValue,
   type FlowCallExpr,
   type FlowTarget,
+  type FreedomInstruction,
+  type FreedomMode,
   type Frag,
   type SourceSpan,
   type SymbolExpr,
@@ -66,17 +76,20 @@ import {
   isAgentHandle,
   isMemoryHandle,
   isSymbolRef,
+  type AgentOrigin,
   type AgentHandle,
   type MemoryCheckpoint,
   type MemoryHandle,
   type VmValue,
   type TaskGroupHandle,
 } from "./vm-values.js";
-import { assertValidModule } from "./validation.js";
+import { assertValidModule, validateModule } from "./validation.js";
 import {
+  defaultAgentWorkspacePath,
   resolveAgentWorkspace,
   resolveExecutionRoot,
   type AgentWorkspaceSet,
+  workspacePathOverlap,
   workspaceKey,
 } from "./workspace.js";
 
@@ -120,6 +133,51 @@ interface ActivationContext {
   readonly path: string;
   readonly moduleDigest: string;
   readonly blockVisits: Map<string, number>;
+  readonly freedomDepth: number;
+  readonly forbiddenWriterWorkspace?: AgentWorkspaceSet;
+  readonly freedomRouteTracker?: FreedomRouteTracker;
+}
+
+interface FreedomRuntime {
+  readonly activation: AgentControlActivation;
+  execute(request: AgentControlToolRequest): Promise<AgentControlToolResult>;
+}
+
+interface FreedomScope {
+  readonly instruction: FreedomInstruction;
+  readonly planner: AgentHandle;
+  readonly origin: AgentOrigin;
+  readonly context: VmRunContext;
+  readonly location: Required<TraceLocation>;
+  readonly signal: AbortSignal;
+  readonly constraint: Readonly<Record<string, ComputeValue>>;
+  readonly limits: FreedomLimits;
+  readonly freedomDepth: number;
+  readonly nodes: ReadonlyMap<string, AflNode>;
+  readonly agents: readonly SymbolRef[];
+  readonly refs: Map<string, VmArgument>;
+  readonly counts: {
+    control: number;
+    route: number;
+    completedNode: number;
+    completedIr: number;
+    validation: number;
+    execution: number;
+    result: number;
+  };
+}
+
+interface FreedomRouteTracker {
+  readonly scope: FreedomScope;
+  readonly generatedNodes: ReadonlySet<string>;
+}
+
+interface GeneratedIrValidation {
+  readonly valid: boolean;
+  readonly digest?: string;
+  readonly module?: AflModule;
+  readonly overlay?: AflModule;
+  readonly diagnostics: readonly AflDiagnostic[];
 }
 
 interface TraceLocation {
@@ -216,6 +274,9 @@ export class AflVm {
     context: VmRunContext,
     invocationSignal: AbortSignal = context.signal,
     activationPath = "root",
+    forbiddenWriterWorkspace?: AgentWorkspaceSet,
+    freedomDepth = 0,
+    freedomRouteTracker?: FreedomRouteTracker,
   ): Promise<VmValue> {
     throwIfAborted(invocationSignal);
     this.takeStep(context, `node '${nodeName}'`, invocationSignal);
@@ -240,6 +301,9 @@ export class AflVm {
       path: activationPath,
       moduleDigest: canonicalModuleDigest(module),
       blockVisits: new Map(),
+      freedomDepth,
+      ...(forbiddenWriterWorkspace === undefined ? {} : { forbiddenWriterWorkspace }),
+      ...(freedomRouteTracker === undefined ? {} : { freedomRouteTracker }),
     };
     await this.trace(context, "node.started", { node: node.name });
     try {
@@ -415,19 +479,28 @@ export class AflVm {
   ): Promise<VmValue | undefined> {
     switch (instruction.op) {
       case "agent": {
+        const allocationSlot = this.memorySlot(
+          frame,
+          instruction,
+          activation,
+          blockVisit,
+          location,
+          "working",
+        );
         const workspaceValue = instruction.workspace === undefined
           ? undefined
           : evaluateValue(instruction.workspace, frame);
         const workspace = await resolveAgentWorkspace(
           workspaceValue,
           context.executionRoot,
+          defaultAgentWorkspacePath(context.executionRoot, context.runId, allocationSlot),
           signal,
           instruction.workspace?.span,
         );
         const memory = instruction.memory === undefined
           ? this.createMemory(
               context,
-              this.memorySlot(frame, instruction, activation, blockVisit, location, "working"),
+              allocationSlot,
               activation.moduleDigest,
             )
           : asMemory(evaluateValue(instruction.memory, frame), instruction.memory.span);
@@ -442,6 +515,7 @@ export class AflVm {
             { kind: "symbol", name: instruction.agent.name },
             memory,
             workspace,
+            this.agentOrigin(frame, activation, location),
           );
           memory.owner = agent.id;
           return agent;
@@ -489,6 +563,8 @@ export class AflVm {
           context,
           location,
           signal,
+          undefined,
+          activation.forbiddenWriterWorkspace,
         );
       }
       case "prompt":
@@ -544,6 +620,7 @@ export class AflVm {
       }
       case "call": {
         const args = instruction.args.map((argument) => evaluateValue(argument, frame));
+        this.reserveGeneratedFreedomRoute(frame.node.name, instruction.target, activation);
         return normalizeFlowResult(
           await this.invokeFlow(
             frame.module,
@@ -552,6 +629,9 @@ export class AflVm {
             context,
             signal,
             this.childActivationPath(activation, location, blockVisit, "call"),
+            activation.forbiddenWriterWorkspace,
+            activation.freedomDepth,
+            activation.freedomRouteTracker,
           ),
           instruction.span,
         );
@@ -641,7 +721,13 @@ export class AflVm {
           snapshot.checkpoint,
           snapshot.base,
         );
-        const branch = this.createAgent(context, snapshot.agent, memory, snapshot.workspace);
+        const branch = this.createAgent(
+          context,
+          snapshot.agent,
+          memory,
+          snapshot.workspace,
+          this.agentOrigin(frame, activation, location),
+        );
         memory.owner = branch.id;
         if (snapshot.systemPrompt !== undefined) branch.systemPrompt = snapshot.systemPrompt;
         const input = asFrag(evaluateValue(instruction.action.input, frame), instruction.action.input.span, "fork input");
@@ -653,6 +739,8 @@ export class AflVm {
           context,
           location,
           signal,
+          undefined,
+          activation.forbiddenWriterWorkspace,
         );
         await this.trace(context, "fork.completed", location, { source: source.id, branch: branch.id });
         return branch;
@@ -737,14 +825,20 @@ export class AflVm {
                 span: instruction.span,
               });
             }
-            const agent = this.createAgent(context, source.agent, memory, source.workspace);
+            const agent = this.createAgent(
+              context,
+              source.agent,
+              memory,
+              source.workspace,
+              this.agentOrigin(frame, activation, location),
+            );
             if (source.systemPrompt !== undefined) agent.systemPrompt = source.systemPrompt;
             memory.owner = agent.id;
             return agent;
           },
         );
       }
-      case "freedom.move":
+      case "freedom.route":
       case "freedom.flow":
         return this.executeFreedom(frame, instruction, context, activation, blockVisit, location, signal);
     }
@@ -758,12 +852,29 @@ export class AflVm {
     context: VmRunContext,
     location: Required<TraceLocation>,
     signal: AbortSignal,
+    control?: FreedomRuntime,
+    forbiddenWriterWorkspace?: AgentWorkspaceSet,
   ): Promise<Frag> {
     const executor = this.agentExecutor;
     if (executor === undefined) {
       throw new AflVmError(
         "AGENT_ADAPTER_MISSING",
         `Agent '${agent.agent.name}' requires an Agent binding`,
+      );
+    }
+    const workspaceConflict = forbiddenWriterWorkspace === undefined
+      ? undefined
+      : freedomWorkspaceConflict(agent.workspace, forbiddenWriterWorkspace);
+    if (workspaceConflict !== undefined) {
+      throw new AflVmError(
+        "FREEDOM_WORKSPACE_OVERLAP",
+        `Agent Workspace '${workspaceConflict.child}' conflicts with Freedom writer Workspace '${workspaceConflict.writer}'`,
+      );
+    }
+    if (control !== undefined && !executor.capabilities.dynamicControlTools) {
+      throw new AflVmError(
+        "AGENT_CAPABILITY_UNSUPPORTED",
+        `Agent executor '${executor.name}' does not support activation-scoped AFL control tools`,
       );
     }
     return context.locks.use(
@@ -776,6 +887,7 @@ export class AflVm {
         ],
         signal,
         async () => {
+          let externalLease: SuspendableSemaphoreLease | undefined;
           let returnedSession: BackendSessionRef | undefined;
           let persistenceAttempt: MemoryPersistenceAttempt | undefined;
           try {
@@ -793,6 +905,7 @@ export class AflVm {
               workspace: agent.workspace,
               messages: cloneMessages(agent.memory.messages),
               ...(schema === undefined ? {} : { schema: toSymbol(schema) }),
+              ...(control === undefined ? {} : { control: control.activation }),
               signal,
             };
             const approved = await this.bindings.policy?.authorizeAgent?.(policyRequest);
@@ -813,6 +926,7 @@ export class AflVm {
                 ? {}
                 : { sessionMemoryRevision: agent.sessionMemoryRevision }),
               ...(schema === undefined ? {} : { schema: toSymbol(schema) }),
+              ...(control === undefined ? {} : { control: control.activation }),
               signal,
             };
             const continuation = persistedContinuation(agent.memory.checkpoint);
@@ -827,9 +941,12 @@ export class AflVm {
               ...(executor.sessionFormat === undefined ? {} : { format: executor.sessionFormat }),
               location: `${location.node}:${location.block}:${location.instruction}`,
             }, signal);
-            const host = this.createAgentHost(context, location, persistenceAttempt);
+            externalLease = await SuspendableSemaphoreLease.open(context.external, signal);
+            const host = this.createAgentHost(context, location, persistenceAttempt, externalLease, control);
             await this.trace(context, "agent.started", location, { agent: agent.id });
-            const result = await context.external.use(signal, () => executor.execute(request, host));
+            const result = await executor.execute(request, host);
+            await externalLease.close();
+            externalLease = undefined;
             returnedSession = result.session;
             if (typeof result.output !== "string") {
               throw new AflVmError("AGENT_OUTPUT_INVALID", "Agent executor output must be a string");
@@ -855,6 +972,8 @@ export class AflVm {
             await this.invalidateAgentSession(agent, executor, returnedSession);
             await this.trace(context, "agent.failed", location, { agent: agent.id }, vmError);
             throw vmError;
+          } finally {
+            await externalLease?.close();
           }
         },
       ),
@@ -1042,6 +1161,8 @@ export class AflVm {
     context: VmRunContext,
     location: Required<TraceLocation>,
     persistenceAttempt: MemoryPersistenceAttempt,
+    externalLease: SuspendableSemaphoreLease,
+    control?: FreedomRuntime,
   ): AgentExecutionHost {
     return {
       emit: async (event) => {
@@ -1065,6 +1186,18 @@ export class AflVm {
           );
         }
         return this.bindings.agentHost.requestInput(request);
+      },
+      executeControlTool: async (request) => {
+        if (control === undefined) {
+          throw new AgentExecutorError(
+            "AGENT_CAPABILITY_UNSUPPORTED",
+            `AFL control tool '${request.name}' is not available in this Agent activation`,
+          );
+        }
+        return externalLease.suspend(async () => {
+          await this.trace(context, "freedom.tool", location, { tool: request.name });
+          return control.execute(request);
+        });
       },
     };
   }
@@ -1122,10 +1255,23 @@ export class AflVm {
     context: VmRunContext,
     signal: AbortSignal,
     activationPath: string,
+    forbiddenWriterWorkspace?: AgentWorkspaceSet,
+    freedomDepth = 0,
+    freedomRouteTracker?: FreedomRouteTracker,
   ): Promise<VmValue> {
     throwIfAborted(signal);
     if (target.kind === "local") {
-      return this.executeNode(module, target.name, args, context, signal, activationPath);
+      return this.executeNode(
+        module,
+        target.name,
+        args,
+        context,
+        signal,
+        activationPath,
+        forbiddenWriterWorkspace,
+        freedomDepth,
+        freedomRouteTracker,
+      );
     }
     if (this.bindings.flows === undefined) {
       throw new AflVmError("FLOW_ADAPTER_MISSING", `external flow '${target.name}' requires a Flow binding`, {
@@ -1159,6 +1305,7 @@ export class AflVm {
         `dispatch requested ${calls.length} tasks, exceeding maxDispatchTasks=${maxTasks}`,
       );
     }
+    this.reserveGeneratedFreedomRoutes(frame.node.name, calls.map((call) => call.target), activation);
     const linked = linkedController(parentSignal);
     const workerLimit = new Semaphore(maxWorkers);
     const id = this.nextHandle(context, "task-group");
@@ -1171,6 +1318,9 @@ export class AflVm {
           context,
           linked.controller.signal,
           `${this.childActivationPath(activation, location, blockVisit, "dispatch")}:${index}`,
+          activation.forbiddenWriterWorkspace,
+          activation.freedomDepth,
+          activation.freedomRouteTracker,
         ),
         call.span,
       ));
@@ -1256,9 +1406,9 @@ export class AflVm {
           ...agent(instruction.sourceAgent, "read"),
           ...memory(instruction.memory, "write"),
         ];
-      case "freedom.move":
+      case "freedom.route":
       case "freedom.flow":
-        return agent(instruction.planner, "read");
+        return agent(instruction.planner, "write");
       default:
         return [];
     }
@@ -1266,104 +1416,679 @@ export class AflVm {
 
   private async executeFreedom(
     frame: MutableFrame,
-    instruction: Extract<AflInstruction, { op: "freedom.move" | "freedom.flow" }>,
+    instruction: FreedomInstruction,
     context: VmRunContext,
     activation: ActivationContext,
-    blockVisit: number,
+    _blockVisit: number,
     location: Required<TraceLocation>,
     signal: AbortSignal,
   ): Promise<Frag> {
-    if (this.bindings.freedom === undefined) {
-      throw new AflVmError("FREEDOM_ADAPTER_MISSING", `${instruction.op} requires a Freedom binding`, {
-        span: instruction.span,
-      });
-    }
+    const mode = freedomInstructionMode(instruction);
     const planner = asAgent(evaluateValue(instruction.planner, frame), instruction.planner.span);
     const prompt = asFrag(evaluateValue(instruction.prompt, frame), instruction.prompt.span, "freedom prompt");
-    const contextValue = asFrag(evaluateValue(instruction.context, frame), instruction.context.span, "freedom context");
-    const moves = instruction.moves === undefined ? undefined : this.evaluateMoveCandidates(instruction.moves, frame);
-    const plan: unknown = await this.bindings.freedom.plan({
-      mode: instruction.mode,
-      planner: planner.agent,
-      ...(planner.systemPrompt === undefined ? {} : { systemPrompt: planner.systemPrompt }),
-      messages: cloneMessages(planner.memory.messages),
-      ...(moves === undefined ? {} : { moves }),
-      prompt,
-      context: contextValue,
-      signal,
-    });
-    validateFreedomPlanShape(plan, instruction.mode, instruction.span);
-    await this.trace(context, "freedom.planned", location, { kind: plan.kind });
-    const approved = await this.bindings.policy?.approveFreedom?.({
-      module: frame.module,
-      plan,
+    const constraint = this.evaluateComputeRecord(instruction.constraint, frame, "Freedom constraint");
+    const limits = parseFreedomLimits(
+      constraint,
+      instruction.constraint.span,
+      this.bindings.policy?.freedomLimits,
+    );
+    const freedomDepth = activation.freedomDepth + 1;
+    if (freedomDepth > limits.maxActivationDepth) {
+      throw new AflVmError(
+        "FREEDOM_ACTIVATION_DEPTH_EXCEEDED",
+        `Freedom exceeded max_activation_depth=${limits.maxActivationDepth}`,
+        { span: instruction.span },
+      );
+    }
+    const nodes = new Map<string, AflNode>();
+    for (const candidate of instruction.nodes) {
+      const node = planner.origin.module.nodes.find((item) => item.name === candidate.name);
+      if (node === undefined) {
+        throw new AflVmError(
+          "FREEDOM_NODE_UNKNOWN",
+          `Freedom Node '${candidate.name}' is unavailable at planner origin`,
+          { span: candidate.span },
+        );
+      }
+      nodes.set(candidate.name, node);
+    }
+    const agents = instruction.op === "freedom.flow" ? instruction.agents.map(toSymbol) : [];
+    const refs = new Map<string, VmArgument>();
+    for (const [name, expression] of Object.entries(instruction.params.entries)) {
+      const value = evaluateValue(expression, frame);
+      if (isVmHandle(value) || isSymbolRef(value)) {
+        throw new AflVmError(
+          "FREEDOM_PARAM_INVALID",
+          `Freedom controlled param '${name}' must be Frag or compute data`,
+          { span: expression.span },
+        );
+      }
+      refs.set(`param:${name}`, this.toVmArgument(value, expression.span));
+    }
+    const policyRequest = {
+      mode,
+      module: planner.origin.module,
       runId: context.runId,
-      node: frame.node.name,
+      node: location.node,
       block: location.block,
-    });
-    if (approved === false) {
-      await this.trace(context, "freedom.rejected", location, { kind: plan.kind });
-      throw new AflVmError("FREEDOM_DENIED", "freedom plan was denied by policy", {
+      planner: planner.agent,
+      nodes: [...nodes.keys()],
+      agents,
+      constraint,
+    } as const;
+    if (await this.bindings.policy?.authorizeFreedom?.(policyRequest) === false) {
+      throw new AflVmError("FREEDOM_DENIED", "Freedom activation was denied by policy", {
         span: instruction.span,
       });
     }
-    await this.trace(context, "freedom.approved", location, { kind: plan.kind });
-    const result = await this.executeFreedomPlan(
-      frame.module,
-      plan,
-      moves,
+    const linked = linkedController(signal);
+    const timeout = setTimeout(() => {
+      linked.controller.abort(new AflVmError(
+        "FREEDOM_TIMEOUT",
+        `Freedom activation exceeded timeout_ms=${limits.timeoutMs}`,
+        { span: instruction.span },
+      ));
+    }, limits.timeoutMs);
+    const scope: FreedomScope = {
+      instruction,
+      planner,
+      origin: planner.origin,
       context,
-      signal,
-      instruction.span,
-      this.childActivationPath(activation, location, blockVisit, "call"),
-    );
-    const output = normalizeFlowResult(result, instruction.span);
-    await this.validateSchema(output.content, instruction.schema, signal);
-    return output;
-  }
-
-  private async executeFreedomPlan(
-    module: AflModule,
-    plan: FreedomPlan,
-    candidates: readonly SymbolRef[] | undefined,
-    context: VmRunContext,
-    signal: AbortSignal,
-    span: SourceSpan,
-    activationPath: string,
-  ): Promise<VmValue> {
-    if (plan.kind === "move") {
-      if (candidates === undefined || !candidates.some((candidate) => candidate.name === plan.move.name)) {
-        throw new AflVmError("FREEDOM_MOVE_OUT_OF_SCOPE", `move '${plan.move.name}' is not a candidate`, { span });
-      }
-      if (this.bindings.moves === undefined) {
-        throw new AflVmError("MOVE_ADAPTER_MISSING", "freedom move requires a Move binding", { span });
-      }
-      const result = await this.bindings.moves.execute({
-        move: plan.move,
-        args: plan.args ?? [],
-        signal,
+      location,
+      signal: linked.controller.signal,
+      constraint,
+      limits,
+      freedomDepth,
+      nodes,
+      agents,
+      refs,
+      counts: {
+        control: 0,
+        route: 0,
+        completedNode: 0,
+        completedIr: 0,
+        validation: 0,
+        execution: 0,
+        result: 0,
+      },
+    };
+    try {
+      await this.trace(context, "freedom.started", location, {
+        mode,
+        nodes: [...nodes.keys()],
       });
-      if (typeof result === "string") return frag(result);
-      if (isFrag(result)) return result;
-      throw new AflVmError("MOVE_RESULT_INVALID", "Move binding returned an invalid value", { span });
-    }
-    if (plan.kind === "flow") {
-      if (this.bindings.flows === undefined) {
-        throw new AflVmError("FLOW_ADAPTER_MISSING", "freedom flow requires a Flow binding", { span });
+      const output = await this.runAgent(
+        planner,
+        "user",
+        prompt,
+        undefined,
+        context,
+        location,
+        linked.controller.signal,
+        this.createFreedomRuntime(scope),
+      );
+      if (scope.counts.route < scope.limits.minRoutes) {
+        throw new AflVmError(
+          "FREEDOM_ROUTE_MIN_NOT_REACHED",
+          `Freedom started ${scope.counts.route} routes, below min_routes=${scope.limits.minRoutes}`,
+          { span: instruction.span },
+        );
       }
-      return this.bindings.flows.invoke({ flow: plan.flow, args: plan.args ?? [], signal });
+      await this.trace(context, "freedom.completed", location, {
+        mode,
+        controlCalls: scope.counts.control,
+        routes: scope.counts.route,
+        completedNodes: scope.counts.completedNode,
+        completedIr: scope.counts.completedIr,
+      });
+      return scope.counts.completedNode + scope.counts.completedIr === 0 ? frag("") : output;
+    } finally {
+      clearTimeout(timeout);
+      linked.dispose();
     }
-    const generated = assertValidModule(parseAfl(plan.source, "<freedom-generated>"));
-    return this.executeNode(generated, plan.entry, [...(plan.args ?? [])], context, signal, activationPath);
   }
 
-  private evaluateMoveCandidates(expression: ValueExpr, frame: MutableFrame): SymbolRef[] {
-    if (expression.kind !== "list") {
-      throw new AflVmError("FREEDOM_MOVES_INVALID", "freedom.move candidates must be a symbol list", {
+  private createFreedomRuntime(scope: FreedomScope): FreedomRuntime {
+    return {
+      activation: {
+        tools: freedomControlTools(freedomInstructionMode(scope.instruction)),
+      },
+      execute: (request) => this.executeFreedomTool(scope, request),
+    };
+  }
+
+  private reserveFreedomRoutes(scope: FreedomScope, count: number): void {
+    if (count === 0) return;
+    this.assertFreedomRouteCapacity(scope, count);
+    scope.counts.route += count;
+  }
+
+  private assertFreedomRouteCapacity(scope: FreedomScope, count: number): void {
+    const next = scope.counts.route + count;
+    if (next > scope.limits.maxRoutes) {
+      throw new AflVmError(
+        "FREEDOM_ROUTE_MAX_EXCEEDED",
+        `Freedom routing would reach ${next} routes, exceeding max_routes=${scope.limits.maxRoutes}`,
+      );
+    }
+  }
+
+  private reserveFreedomRoute(scope: FreedomScope): void {
+    this.reserveFreedomRoutes(scope, 1);
+  }
+
+  private reserveGeneratedFreedomRoute(
+    caller: string,
+    target: FlowTarget,
+    activation: ActivationContext,
+  ): void {
+    this.reserveGeneratedFreedomRoutes(caller, [target], activation);
+  }
+
+  private reserveGeneratedFreedomRoutes(
+    caller: string,
+    targets: readonly FlowTarget[],
+    activation: ActivationContext,
+  ): void {
+    const tracker = activation.freedomRouteTracker;
+    if (tracker === undefined || !tracker.generatedNodes.has(caller)) return;
+    const count = targets.filter((target) =>
+      target.kind === "local" && tracker.scope.nodes.has(target.name)).length;
+    this.reserveFreedomRoutes(tracker.scope, count);
+  }
+
+  private evaluateComputeRecord(
+    expression: ValueExpr,
+    frame: MutableFrame,
+    label: string,
+  ): Readonly<Record<string, ComputeValue>> {
+    const value = evaluateValue(expression, frame);
+    if (isFrag(value) || isSymbolRef(value) || isVmHandle(value) ||
+        typeof value !== "object" || value === null || Array.isArray(value) || !isComputeValue(value)) {
+      throw new AflVmError("FREEDOM_CONSTRAINT_INVALID", `${label} must be compute record data`, {
         span: expression.span,
       });
     }
-    return expression.items.map((item) => asSymbol(evaluateValue(item, frame), item.span));
+    return structuredClone(value);
+  }
+
+  private async executeFreedomTool(
+    scope: FreedomScope,
+    request: AgentControlToolRequest,
+  ): Promise<AgentControlToolResult> {
+    throwIfAborted(scope.signal);
+    throwIfAborted(request.signal);
+    scope.counts.control += 1;
+    try {
+      if (scope.counts.control > scope.limits.maxControlCalls) {
+        throw new AflVmError(
+          "FREEDOM_CONTROL_LIMIT_EXCEEDED",
+          `Freedom exceeded max_control_calls=${scope.limits.maxControlCalls}`,
+        );
+      }
+      const mode = freedomInstructionMode(scope.instruction);
+      if (!freedomControlTools(mode).some((tool) => tool.name === request.name)) {
+        throw new AflVmError(
+          "FREEDOM_TOOL_UNAVAILABLE",
+          `AFL control tool '${request.name}' is unavailable in ${mode} mode`,
+        );
+      }
+      switch (request.name) {
+        case "afl.environment.get":
+          return this.freedomEnvironment(scope, request.input);
+        case "afl.node.execute":
+          return await this.executeFreedomNode(scope, request);
+        case "afl.ir.validate":
+          return this.validateFreedomIrTool(scope, request.input);
+        case "afl.ir.execute":
+          return await this.executeFreedomIrTool(scope, request);
+        default:
+          throw new AflVmError("FREEDOM_TOOL_UNAVAILABLE", `Unknown AFL control tool '${request.name}'`);
+      }
+    } catch (error) {
+      throwIfAborted(scope.signal);
+      throwIfAborted(request.signal);
+      const vmError = normalizeVmError(error);
+      return controlResult({
+        ok: false,
+        error: {
+          code: vmError.code,
+          message: vmError.message,
+          ...(vmError.span === undefined ? {} : {
+            span: {
+              line: vmError.span.line,
+              column: vmError.span.column,
+              endColumn: vmError.span.endColumn,
+            },
+          }),
+        },
+      });
+    }
+  }
+
+  private freedomEnvironment(
+    scope: FreedomScope,
+    input: Readonly<Record<string, unknown>>,
+  ): AgentControlToolResult {
+    assertObjectInput(input, ["include"]);
+    const allowedSections = ["agents", "nodes", "parameters", "constraints", "tools"] as const;
+    let include: readonly (typeof allowedSections)[number][] = allowedSections;
+    if (input.include !== undefined) {
+      if (!Array.isArray(input.include) ||
+          !input.include.every((item) => typeof item === "string" && allowedSections.includes(item as never))) {
+        throw new AflVmError("FREEDOM_TOOL_INPUT_INVALID", "include contains an unknown environment section");
+      }
+      include = [...new Set(input.include)] as (typeof allowedSections)[number][];
+    }
+    const selected = new Set(include);
+    const environment: Record<string, ComputeValue> = {
+      mode: freedomInstructionMode(scope.instruction),
+    };
+    if (selected.has("nodes")) {
+      environment.nodes = [...scope.nodes.values()].map((node) => ({
+        name: node.name,
+        description: node.documentation?.description ?? "",
+        parameters: node.parameters.map((name) => ({
+          name,
+          description: node.documentation?.parameters[name] ?? "",
+        })),
+        returns: node.documentation?.returns ?? "",
+        callable: true,
+      }));
+    }
+    if (selected.has("agents")) {
+      environment.agents = scope.agents.map((agent) => agent.name);
+    }
+    if (selected.has("parameters")) {
+      environment.parameters = [...scope.refs].map(([ref, value]) => ({
+        ref,
+        name: ref.startsWith("param:") ? ref.slice("param:".length) : ref,
+        kind: portableControlKind(value),
+        value: portableControlValue(value),
+      }));
+    }
+    if (selected.has("constraints")) {
+      environment.constraints = {
+        requested: structuredClone(scope.constraint),
+        effective: freedomLimitsValue(scope.limits),
+      };
+    }
+    if (selected.has("tools")) {
+      environment.tools = freedomControlTools(freedomInstructionMode(scope.instruction)).map((tool) => tool.name);
+    }
+    return controlResult({ ok: true, environment });
+  }
+
+  private async executeFreedomNode(
+    scope: FreedomScope,
+    request: AgentControlToolRequest,
+  ): Promise<AgentControlToolResult> {
+    assertObjectInput(request.input, ["node", "args"]);
+    const target = requiredString(request.input, "node");
+    const node = scope.nodes.get(target);
+    if (node === undefined) {
+      throw new AflVmError("FREEDOM_NODE_DENIED", `Node '${target}' is not in this Freedom allowlist`);
+    }
+    const args = resolveControlArguments(request.input.args, scope.refs);
+    if (args.length !== node.parameters.length) {
+      throw new AflVmError(
+        "CALL_ARITY",
+        `Node '${target}' expects ${node.parameters.length} arguments, received ${args.length}`,
+      );
+    }
+    this.assertFreedomRouteCapacity(scope, 1);
+    if (await this.bindings.policy?.authorizeFreedomNode?.({
+      ...this.freedomPolicyRequest(scope),
+      target,
+      args: args.map((argument) => clonePortable(argument)),
+    }) === false) {
+      throw new AflVmError("FREEDOM_NODE_DENIED", `Node '${target}' was denied by policy`);
+    }
+    this.reserveFreedomRoute(scope);
+    const output = await this.executeNode(
+      scope.origin.module,
+      target,
+      args,
+      scope.context,
+      scope.signal,
+      `${scope.origin.activationPath}/freedom-node:${encodeURIComponent(request.id)}`,
+      scope.planner.workspace,
+      scope.freedomDepth,
+    );
+    const result = portableFlowResult(output, node.span);
+    const ref = this.registerFreedomResult(scope, result);
+    scope.counts.completedNode += 1;
+    return controlResult({ ok: true, ref, value: portableControlValue(result) });
+  }
+
+  private validateFreedomIrTool(
+    scope: FreedomScope,
+    input: Readonly<Record<string, unknown>>,
+  ): AgentControlToolResult {
+    assertObjectInput(input, ["source", "entry", "args"]);
+    scope.counts.validation += 1;
+    if (scope.counts.validation > scope.limits.maxIrValidations) {
+      throw new AflVmError(
+        "FREEDOM_IR_VALIDATION_LIMIT_EXCEEDED",
+        `Freedom exceeded max_ir_validations=${scope.limits.maxIrValidations}`,
+      );
+    }
+    const source = requiredString(input, "source");
+    const entry = requiredString(input, "entry");
+    const args = resolveControlArguments(input.args, scope.refs);
+    const result = this.validateGeneratedIr(scope, source, entry, args);
+    return controlResult({
+      ok: result.valid,
+      ...(result.digest === undefined ? {} : { digest: result.digest }),
+      diagnostics: diagnosticValues(result.diagnostics),
+    });
+  }
+
+  private async executeFreedomIrTool(
+    scope: FreedomScope,
+    request: AgentControlToolRequest,
+  ): Promise<AgentControlToolResult> {
+    assertObjectInput(request.input, ["source", "entry", "args", "expectedDigest"]);
+    scope.counts.execution += 1;
+    if (scope.counts.execution > scope.limits.maxIrExecutions) {
+      throw new AflVmError(
+        "FREEDOM_IR_EXECUTION_LIMIT_EXCEEDED",
+        `Freedom exceeded max_ir_executions=${scope.limits.maxIrExecutions}`,
+      );
+    }
+    const source = requiredString(request.input, "source");
+    const entry = requiredString(request.input, "entry");
+    const args = resolveControlArguments(request.input.args, scope.refs);
+    const expectedDigest = optionalString(request.input, "expectedDigest");
+    const result = this.validateGeneratedIr(scope, source, entry, args);
+    if (!result.valid || result.digest === undefined || result.overlay === undefined) {
+      return controlResult({ ok: false, diagnostics: diagnosticValues(result.diagnostics) });
+    }
+    if (expectedDigest !== undefined && expectedDigest !== result.digest) {
+      return controlResult({
+        ok: false,
+        digest: result.digest,
+        error: {
+          code: "FREEDOM_IR_DIGEST_MISMATCH",
+          message: "Generated IR changed after validation",
+        },
+      });
+    }
+    if (await this.bindings.policy?.authorizeFreedomIr?.({
+      ...this.freedomPolicyRequest(scope),
+      source,
+      entry,
+      digest: result.digest,
+    }) === false) {
+      throw new AflVmError("FREEDOM_IR_DENIED", "Generated IR execution was denied by policy");
+    }
+    const output = await this.executeNode(
+      result.overlay!,
+      entry,
+      args,
+      scope.context,
+      scope.signal,
+      `${scope.origin.activationPath}/freedom-ir:${encodeURIComponent(request.id)}`,
+      scope.planner.workspace,
+      scope.freedomDepth,
+      {
+        scope,
+        generatedNodes: new Set(result.module!.nodes.map((node) => node.name)),
+      },
+    );
+    const portable = portableFlowResult(output, scope.instruction.span);
+    const ref = this.registerFreedomResult(scope, portable);
+    scope.counts.completedIr += 1;
+    return controlResult({
+      ok: true,
+      digest: result.digest,
+      ref,
+      value: portableControlValue(portable),
+      diagnostics: diagnosticValues(result.diagnostics),
+    });
+  }
+
+  private validateGeneratedIr(
+    scope: FreedomScope,
+    source: string,
+    entry: string,
+    args: readonly VmArgument[],
+  ): GeneratedIrValidation {
+    const diagnostics: AflDiagnostic[] = [];
+    let fragment: AflModule;
+    if (new TextEncoder().encode(source).byteLength > scope.limits.maxGeneratedBytes) {
+      diagnostics.push(generatedDiagnostic(
+        "FREEDOM_IR_BYTE_LIMIT_EXCEEDED",
+        `Generated IR exceeds max_generated_bytes=${scope.limits.maxGeneratedBytes}`,
+      ));
+      return { valid: false, diagnostics };
+    }
+    try {
+      fragment = parseAfl(source, "<freedom-generated>");
+    } catch (error) {
+      if (error instanceof AflParseError || error instanceof AflValidationError) {
+        return { valid: false, diagnostics: error.diagnostics };
+      }
+      const vmError = normalizeVmError(error);
+      return { valid: false, diagnostics: [generatedDiagnostic(vmError.code, vmError.message)] };
+    }
+    if (fragment.nodes.length > scope.limits.maxGeneratedNodes) {
+      diagnostics.push(generatedDiagnostic(
+        "FREEDOM_IR_NODE_LIMIT_EXCEEDED",
+        `Generated IR exceeds max_generated_nodes=${scope.limits.maxGeneratedNodes}`,
+      ));
+    }
+    const originNames = new Set(scope.origin.module.nodes.map((node) => node.name));
+    const fragmentNames = new Set(fragment.nodes.map((node) => node.name));
+    for (const node of fragment.nodes) {
+      if (originNames.has(node.name)) {
+        diagnostics.push(generatedDiagnostic(
+          "FREEDOM_IR_NODE_COLLISION",
+          `Generated Node '${node.name}' collides with a writer-origin Node`,
+          node.span,
+        ));
+      }
+      this.validateGeneratedNodeScope(scope, node, fragmentNames, originNames, diagnostics);
+    }
+    const entryNode = fragment.nodes.find((node) => node.name === entry);
+    if (entryNode === undefined) {
+      diagnostics.push(generatedDiagnostic(
+        "FREEDOM_IR_ENTRY_UNKNOWN",
+        `Generated entry Node '${entry}' is not declared by this fragment`,
+      ));
+    } else if (entryNode.parameters.length !== args.length) {
+      diagnostics.push(generatedDiagnostic(
+        "CALL_ARITY",
+        `Generated entry Node '${entry}' expects ${entryNode.parameters.length} arguments, received ${args.length}`,
+        entryNode.span,
+      ));
+    }
+
+    const validationOverlay: AflModule = {
+      sourceName: "<freedom-generated>",
+      nodes: [
+        ...scope.origin.module.nodes.map(validationNodeStub),
+        ...fragment.nodes,
+      ],
+    };
+    const validation = validateModule(validationOverlay);
+    diagnostics.push(...validation.diagnostics.filter((diagnostic) => diagnostic.span.line !== 0));
+    this.validateGeneratedWorkspaceOverlap(scope, fragment, diagnostics);
+    const errors = diagnostics.filter((diagnostic) => diagnostic.severity !== "warning");
+    if (errors.length > 0) return { valid: false, diagnostics };
+    const overlay: AflModule = {
+      sourceName: "<freedom-overlay>",
+      nodes: [...scope.origin.module.nodes, ...fragment.nodes],
+    };
+    return {
+      valid: true,
+      digest: canonicalModuleDigest(fragment),
+      module: fragment,
+      overlay,
+      diagnostics,
+    };
+  }
+
+  private validateGeneratedNodeScope(
+    scope: FreedomScope,
+    node: AflNode,
+    fragmentNames: ReadonlySet<string>,
+    originNames: ReadonlySet<string>,
+    diagnostics: AflDiagnostic[],
+  ): void {
+    const allowedAgents = new Set(scope.agents.map((agent) => agent.name));
+    const validateTarget = (target: FlowTarget, span: SourceSpan): void => {
+      if (target.kind === "external") {
+        diagnostics.push(generatedDiagnostic(
+          "FREEDOM_IR_EXTERNAL_FLOW_DENIED",
+          `Generated IR cannot call external Flow '${target.name}' in v0`,
+          span,
+        ));
+      } else if (originNames.has(target.name) && !scope.nodes.has(target.name)) {
+        diagnostics.push(generatedDiagnostic(
+          "FREEDOM_IR_NODE_DENIED",
+          `Writer-origin Node '${target.name}' is not in this Freedom allowlist`,
+          span,
+        ));
+      } else if (!originNames.has(target.name) && !fragmentNames.has(target.name)) {
+        diagnostics.push(generatedDiagnostic("FLOW_UNKNOWN", `Flow '${target.name}' is not declared`, span));
+      }
+    };
+    for (const block of node.blocks) {
+      for (const instruction of block.instructions) {
+        switch (instruction.op) {
+          case "agent":
+            if (!allowedAgents.has(instruction.agent.name)) {
+              diagnostics.push(generatedDiagnostic(
+                "FREEDOM_IR_AGENT_DENIED",
+                `Agent '${instruction.agent.name}' is not in this Freedom allowlist`,
+                instruction.span,
+              ));
+            }
+            break;
+          case "call":
+            validateTarget(instruction.target, instruction.span);
+            break;
+          case "dispatch.list":
+            for (const call of instruction.calls) validateTarget(call.target, call.span);
+            break;
+          case "dispatch.batch":
+            validateTarget(instruction.target, instruction.span);
+            break;
+          case "input":
+          case "script":
+          case "invoke":
+          case "freedom.route":
+          case "freedom.flow":
+            diagnostics.push(generatedDiagnostic(
+              "FREEDOM_IR_INSTRUCTION_DENIED",
+              `Generated IR cannot use '${instruction.op}' in v0`,
+              instruction.span,
+            ));
+            break;
+          case "prompt":
+            if (instruction.source.kind === "symbol") {
+              diagnostics.push(generatedDiagnostic(
+                "FREEDOM_IR_SYMBOL_DENIED",
+                "Generated IR cannot use an external Prompt symbol in v0",
+                instruction.source.span,
+              ));
+            }
+            break;
+          case "agent.sysprompt":
+            if (instruction.prompt.kind === "symbol") {
+              diagnostics.push(generatedDiagnostic(
+                "FREEDOM_IR_SYMBOL_DENIED",
+                "Generated IR cannot use an external system Prompt symbol in v0",
+                instruction.prompt.span,
+              ));
+            }
+            break;
+          case "agent.do":
+            if (instruction.schema !== undefined) {
+              diagnostics.push(generatedDiagnostic(
+                "FREEDOM_IR_SYMBOL_DENIED",
+                "Generated IR cannot use an external Schema symbol in v0",
+                instruction.schema.span,
+              ));
+            }
+            break;
+          case "fork":
+            if (instruction.action.schema !== undefined) {
+              diagnostics.push(generatedDiagnostic(
+                "FREEDOM_IR_SYMBOL_DENIED",
+                "Generated IR cannot use an external Schema symbol in v0",
+                instruction.action.schema.span,
+              ));
+            }
+            break;
+          case "sync":
+            if (instruction.formatter !== undefined) {
+              diagnostics.push(generatedDiagnostic(
+                "FREEDOM_IR_SYMBOL_DENIED",
+                "Generated IR cannot use an external Formatter symbol in v0",
+                instruction.formatter.span,
+              ));
+            }
+            break;
+          default:
+            break;
+        }
+      }
+    }
+  }
+
+  private validateGeneratedWorkspaceOverlap(
+    scope: FreedomScope,
+    fragment: AflModule,
+    diagnostics: AflDiagnostic[],
+  ): void {
+    for (const node of fragment.nodes) {
+      for (const block of node.blocks) {
+        for (const instruction of block.instructions) {
+          if (instruction.op !== "agent") continue;
+          const workspace = literalWorkspacePaths(instruction.workspace);
+          if (workspace === undefined) continue;
+          const childPrimary = resolveWorkspaceLiteral(scope.context.executionRoot, workspace.primary);
+          const writerPaths = [
+            scope.planner.workspace.primary.root,
+            ...scope.planner.workspace.readOnly.map((item) => item.root),
+          ];
+          const primaryConflict = writerPaths.find((path) => workspacePathOverlap(path, childPrimary));
+          const readOnlyConflict = workspace.readOnly
+            .map((path) => resolveWorkspaceLiteral(scope.context.executionRoot, path))
+            .find((path) => workspacePathOverlap(path, scope.planner.workspace.primary.root));
+          if (primaryConflict === undefined && readOnlyConflict === undefined) continue;
+          diagnostics.push(generatedDiagnostic(
+            "FREEDOM_WORKSPACE_OVERLAP",
+            `Generated Agent Workspace '${primaryConflict === undefined ? readOnlyConflict : childPrimary}' conflicts with the writer Workspace`,
+            instruction.workspace!.span,
+            "warning",
+          ));
+        }
+      }
+    }
+  }
+
+  private freedomPolicyRequest(scope: FreedomScope) {
+    return {
+      mode: freedomInstructionMode(scope.instruction),
+      module: scope.origin.module,
+      runId: scope.context.runId,
+      node: scope.location.node,
+      block: scope.location.block,
+      planner: scope.planner.agent,
+      nodes: [...scope.nodes.keys()],
+      agents: scope.agents,
+      constraint: scope.constraint,
+    } as const;
+  }
+
+  private registerFreedomResult(scope: FreedomScope, result: VmArgument): string {
+    scope.counts.result += 1;
+    const ref = `result:${scope.counts.result}`;
+    scope.refs.set(ref, clonePortable(result));
+    return ref;
   }
 
   private toPromptArgument(value: VmValue, span: SourceSpan): PromptArgument {
@@ -1405,8 +2130,24 @@ export class AflVm {
     agent: SymbolRef,
     memory: MemoryHandle,
     workspace: AgentWorkspaceSet,
+    origin: AgentOrigin,
   ): AgentHandle {
-    return { kind: "agent", id: this.nextHandle(context, "agent"), agent, memory, workspace };
+    return { kind: "agent", id: this.nextHandle(context, "agent"), agent, memory, workspace, origin };
+  }
+
+  private agentOrigin(
+    frame: MutableFrame,
+    activation: ActivationContext,
+    location: Required<TraceLocation>,
+  ): AgentOrigin {
+    return Object.freeze({
+      module: frame.module,
+      moduleDigest: activation.moduleDigest,
+      activationPath: activation.path,
+      node: location.node,
+      block: location.block,
+      instruction: location.instruction,
+    });
   }
 
   private async persistMemory(
@@ -1526,6 +2267,63 @@ export class AflVm {
   }
 }
 
+class SuspendableSemaphoreLease {
+  private release: (() => void) | undefined;
+  private suspended = 0;
+  private closed = false;
+  private transition: Promise<void> = Promise.resolve();
+
+  private constructor(
+    private readonly semaphore: Semaphore,
+    private readonly signal: AbortSignal,
+    release: () => void,
+  ) {
+    this.release = release;
+  }
+
+  static async open(semaphore: Semaphore, signal: AbortSignal): Promise<SuspendableSemaphoreLease> {
+    return new SuspendableSemaphoreLease(semaphore, signal, await semaphore.acquire(signal));
+  }
+
+  async suspend<T>(operation: () => Promise<T>): Promise<T> {
+    await this.enqueue(() => {
+      if (this.closed) throw new AflVmError("RUN_CLOSED", "Agent execution lease has closed");
+      this.suspended += 1;
+      if (this.suspended === 1) {
+        this.release?.();
+        this.release = undefined;
+      }
+    });
+    try {
+      return await operation();
+    } finally {
+      await this.enqueue(async () => {
+        this.suspended -= 1;
+        if (this.suspended < 0) {
+          throw new AflVmError("VM_INTERNAL", "Agent execution lease suspension underflow");
+        }
+        if (this.suspended === 0 && !this.closed) {
+          this.release = await this.semaphore.acquire(this.signal);
+        }
+      });
+    }
+  }
+
+  async close(): Promise<void> {
+    await this.enqueue(() => {
+      this.closed = true;
+      this.release?.();
+      this.release = undefined;
+    });
+  }
+
+  private enqueue(operation: () => void | Promise<void>): Promise<void> {
+    const current = this.transition.then(operation, operation);
+    this.transition = current.then(() => {}, () => {});
+    return current;
+  }
+}
+
 function normalizeFlowResult(value: VmValue, span: SourceSpan): Frag {
   if (isFrag(value)) return value;
   if (isComputeValue(value)) return frag(formatCompute(value));
@@ -1590,45 +2388,190 @@ function toSymbol(expression: SymbolExpr): SymbolRef {
   return { kind: "symbol", name: expression.name };
 }
 
-function validateFreedomPlanShape(
-  plan: unknown,
-  mode: "move" | "flow",
-  span: SourceSpan,
-): asserts plan is FreedomPlan {
-  if (typeof plan !== "object" || plan === null || !("kind" in plan)) {
-    throw new AflVmError("FREEDOM_PLAN_INVALID", "Freedom binding returned an invalid plan", { span });
+function isVmHandle(value: VmValue): value is AgentHandle | MemoryHandle | TaskGroupHandle {
+  return isAgentHandle(value) || isMemoryHandle(value) || isTaskGroupLike(value);
+}
+
+function portableFlowResult(value: VmValue, span: SourceSpan): VmArgument {
+  if (isFrag(value)) return clonePortable(value);
+  if (isSymbolRef(value) || isVmHandle(value) || !isComputeValue(value)) {
+    throw new AflVmError("FLOW_RESULT_INVALID", "Freedom child result must be Frag or compute data", { span });
   }
-  const candidate = plan as Record<string, unknown>;
-  if (candidate.kind !== "move" && candidate.kind !== "flow" && candidate.kind !== "generated") {
-    throw new AflVmError("FREEDOM_PLAN_INVALID", "Freedom plan has an unknown kind", { span });
+  return structuredClone(value);
+}
+
+function portableControlValue(value: VmArgument): ComputeValue {
+  if (isFrag(value)) return { type: "frag", content: value.content };
+  if (isSymbolRef(value)) return { type: "symbol", name: value.name };
+  return structuredClone(value);
+}
+
+function portableControlKind(value: VmArgument): string {
+  if (isFrag(value)) return "frag";
+  if (isSymbolRef(value)) return "symbol";
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "list";
+  return typeof value === "object" ? "record" : typeof value;
+}
+
+function freedomInstructionMode(instruction: FreedomInstruction): FreedomMode {
+  return instruction.op === "freedom.route" ? "route" : "flow";
+}
+
+function freedomLimitsValue(limits: FreedomLimits): ComputeValue {
+  return {
+    min_routes: limits.minRoutes,
+    max_routes: limits.maxRoutes,
+  };
+}
+
+function controlResult(payload: ComputeValue): AgentControlToolResult {
+  return {
+    content: JSON.stringify(payload, null, 2),
+    details: structuredClone(payload),
+  };
+}
+
+function assertObjectInput(
+  input: Readonly<Record<string, unknown>>,
+  allowedFields: readonly string[],
+): void {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    throw new AflVmError("FREEDOM_TOOL_INPUT_INVALID", "AFL control tool input must be an object");
   }
-  if (candidate.args !== undefined &&
-      (!Array.isArray(candidate.args) || !candidate.args.every(isVmArgument))) {
-    throw new AflVmError("FREEDOM_PLAN_INVALID", "Freedom plan args are invalid", { span });
-  }
-  if (mode === "move" && candidate.kind !== "move") {
-    throw new AflVmError("FREEDOM_PLAN_KIND_INVALID", "freedom.move requires a move plan", { span });
-  }
-  if (mode === "flow" && candidate.kind === "move") {
-    throw new AflVmError("FREEDOM_PLAN_KIND_INVALID", "freedom.flow requires a flow plan", { span });
-  }
-  if (candidate.kind === "move" &&
-      (!isSymbolRef(candidate.move) || !candidate.move.name.startsWith("@move."))) {
-    throw new AflVmError("FREEDOM_PLAN_INVALID", "move plan requires an @move symbol", { span });
-  }
-  if (candidate.kind === "flow" &&
-      (!isSymbolRef(candidate.flow) || !candidate.flow.name.startsWith("@flow."))) {
-    throw new AflVmError("FREEDOM_PLAN_INVALID", "flow plan requires an @flow symbol", { span });
-  }
-  if (candidate.kind === "generated" &&
-      (typeof candidate.source !== "string" || candidate.source.trim().length === 0 ||
-       typeof candidate.entry !== "string" || candidate.entry.trim().length === 0)) {
-    throw new AflVmError("FREEDOM_PLAN_INVALID", "generated flow requires source and entry", { span });
+  const unknown = Object.keys(input).find((field) => !allowedFields.includes(field));
+  if (unknown !== undefined) {
+    throw new AflVmError("FREEDOM_TOOL_INPUT_INVALID", `unknown AFL control tool input field '${unknown}'`);
   }
 }
 
-function isVmArgument(value: unknown): value is VmArgument {
-  return isFrag(value) || isSymbolRef(value) || isComputeValue(value);
+function requiredString(input: Readonly<Record<string, unknown>>, field: string): string {
+  const value = input[field];
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new AflVmError("FREEDOM_TOOL_INPUT_INVALID", `'${field}' must be a non-empty string`);
+  }
+  return value;
+}
+
+function optionalString(input: Readonly<Record<string, unknown>>, field: string): string | undefined {
+  if (input[field] === undefined) return undefined;
+  return requiredString(input, field);
+}
+
+function resolveControlArguments(
+  input: unknown,
+  refs: ReadonlyMap<string, VmArgument>,
+): VmArgument[] {
+  if (input === undefined) return [];
+  if (!Array.isArray(input)) {
+    throw new AflVmError("FREEDOM_TOOL_INPUT_INVALID", "'args' must be an array");
+  }
+  return input.map((item, index) => {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) {
+      throw new AflVmError(
+        "FREEDOM_TOOL_INPUT_INVALID",
+        `argument ${index} must contain exactly one 'ref' or 'string' field`,
+      );
+    }
+    const candidate = item as Record<string, unknown>;
+    const keys = Object.keys(candidate);
+    if (keys.length !== 1) {
+      throw new AflVmError(
+        "FREEDOM_TOOL_INPUT_INVALID",
+        `argument ${index} must contain exactly one 'ref' or 'string' field`,
+      );
+    }
+    if (keys[0] === "string" && typeof candidate.string === "string") return candidate.string;
+    if (keys[0] !== "ref" || typeof candidate.ref !== "string" || candidate.ref.length === 0) {
+      throw new AflVmError(
+        "FREEDOM_TOOL_INPUT_INVALID",
+        `argument ${index} must contain exactly one 'ref' or 'string' field`,
+      );
+    }
+    const value = refs.get(candidate.ref);
+    if (value === undefined) {
+      throw new AflVmError("FREEDOM_REF_UNKNOWN", `controlled reference '${candidate.ref}' is unavailable`);
+    }
+    return clonePortable(value);
+  });
+}
+
+function diagnosticValues(diagnostics: readonly AflDiagnostic[]): ComputeValue[] {
+  return diagnostics.map((diagnostic) => ({
+    code: diagnostic.code,
+    message: diagnostic.message,
+    severity: diagnostic.severity ?? "error",
+    span: {
+      line: diagnostic.span.line,
+      column: diagnostic.span.column,
+      endColumn: diagnostic.span.endColumn,
+    },
+    ...(diagnostic.sourceName === undefined ? {} : { sourceName: diagnostic.sourceName }),
+  }));
+}
+
+function generatedDiagnostic(
+  code: string,
+  message: string,
+  span: SourceSpan = { line: 1, column: 1, endColumn: 1 },
+  severity?: "warning",
+): AflDiagnostic {
+  return {
+    code,
+    message,
+    ...(severity === undefined ? {} : { severity }),
+    span,
+    sourceName: "<freedom-generated>",
+  };
+}
+
+function validationNodeStub(node: AflNode): AflNode {
+  const span = { line: 0, column: 0, endColumn: 0 };
+  return {
+    name: node.name,
+    parameters: [...node.parameters],
+    blocks: [{
+      name: "entry",
+      instructions: [],
+      terminator: { op: "ret", span },
+      span,
+    }],
+    span,
+  };
+}
+
+function literalWorkspacePaths(
+  expression: ValueExpr | undefined,
+): { readonly primary: string; readonly readOnly: readonly string[] } | undefined {
+  if (expression?.kind === "literal" && typeof expression.value === "string") {
+    return { primary: expression.value, readOnly: [] };
+  }
+  if (expression?.kind !== "list") return undefined;
+  const paths = expression.items.map((item) =>
+    item.kind === "literal" && typeof item.value === "string" ? item.value : undefined);
+  if (paths.some((path) => path === undefined)) return undefined;
+  return { primary: paths[0]!, readOnly: paths.slice(1) as string[] };
+}
+
+function resolveWorkspaceLiteral(executionRoot: string, path: string): string {
+  return isAbsolute(path) ? resolve(path) : resolve(executionRoot, path);
+}
+
+function freedomWorkspaceConflict(
+  child: AgentWorkspaceSet,
+  writer: AgentWorkspaceSet,
+): { readonly child: string; readonly writer: string } | undefined {
+  for (const writerPath of [writer.primary, ...writer.readOnly]) {
+    if (workspacePathOverlap(child.primary.root, writerPath.root)) {
+      return { child: child.primary.root, writer: writerPath.root };
+    }
+  }
+  for (const childPath of child.readOnly) {
+    if (workspacePathOverlap(childPath.root, writer.primary.root)) {
+      return { child: childPath.root, writer: writer.primary.root };
+    }
+  }
+  return undefined;
 }
 
 function createRunId(): string {

@@ -57,6 +57,19 @@ name(arg0, arg1, ...):
         ...
 ```
 
+Freedom 可见的 Node 可以在 header 后用机器可读注释描述接口：
+
+```text
+worker(task):
+    # @description Execute one isolated task.
+    # @param task The task and necessary context.
+    # @returns A concise execution report.
+    entry:
+        ...
+```
+
+Parser 会把 `@description`、`@param` 和 `@returns` 保存进 IR；`@param` 必须引用签名中的真实参数。其他普通 `#` 注释仍只用于源码阅读。
+
 - 参数列表可以为空；
 - 每个 node 有一个 `entry` block；
 - node 内可以声明其他命名 block；
@@ -157,7 +170,7 @@ reviewer = agent @agent.reviewer, ["workers/reviewer/", "docs/", "src/"]
 reviewer = agent @agent.reviewer,, review_memory
 ```
 
-第二个 operand 固定表示 Workspace：单个路径是主工作区；列表第一项是主工作区，后续至少一项是只读工作区。只有主工作区时必须使用字符串形式。省略时主工作区为 AFL 执行根目录。第三个 operand 才是已有 Memory；省略 Workspace 但传入 Memory 时必须保留空的第二个位置，如 `agent @agent.reviewer,, review_memory`。
+第二个 operand 固定表示 Workspace：单个路径是主工作区；列表第一项是主工作区，后续至少一项是只读工作区。只有主工作区时必须使用字符串形式。省略时 VM 为这次 Agent allocation 在 `.afl/tmpworkspace/<run-id>/` 下分配稳定且互不重叠的主工作区。第三个 operand 才是已有 Memory；省略 Workspace 但传入 Memory 时必须保留空的第二个位置，如 `agent @agent.reviewer,, review_memory`。
 
 设置 system prompt：
 
@@ -331,21 +344,23 @@ branch = memory.apply coder, branch_memory
 
 ## 13. Freedom
 
-`freedom.move` 从显式候选 move 中选择并执行一步：
+`freedom.route` 临时向普通 planner Agent 暴露环境查询和既有 Node 调用工具：
 
 ```text
-result = freedom.move planner, moves, prompt, context
-result = freedom.move planner, moves, prompt, context, @schema.Result
+result = freedom.route planner, prompt, {min_routes: 1, max_routes: 2}, [node0, node1], {task: task, spec: spec}
 ```
 
-`freedom.flow` 选择已有 flow 或生成临时 child flow：
+`freedom.flow` 额外暴露 generated IR 的校验和执行工具：
 
 ```text
-result = freedom.flow planner, prompt, context
-result = freedom.flow planner, prompt, context, @schema.Result
+result = freedom.flow writer, prompt, {min_routes: 0, max_routes: 4}, [node0, node1], [@agent.fast, @agent.strong], {task: task}
 ```
 
-两种指令的业务结果都是 Frag。Schema 只约束其字符串编码。
+Node allowlist 只接受本 module 的 Node 名称；Flow 的 Agent allowlist 只接受 `@agent.*` symbol。`constraint` 是只含 `min_routes` 和 `max_routes` 的具名 record，两者分别要求本次 activation 至少和至多路由多少次；`min_routes` 可以为 0，`max_routes` 必须为正整数且不小于前者。并行度、超时和工具调用预算属于 VM policy，不进入 AFL 指令约束。
+
+受控参数也使用具名 record。Agent 只能通过 `{ref: "param:name"}` 选择显式参数或先前工具结果，也可以通过 `{string: "..."}` 传入自由文本。成功执行过 Node 或 generated IR 时，两种指令都返回 writer 的 final response Frag，且临时工具不会泄漏到该 Agent 后续的普通 `do`。VM 先检查已发起 route 是否满足 `min_routes`；通过后若没有成功执行任何 Node 或 IR，则返回空 Frag。环境查询和 IR 校验不算执行。
+
+Freedom activation 延续该 Agent 已有的 Memory 和 executor session，指令的 `prompt` 作为普通 user message 加入同一份 Memory。`environment.get` 不返回 AFL 语法；当前调用方可以在 `prompt` 中直接给出必要的最小语法，后续再由 AFL skill 提供完整语言知识。
 
 ## 14. 指令形式汇总
 
@@ -373,8 +388,8 @@ memory.append memory, role, frag
 dst = memory.copy memory
 dst = memory.apply source_agent, memory
 
-dst = freedom.move planner, moves, prompt, context [, schema]
-dst = freedom.flow planner, prompt, context [, schema]
+dst = freedom.route planner, prompt, constraint, [node ...], {param: value ...}
+dst = freedom.flow writer, prompt, constraint, [node ...], [agent_symbol ...], {param: value ...}
 
 jump target
 jump condition, true_target, false_target

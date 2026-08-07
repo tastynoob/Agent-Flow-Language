@@ -94,6 +94,96 @@ main():
   );
 });
 
+test("Pi scopes AFL control tools to one Freedom activation and restores binding tools", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "afl-pi-freedom-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const contexts = [];
+  faux.setResponses([
+    (context) => {
+      contexts.push({ tools: context.tools.map((tool) => tool.name), messages: context.messages.length });
+      assert.deepEqual(context.tools.map((tool) => tool.name), ["lookup"]);
+      assert.equal(lastUserText(context.messages), "seed");
+      assert.doesNotMatch(context.systemPrompt ?? "", /AFL Freedom Route activation/u);
+      return fauxAssistantMessage("seed-complete");
+    },
+    (context) => {
+      contexts.push({ tools: context.tools.map((tool) => tool.name), messages: context.messages.length });
+      assert.deepEqual(context.tools.map((tool) => tool.name), ["afl_environment_get", "afl_node_execute"]);
+      assert.match(context.tools[0].description, /Canonical AFL name: afl\.environment\.get/u);
+      assert.doesNotMatch(context.systemPrompt ?? "", /AFL Freedom Route activation/u);
+      assert.equal(messageTexts(context.messages).includes("seed"), true);
+      assert.equal(messageTexts(context.messages).includes("seed-complete"), true);
+      return fauxAssistantMessage(
+        fauxToolCall("afl_environment_get", {}, { id: "afl-environment" }),
+        { stopReason: "toolUse" },
+      );
+    },
+    (context) => {
+      contexts.push({ tools: context.tools.map((tool) => tool.name), messages: context.messages.length });
+      assert.equal(context.messages.some((message) => message.role === "toolResult"), true);
+      assert.deepEqual(context.tools.map((tool) => tool.name), ["afl_environment_get", "afl_node_execute"]);
+      assert.match(context.tools[1].description, /Canonical AFL name: afl\.node\.execute/u);
+      assert.doesNotMatch(context.systemPrompt ?? "", /AFL Freedom Route activation/u);
+      assert.equal(messageTexts(context.messages).includes("seed-complete"), true);
+      return fauxAssistantMessage("route-complete");
+    },
+    (context) => {
+      contexts.push({ tools: context.tools.map((tool) => tool.name), messages: context.messages.length });
+      assert.deepEqual(context.tools.map((tool) => tool.name), ["lookup"]);
+      assert.doesNotMatch(context.systemPrompt ?? "", /AFL Freedom Route activation/u);
+      assert.equal(messageTexts(context.messages).includes("seed-complete"), true);
+      assert.equal(context.messages.some((message) =>
+        message.role === "user" && message.content.some((part) => part.type === "text" && part.text === "route")), true);
+      assert.equal(context.messages.some((message) =>
+        message.role === "assistant" && message.content.some((part) =>
+          part.type === "text" && part.text === "route-complete")), true);
+      return fauxAssistantMessage("ordinary-complete");
+    },
+  ]);
+  const lookup = {
+    name: "lookup",
+    label: "Lookup",
+    description: "Ordinary binding tool",
+    parameters: Type.Object({ key: Type.String() }),
+    async execute() {
+      return { content: [{ type: "text", text: "unused" }], details: undefined };
+    },
+  };
+  const backend = new PiAgentExecutorBackend({
+    models,
+    agents: {
+      "@agent.planner": {
+        model: faux.getModel(),
+        tools: [lookup],
+      },
+    },
+  });
+  const vm = AflVm.fromSource(`
+main():
+    entry:
+        planner = agent @agent.planner
+        seeded = planner.do "seed"
+        routed = freedom.route planner, "route", {}, [], {}
+        ordinary = planner.do "ordinary"
+        ret ordinary
+`, { agentExecutor: backend });
+  const result = await vm.run("main", [], { executionRoot: root, runId: "pi-freedom" });
+  assert.equal(result.output.content, "ordinary-complete");
+  assert.equal(contexts.length, 4);
+
+  const state = await readMemoryState(root);
+  const continuation = Object.values(state.memories)[0].continuation.state.payload;
+  const serialized = JSON.stringify(continuation);
+  assert.match(serialized, /afl\.environment\.get/u);
+  assert.match(serialized, /afl_environment_get/u);
+  assert.match(serialized, /seed-complete/u);
+  assert.match(serialized, /route-complete/u);
+  assert.doesNotMatch(serialized, /AFL Freedom Route activation/u);
+});
+
 test("Pi session continuation persists tools and thinking and restores replay policy", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "afl-pi-continuation-"));
   t.after(() => rm(root, { recursive: true, force: true }));

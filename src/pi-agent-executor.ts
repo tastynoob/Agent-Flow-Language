@@ -26,11 +26,13 @@ import {
   type ImageContent,
   type Model,
   type Models,
+  type TSchema,
   type TextContent,
   type Usage,
 } from "@earendil-works/pi-ai";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import type {
+  AgentControlToolDescriptor,
   AgentExecutionEvent,
   AgentExecutionHost,
   AgentExecutionRequest,
@@ -180,7 +182,7 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
       readOnlyWorkspaceContext: true,
       structuredOutput: false,
       interrupt: true,
-      toolCallInterception: true,
+      dynamicControlTools: true,
       interactiveApproval: this.approval === "always",
       sandboxEnforcement: false,
     });
@@ -246,30 +248,44 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     try {
       await this.importMessages(record, pending.slice(0, -1));
       const unsubscribe = this.bindEvents(record, host);
-      const removeApproval = this.bindApproval(record.harness, request, host);
+      let restoreControlTools: (() => Promise<void>) | undefined;
+      let removeApproval: (() => void) | undefined;
+      let result: AgentExecutionResult;
       const abort = () => {
         void record.harness.abort().catch(() => {});
       };
-      request.signal.addEventListener("abort", abort, { once: true });
       try {
-        const result = request.signal.aborted
+        restoreControlTools = await this.configureControlTools(record, request, host);
+        removeApproval = this.bindApproval(record.harness, request, host);
+        request.signal.addEventListener("abort", abort, { once: true });
+        result = request.signal.aborted
           ? await this.cancelledResult(record)
           : await this.toResult(record, await record.harness.prompt(prompt.content));
-        if (result.stopReason !== "completed") {
-          await record.session.moveTo(preExecutionLeaf);
-          if (created) await this.deleteSession(record);
-          return {
-            output: result.output,
-            stopReason: result.stopReason,
-            ...(result.usage === undefined ? {} : { usage: result.usage }),
-          };
-        }
-        return result;
       } finally {
         request.signal.removeEventListener("abort", abort);
-        removeApproval();
+        removeApproval?.();
+        await restoreControlTools?.();
         unsubscribe();
       }
+      if (result.stopReason !== "completed") {
+        await record.session.moveTo(preExecutionLeaf);
+        if (created) await this.deleteSession(record);
+        return {
+          output: result.output,
+          stopReason: result.stopReason,
+          ...(result.usage === undefined ? {} : { usage: result.usage }),
+        };
+      }
+      const metadata = await record.session.getMetadata();
+      const checkpoint = await record.session.getLeafId();
+      return {
+        ...result,
+        session: {
+          backend: this.name,
+          id: metadata.id,
+          ...(checkpoint === null ? {} : { checkpoint }),
+        },
+      };
     } catch (error) {
       await record.session.moveTo(preExecutionLeaf);
       if (created) await this.deleteSession(record);
@@ -499,6 +515,51 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     return resolved.contextPrompt === undefined
       ? { ...resolved, contextPrompt: workspaceContextPrompt(workspace) }
       : resolved;
+  }
+
+  private async configureControlTools(
+    record: PiSessionRecord,
+    request: AgentExecutionRequest,
+    host: AgentExecutionHost,
+  ): Promise<(() => Promise<void>) | undefined> {
+    if (request.control === undefined) return undefined;
+    const baselineTools = record.harness.getTools();
+    const baselineActiveNames = record.harness.getActiveTools().map((tool) => tool.name);
+    const aliases = controlToolAliases(request.control.tools);
+    const reserved = baselineTools.find((tool) =>
+      tool.name.startsWith("afl.") || aliases.has(tool.name));
+    if (reserved !== undefined) {
+      throw new AgentExecutorError(
+        "AGENT_CAPABILITY_UNSUPPORTED",
+        `Agent binding cannot register reserved AFL control tool '${reserved.name}'`,
+      );
+    }
+    const controlTools = request.control.tools.map((descriptor): AgentHarnessTool<any> => ({
+      name: piControlToolName(descriptor.name),
+      label: descriptor.label,
+      description: `${descriptor.description} Canonical AFL name: ${descriptor.name}.`,
+      parameters: descriptor.inputSchema as TSchema,
+      executionMode: "parallel",
+      execute: async (toolCallId, params, signal) => {
+        const result = await host.executeControlTool({
+          id: toolCallId,
+          name: descriptor.name,
+          input: params as Readonly<Record<string, unknown>>,
+          signal: signal ?? request.signal,
+        });
+        return {
+          content: [{ type: "text", text: result.content }],
+          details: result.details ?? {},
+        };
+      },
+    }));
+    await record.harness.setTools(
+      [...baselineTools, ...controlTools],
+      controlTools.map((tool) => tool.name),
+    );
+    return async () => {
+      await record.harness.setTools(baselineTools, baselineActiveNames);
+    };
   }
 
   private requireSession(
@@ -1208,8 +1269,34 @@ function workspaceContextPrompt(workspace: AgentWorkspaceSet): string {
   return lines.join("\n");
 }
 
-function joinPrompts(left: string | undefined, right: string | undefined): string | undefined {
-  const parts = [left, right].filter((value): value is string => value !== undefined && value.length > 0);
+function controlToolAliases(tools: readonly AgentControlToolDescriptor[]): ReadonlySet<string> {
+  const aliases = new Set<string>();
+  for (const tool of tools) {
+    const alias = piControlToolName(tool.name);
+    if (aliases.has(alias)) {
+      throw new AgentExecutorError(
+        "AGENT_CAPABILITY_UNSUPPORTED",
+        `AFL control tools produce duplicate Pi alias '${alias}'`,
+      );
+    }
+    aliases.add(alias);
+  }
+  return aliases;
+}
+
+function piControlToolName(name: string): string {
+  const alias = name.replace(/[^a-zA-Z0-9_-]+/gu, "_");
+  if (alias.length === 0 || !/^[a-zA-Z0-9_-]+$/u.test(alias)) {
+    throw new AgentExecutorError(
+      "AGENT_CAPABILITY_UNSUPPORTED",
+      `AFL control tool '${name}' cannot be represented by the Pi executor`,
+    );
+  }
+  return alias;
+}
+
+function joinPrompts(...prompts: readonly (string | undefined)[]): string | undefined {
+  const parts = prompts.filter((value): value is string => value !== undefined && value.length > 0);
   return parts.length === 0 ? undefined : parts.join("\n\n");
 }
 

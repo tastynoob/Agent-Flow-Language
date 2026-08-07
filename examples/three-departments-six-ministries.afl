@@ -1,10 +1,9 @@
 # Simplified core Agent flow modeled after cft0808/edict.
 # Source: https://github.com/cft0808/edict
 #
-# This example covers Edict's conversational workflow, not its complete runtime.
-# It omits the dashboard, persistent task state, snapshots, event bus, audit log,
-# and stop/cancel/resume machinery. Department moves are supplied by bindings;
-# @move.edict.skip returns "not_assigned" without starting a department Agent.
+# AFL describes the workflow topology. Dashboards, persistent task state,
+# snapshots, event delivery, audit logs, and cancellation are VM concerns.
+# Each department is an ordinary documented Node selected through freedom.route.
 
 main(message):
     entry:
@@ -56,26 +55,12 @@ main(message):
         jump approved_3, assign, rejected
 
     assign:
-        shangshu = agent @agent.edict.shangshu
-        shangshu.sysprompt "You are Shangshu. Select the relevant departments, assign clear subtasks, coordinate execution, and combine their reports. When routing a department, choose its department move only if it has an assignment; otherwise choose @move.edict.skip."
+        shangshu = agent @agent.edict.shangshu, "workspaces/shangshu/"
+        shangshu.sysprompt "You are Shangshu. Select the relevant departments, assign clear subtasks, coordinate execution, and combine their reports. During routing, inspect the available Node interfaces and call only departments needed by the approved plan."
         assignment_prompt = prompt "Select departments and allocate the approved plan. Include enough context for each assigned department to work", execution_plan
         assignments = shangshu.do assignment_prompt
-        route_prompt = prompt "Choose one of the allowed moves for this department. Pass its complete assignment as move arguments when dispatching"
-        hubu_context = prompt "hubu handles data, resources, accounting, reports, and cost analysis", execution_plan, assignments
-        libu_context = prompt "libu handles documents, specifications, reports, and API documentation", execution_plan, assignments
-        bingbu_context = prompt "bingbu handles code, algorithms, implementation, bug fixes, and code review", execution_plan, assignments
-        xingbu_context = prompt "xingbu handles security, compliance, testing, and audit review", execution_plan, assignments
-        gongbu_context = prompt "gongbu handles CI/CD, deployment, tools, and infrastructure", execution_plan, assignments
-        libu_hr_context = prompt "libu_hr handles Agent registration, permissions, training, and organizational management", execution_plan, assignments
-        hubu_report = freedom.move shangshu, [@move.edict.hubu, @move.edict.skip], route_prompt, hubu_context
-        libu_report = freedom.move shangshu, [@move.edict.libu, @move.edict.skip], route_prompt, libu_context
-        bingbu_report = freedom.move shangshu, [@move.edict.bingbu, @move.edict.skip], route_prompt, bingbu_context
-        xingbu_report = freedom.move shangshu, [@move.edict.xingbu, @move.edict.skip], route_prompt, xingbu_context
-        gongbu_report = freedom.move shangshu, [@move.edict.gongbu, @move.edict.skip], route_prompt, gongbu_context
-        libu_hr_report = freedom.move shangshu, [@move.edict.libu_hr, @move.edict.skip], route_prompt, libu_hr_context
-        reports = prompt "Department reports in hubu, libu, bingbu, xingbu, gongbu, libu_hr order", hubu_report, libu_report, bingbu_report, xingbu_report, gongbu_report, libu_hr_report
-        summary_prompt = prompt "Combine the department reports in hubu, libu, bingbu, xingbu, gongbu, libu_hr order. Ignore not_assigned entries and report execution status and unresolved issues", execution_plan, assignments, reports
-        execution_summary = shangshu.do summary_prompt
+        route_prompt = prompt "Inspect the six department interfaces. Call every department that has an assignment, preferably in parallel when independent. Pass the approved plan and complete assignments by reference. After observing all reports, summarize execution status and unresolved issues", execution_plan, assignments
+        execution_summary = freedom.route shangshu, route_prompt, {min_routes: 1, max_routes: 6}, [hubu, libu, bingbu, xingbu, gongbu, libu_hr], {plan: execution_plan, assignments: assignments}
         memorial_prompt = prompt "Prepare the final report from the approved plan and Shangshu execution summary", triage_result, execution_plan, execution_summary
         memorial = zhongshu.do memorial_prompt
         reply_prompt = prompt "Return this final report to the user clearly and concisely", memorial
@@ -85,3 +70,75 @@ main(message):
     rejected:
         rejection = prompt "Menxia rejected the plan after three review rounds", review_result_3
         fail rejection
+
+hubu(plan, assignments):
+    # @description Handle data, resources, accounting, reports, and cost analysis.
+    # @param plan The approved execution plan.
+    # @param assignments The complete Shangshu department assignments.
+    # @returns Hubu execution report.
+    entry:
+        official = agent @agent.edict.hubu, "workspaces/hubu/"
+        official.sysprompt "You are Hubu. Execute only the finance, data, resource, accounting, reporting, and cost-analysis work assigned to Hubu."
+        task = prompt "Execute Hubu's assignment and report results, evidence, and unresolved issues", plan, assignments
+        report = official.do task
+        ret report
+
+libu(plan, assignments):
+    # @description Handle documents, specifications, reports, and API documentation.
+    # @param plan The approved execution plan.
+    # @param assignments The complete Shangshu department assignments.
+    # @returns Libu execution report.
+    entry:
+        official = agent @agent.edict.libu, "workspaces/libu/"
+        official.sysprompt "You are Libu. Execute only the documentation, specification, report, and API-documentation work assigned to Libu."
+        task = prompt "Execute Libu's assignment and report deliverables and unresolved issues", plan, assignments
+        report = official.do task
+        ret report
+
+bingbu(plan, assignments):
+    # @description Handle code, algorithms, implementation, bug fixes, and code review.
+    # @param plan The approved execution plan.
+    # @param assignments The complete Shangshu department assignments.
+    # @returns Bingbu execution report.
+    entry:
+        official = agent @agent.edict.bingbu, "workspaces/bingbu/"
+        official.sysprompt "You are Bingbu. Execute only the coding, algorithm, implementation, bug-fix, and code-review work assigned to Bingbu."
+        task = prompt "Execute Bingbu's assignment and report changes, verification, and unresolved issues", plan, assignments
+        report = official.do task
+        ret report
+
+xingbu(plan, assignments):
+    # @description Handle security, compliance, testing, and audit review.
+    # @param plan The approved execution plan.
+    # @param assignments The complete Shangshu department assignments.
+    # @returns Xingbu execution report.
+    entry:
+        official = agent @agent.edict.xingbu, "workspaces/xingbu/"
+        official.sysprompt "You are Xingbu. Execute only the security, compliance, testing, and audit work assigned to Xingbu."
+        task = prompt "Execute Xingbu's assignment and report findings, evidence, and unresolved risks", plan, assignments
+        report = official.do task
+        ret report
+
+gongbu(plan, assignments):
+    # @description Handle CI/CD, deployment, tools, and infrastructure.
+    # @param plan The approved execution plan.
+    # @param assignments The complete Shangshu department assignments.
+    # @returns Gongbu execution report.
+    entry:
+        official = agent @agent.edict.gongbu, "workspaces/gongbu/"
+        official.sysprompt "You are Gongbu. Execute only the CI/CD, deployment, tooling, and infrastructure work assigned to Gongbu."
+        task = prompt "Execute Gongbu's assignment and report changes, validation, and unresolved issues", plan, assignments
+        report = official.do task
+        ret report
+
+libu_hr(plan, assignments):
+    # @description Handle Agent registration, permissions, training, and organization.
+    # @param plan The approved execution plan.
+    # @param assignments The complete Shangshu department assignments.
+    # @returns Libu personnel execution report.
+    entry:
+        official = agent @agent.edict.libu_hr, "workspaces/libu-hr/"
+        official.sysprompt "You are Libu Personnel. Execute only Agent registration, permission, training, and organizational work assigned to Libu Personnel."
+        task = prompt "Execute Libu Personnel's assignment and report changes and unresolved issues", plan, assignments
+        report = official.do task
+        ret report

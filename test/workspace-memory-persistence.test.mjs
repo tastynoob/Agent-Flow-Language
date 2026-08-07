@@ -60,7 +60,8 @@ main():
         ret "done"
 `, {});
   await vm.run("main", [], { runId: "lazy-memory", executionRoot: root });
-  await assert.rejects(access(join(root, ".afl")), { code: "ENOENT" });
+  await assert.rejects(access(join(root, ".afl", "memory")), { code: "ENOENT" });
+  await access(join(root, ".afl", "tmpworkspace", "lazy-memory"));
 });
 
 test("Memory persistence binding can replace the directory or store", async (t) => {
@@ -124,7 +125,7 @@ test("input is durable before execution and output-save failure invalidates the 
       readOnlyWorkspaceContext: false,
       structuredOutput: false,
       interrupt: true,
-      toolCallInterception: false,
+      dynamicControlTools: false,
       interactiveApproval: false,
       sandboxEnforcement: false,
     },
@@ -171,7 +172,8 @@ main():
 `, {});
 
   await vm.run("main", [], { runId: "empty-copy", executionRoot: root });
-  await assert.rejects(access(join(root, ".afl")), { code: "ENOENT" });
+  await assert.rejects(access(join(root, ".afl", "memory")), { code: "ENOENT" });
+  await access(join(root, ".afl", "tmpworkspace", "empty-copy"));
 });
 
 test("memory.copy journals a base reference instead of duplicating source messages", async (t) => {

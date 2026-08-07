@@ -2,7 +2,7 @@
 
 AFL 是一种面向 Agent 工作流的描述语言，当前实现提供文本 IR、parser、semantic validator、dependency scheduler 和 TypeScript VM。
 
-文本 AFL 通过显式 VM bindings 连接 Agent、Prompt、Input、Script、Capability、外部 Flow、Formatter、Schema、Freedom 和 Trace 实现。当前格式为 v0，API 与文本格式可能继续调整。
+文本 AFL 通过显式 VM bindings 连接 Agent、Prompt、Input、Script、Capability、外部 Flow、Formatter、Schema 和 Trace 实现。Freedom 是 VM 向 Agent executor 临时注入的工作流控制能力，不使用单独的 Freedom binding。当前格式为 v0，API 与文本格式可能继续调整。
 
 AFL提供一种最小IR实现，并不提供高级描述，可以使用python、typescript等语言作为AFL IR generator前端，以提供更加便捷的表达方式
 
@@ -98,6 +98,8 @@ export default {
 完整 bindings 文件见 [`examples/pi-bindings.mjs`](examples/pi-bindings.mjs)。`defaultBinding` 可供所有 Agent symbol 使用；需要为 Coder、Reviewer 等选择不同模型或工具时，改用 `agents` map，以 `@agent.*` symbol 为 key。
 
 `createPiCodingAgentBinding` 显式启用 Pi core 的 `read`、`bash`、`edit` 和 `write` 工具，并为每个 Agent activation 按 AFL Workspace 创建执行上下文。工具的 `cwd` 是 Agent 主工作区；只读工作区作为上下文信息提供，目前尚无 OS 级只读 sandbox。默认也不加载 pi-coding-agent 的 CLI、extensions 或交互 UI。
+
+Agent 省略 Workspace 时，VM 不再让所有 Agent 共享执行根目录，而是按稳定 allocation identity 分配 `.afl/tmpworkspace/<run-id>/<allocation>/`。`freedom.route` 和 `freedom.flow` 执行 child Node/IR 时禁止 child Agent 与 planner/writer 产生 Workspace 写/读冲突；双方共享同一个只读目录仍然允许。静态可见的冲突由 validator 警告，实际执行前由 VM 强制拒绝。
 
 AFL canonical Memory 默认保存在执行根目录的 `.afl/memory/afl-<date>-<id>/`。`program.jsons` 记录 run header；每个真正进入过 `agent.do` 的 Memory 使用一份两空格缩进、对象间空行分隔的 `.jsons` pretty JSON stream。同一 `runId` 再次执行时会恢复对应 slot。Pi backend 在一次 `do` 内按完整语义消息流式追加 thinking、工具调用与工具结果；每个完整 JSON object 都可恢复，不依赖 `do.end`。`memory.copy` 使用 source file/revision 引用，不重复写入整段历史。这仍是 executor continuation，不是 VM snapshot。Pi backend 暂不支持带 schema 的 `do`。
 

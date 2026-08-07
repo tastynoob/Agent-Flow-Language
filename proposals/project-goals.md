@@ -89,8 +89,8 @@ prompt、Agent、move 和 flow 都应具有可声明的接口，可以作为参�
 
 语言应区分两个层级：
 
-- `freedom.move`：从当前暴露的 move、Agent 或子流程中选择下一步；
-- `freedom.flow`：组合或生成一个临时的 continuation flow。
+- `freedom.route`：让 planner 在当前指令显式列出的 Node 中选择并调用下一步；
+- `freedom.flow`：让 writer 在同一显式范围内组合、校验并执行临时 flow。
 
 `freedom` 至少接收以下上下文：
 
@@ -112,7 +112,7 @@ prompt、Agent、move 和 flow 都应具有可声明的接口，可以作为参�
 | 并发 | parallel、race、join、map、reduce、structured cancellation |
 | 事件 | on、emit、timer、external trigger、human input |
 | 可靠性 | retry、timeout、recover、compensate、checkpoint |
-| 动态性 | `freedom.move`、`freedom.flow`、受控 child flow |
+| 动态性 | `freedom.route`、`freedom.flow`、受控 child flow |
 | 组合 | function、pattern、module、generic、import/export |
 | 工程化 | trace、replay、test、mock、visualize、lint |
 

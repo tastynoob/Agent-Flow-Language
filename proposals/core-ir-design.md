@@ -18,7 +18,7 @@
 - Agent 默认绑定 memory，flow 可以 append Frag、copy memory，或把 memory apply 到新的 Agent；
 - 普通业务结果统一为 role-free Frag，Frag 的可见内容是字符串；
 - `prompt` 和 `input` 只产生 Frag，role 在使用 Frag 时决定；
-- `freedom.move` 与 `freedom.flow` 是开放式 fallback 指令，不只是一个全局权限开关；
+- `freedom.route` 与 `freedom.flow` 是 activation-scoped fallback 指令，不只是一个全局权限开关；
 - Prompt 和公共 flow 应能通过 package/library 传播与复用。
 
 ## 2. 从具体例子向通用模型扩展
@@ -33,7 +33,7 @@ Coder/Reviewer 只是验证语义的第一个例子，IR 不应把角色、审�
 - `dispatch/sync`，使两角色循环能扩展到独立的多部门和多候选任务；
 - `fork`，把 `memory.copy`、`memory.apply` 与首次工作组合为上下文继承操作；
 - `invoke`，使网络、MCP、skill 等能力不必逐一升级为核心 opcode；
-- `freedom.move/freedom.flow`，使固定图不能覆盖的任务仍有受控出口。
+- `freedom.route/freedom.flow`，使固定图不能覆盖的任务仍有受控出口。
 
 这种抽象不是要求所有 flow 都写成完全泛型。它只是避免用第一个案例的名词限制语言边界。
 
@@ -83,9 +83,9 @@ Agent 输出在来源 Memory 中具有 `assistant` role，但同一内容交给 
 
 ### 3.5 Freedom 区分 move 与 flow
 
-开放决策至少有两个不同尺度：从已暴露行为中选择下一步，以及现有行为不足时组合临时 flow。当前草案分别使用 `freedom.move` 和 `freedom.flow`，避免把二者压缩成一个含义模糊的返回值。
+开放决策至少有两个不同尺度：从已暴露 Node 中选择下一步，以及现有行为不足时组合临时 flow。当前设计分别使用 `freedom.route` 和 `freedom.flow`，并只在对应 Agent activation 内注入所需控制工具。
 
-两者都直接返回被选行为的执行结果，而不是只返回一段自然语言计划。Move 的候选集合和临时 flow 都需要经过接口、能力、预算和 policy 检查。
+两者都直接返回被选行为的执行结果，而不是只返回一段自然语言计划。Route 的候选集合和临时 flow 都需要经过接口、能力、预算和 policy 检查。
 
 长期 IR patch 或 self-modify 暂不与一次 fallback 混为同一语义；如果真实长期 Agent 案例需要，可以在临时 child flow 之上增加 revision 机制。
 

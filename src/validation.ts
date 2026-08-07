@@ -1,3 +1,5 @@
+import { resolve } from "node:path";
+
 import { AflValidationError, type AflDiagnostic } from "./errors.js";
 import {
   buildInstructionDependencies,
@@ -15,14 +17,16 @@ import type {
   FlowCallExpr,
   NameExpr,
   OperExpr,
+  RecordExpr,
   SourceSpan,
   ValueExpr,
 } from "./ir.js";
+import { workspacePathOverlap } from "./workspace.js";
 
 export interface ValidationSuccess {
   readonly ok: true;
   readonly value: AflModule;
-  readonly diagnostics: readonly [];
+  readonly diagnostics: readonly AflDiagnostic[];
 }
 
 export interface ValidationFailure {
@@ -47,8 +51,9 @@ export function validateModule(module: AflModule): ValidationResult {
   for (const node of module.nodes) {
     validateNode(module, node, nodes, diagnostics);
   }
-  return diagnostics.length === 0
-    ? { ok: true, value: module, diagnostics: [] }
+  const errors = diagnostics.filter((item) => item.severity !== "warning");
+  return errors.length === 0
+    ? { ok: true, value: module, diagnostics }
     : { ok: false, diagnostics };
 }
 
@@ -72,6 +77,17 @@ function validateNode(
       add(diagnostics, module, node.span, "PARAMETER_DUPLICATE", `parameter '${parameter}' is declared more than once`);
     }
     parameters.add(parameter);
+  }
+  for (const documented of Object.keys(node.documentation?.parameters ?? {})) {
+    if (!parameters.has(documented)) {
+      add(
+        diagnostics,
+        module,
+        node.span,
+        "NODE_DOCUMENTATION_PARAM_UNKNOWN",
+        `@param '${documented}' does not exist in node '${node.name}'`,
+      );
+    }
   }
 
   const blocks = new Map<string, AflBlock>();
@@ -105,6 +121,7 @@ function validateNode(
   }
   validateTaskGroups(module, node, kinds, diagnostics);
   validateMemoryBindings(module, node, diagnostics);
+  validateFreedomWorkspaceWarnings(module, node, nodes, diagnostics);
 }
 
 function collectDefinitions(
@@ -353,12 +370,72 @@ function validateInstructionKinds(
       expectNameKind(module, instruction.sourceAgent, kinds, ["agent", "unknown"], "memory.apply source", diagnostics);
       expectNameKind(module, instruction.memory, kinds, ["memory", "unknown"], "memory.apply Memory", diagnostics);
       break;
-    case "freedom.move":
+    case "freedom.route":
     case "freedom.flow":
       expectNameKind(module, instruction.planner, kinds, ["agent", "unknown"], "freedom planner", diagnostics);
+      validateFreedomConstraint(module, instruction.constraint, diagnostics);
+      for (const value of Object.values(instruction.constraint.entries)) {
+        expectKind(module, value, kinds, ["compute", "unknown"], "Freedom constraint", diagnostics);
+      }
+      for (const value of Object.values(instruction.params.entries)) {
+        expectKind(module, value, kinds, ["frag", "compute", "unknown"], "Freedom controlled param", diagnostics);
+      }
       break;
     default:
       break;
+  }
+}
+
+function validateFreedomConstraint(
+  module: AflModule,
+  constraint: RecordExpr,
+  diagnostics: AflDiagnostic[],
+): void {
+  const allowed = new Set(["min_routes", "max_routes"]);
+  for (const field of Object.keys(constraint.entries)) {
+    if (!allowed.has(field)) {
+      add(
+        diagnostics,
+        module,
+        constraint.entries[field]!.span,
+        "FREEDOM_CONSTRAINT_INVALID",
+        `unknown Freedom constraint '${field}'`,
+      );
+    }
+  }
+  const minimum = constraint.entries.min_routes;
+  const maximum = constraint.entries.max_routes;
+  if (minimum?.kind === "literal" &&
+      (typeof minimum.value !== "number" || !Number.isSafeInteger(minimum.value) || minimum.value < 0)) {
+    add(
+      diagnostics,
+      module,
+      minimum.span,
+      "FREEDOM_CONSTRAINT_INVALID",
+      "Freedom constraint 'min_routes' must be a non-negative integer",
+    );
+  }
+  if (maximum?.kind === "literal" &&
+      (typeof maximum.value !== "number" || !Number.isSafeInteger(maximum.value) || maximum.value <= 0)) {
+    add(
+      diagnostics,
+      module,
+      maximum.span,
+      "FREEDOM_CONSTRAINT_INVALID",
+      "Freedom constraint 'max_routes' must be a positive integer",
+    );
+  }
+  if (minimum?.kind === "literal" && typeof minimum.value === "number" &&
+      maximum?.kind === "literal" && typeof maximum.value === "number" &&
+      Number.isSafeInteger(minimum.value) && Number.isSafeInteger(maximum.value) &&
+      minimum.value >= 0 && maximum.value > 0 && minimum.value > maximum.value) {
+    add(
+      diagnostics,
+      module,
+      constraint.span,
+      "FREEDOM_CONSTRAINT_INVALID",
+      `Freedom constraint min_routes=${minimum.value} cannot exceed max_routes=${maximum.value}`,
+    );
   }
 }
 
@@ -428,6 +505,144 @@ function validateCall(
       add(diagnostics, module, call.span, "CALL_INVALID", "recursive call target has no blocks");
     }
   }
+  if (instruction.op === "freedom.route" || instruction.op === "freedom.flow") {
+    const seen = new Set<string>();
+    for (const candidate of instruction.nodes) {
+      if (seen.has(candidate.name)) {
+        add(
+          diagnostics,
+          module,
+          candidate.span,
+          "FREEDOM_NODE_DUPLICATE",
+          `Freedom Node '${candidate.name}' is listed more than once`,
+        );
+        continue;
+      }
+      seen.add(candidate.name);
+      if (!nodes.has(candidate.name)) {
+        add(
+          diagnostics,
+          module,
+          candidate.span,
+          "FREEDOM_NODE_UNKNOWN",
+          `Freedom Node '${candidate.name}' is not declared`,
+        );
+      }
+    }
+    if (instruction.op === "freedom.flow") {
+      const agents = new Set<string>();
+      for (const candidate of instruction.agents) {
+        if (agents.has(candidate.name)) {
+          add(
+            diagnostics,
+            module,
+            candidate.span,
+            "FREEDOM_AGENT_DUPLICATE",
+            `Freedom Agent '${candidate.name}' is listed more than once`,
+          );
+        }
+        agents.add(candidate.name);
+      }
+    }
+  }
+}
+
+function validateFreedomWorkspaceWarnings(
+  module: AflModule,
+  currentNode: AflNode,
+  nodes: ReadonlyMap<string, AflNode>,
+  diagnostics: AflDiagnostic[],
+): void {
+  const plannerWorkspaces = new Map<string, StaticWorkspaceSet>();
+  for (const block of currentNode.blocks) {
+    for (const instruction of block.instructions) {
+      if (instruction.op !== "agent") continue;
+      const workspace = staticWorkspaceSet(instruction.workspace);
+      if (workspace !== undefined) plannerWorkspaces.set(instruction.dst, workspace);
+    }
+  }
+  for (const block of currentNode.blocks) {
+    for (const instruction of block.instructions) {
+      if (instruction.op !== "freedom.route" && instruction.op !== "freedom.flow") continue;
+      const plannerWorkspace = plannerWorkspaces.get(instruction.planner.name);
+      if (plannerWorkspace === undefined) continue;
+      for (const candidate of instruction.nodes) {
+        const target = nodes.get(candidate.name);
+        if (target === undefined) continue;
+        const overlaps = collectStaticAgentWorkspaces(target, nodes, new Set())
+          .find((workspace) => staticWorkspaceConflict(workspace, plannerWorkspace));
+        if (overlaps === undefined) continue;
+        addWarning(
+          diagnostics,
+          module,
+          instruction.span,
+          "FREEDOM_WORKSPACE_OVERLAP",
+          `Freedom Node '${candidate.name}' contains an Agent Workspace that may overlap planner '${instruction.planner.name}'`,
+        );
+      }
+    }
+  }
+}
+
+function collectStaticAgentWorkspaces(
+  node: AflNode,
+  nodes: ReadonlyMap<string, AflNode>,
+  visited: Set<string>,
+): StaticWorkspaceSet[] {
+  if (visited.has(node.name)) return [];
+  visited.add(node.name);
+  const result: StaticWorkspaceSet[] = [];
+  for (const block of node.blocks) {
+    for (const instruction of block.instructions) {
+      if (instruction.op === "agent") {
+        const workspace = staticWorkspaceSet(instruction.workspace);
+        if (workspace !== undefined) result.push(workspace);
+      }
+      for (const target of localInstructionTargets(instruction)) {
+        const child = nodes.get(target);
+        if (child !== undefined) result.push(...collectStaticAgentWorkspaces(child, nodes, visited));
+      }
+    }
+  }
+  return result;
+}
+
+function localInstructionTargets(instruction: AflInstruction): string[] {
+  if (instruction.op === "call") {
+    return instruction.target.kind === "local" ? [instruction.target.name] : [];
+  }
+  if (instruction.op === "dispatch.list") {
+    return instruction.calls.filter((call) => call.target.kind === "local").map((call) => call.target.name);
+  }
+  if (instruction.op === "dispatch.batch") {
+    return instruction.target.kind === "local" ? [instruction.target.name] : [];
+  }
+  return [];
+}
+
+interface StaticWorkspaceSet {
+  readonly primary: string;
+  readonly readOnly: readonly string[];
+}
+
+function staticWorkspaceSet(expression: ValueExpr | undefined): StaticWorkspaceSet | undefined {
+  if (expression?.kind === "literal" && typeof expression.value === "string") {
+    return { primary: resolve("/__afl_execution_root__", expression.value), readOnly: [] };
+  }
+  if (expression?.kind !== "list") return undefined;
+  const paths = expression.items.map((item) =>
+    item.kind === "literal" && typeof item.value === "string"
+      ? resolve("/__afl_execution_root__", item.value)
+      : undefined);
+  if (paths.length < 2 || paths.some((path) => path === undefined)) return undefined;
+  return { primary: paths[0]!, readOnly: paths.slice(1) as string[] };
+}
+
+function staticWorkspaceConflict(child: StaticWorkspaceSet, writer: StaticWorkspaceSet): boolean {
+  if ([writer.primary, ...writer.readOnly].some((path) => workspacePathOverlap(child.primary, path))) {
+    return true;
+  }
+  return child.readOnly.some((path) => workspacePathOverlap(path, writer.primary));
 }
 
 function validateTaskGroups(
@@ -642,8 +857,13 @@ function expectKind(
   label: string,
   diagnostics: AflDiagnostic[],
 ): void {
-  if (expression.kind !== "name") return;
-  expectNameKind(module, expression, kinds, expected, label, diagnostics);
+  if (expression.kind === "name") {
+    expectNameKind(module, expression, kinds, expected, label, diagnostics);
+    return;
+  }
+  if (expression.kind === "symbol") {
+    add(diagnostics, module, expression.span, "VALUE_KIND_INVALID", `${label} requires ${expected.join(" or ")}, but the value is a symbol`);
+  }
 }
 
 function expectNameKind(
@@ -683,6 +903,22 @@ function add(
   diagnostics.push({
     code,
     message,
+    span,
+    ...(module.sourceName === undefined ? {} : { sourceName: module.sourceName }),
+  });
+}
+
+function addWarning(
+  diagnostics: AflDiagnostic[],
+  module: AflModule,
+  span: SourceSpan,
+  code: string,
+  message: string,
+): void {
+  diagnostics.push({
+    code,
+    message,
+    severity: "warning",
     span,
     ...(module.sourceName === undefined ? {} : { sourceName: module.sourceName }),
   });

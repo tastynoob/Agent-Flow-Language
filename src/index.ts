@@ -1,6 +1,7 @@
 export * from "./adapters.js";
 export * from "./agent-executor.js";
 export * from "./errors.js";
+export * from "./freedom.js";
 export * from "./ir.js";
 export * from "./memory.js";
 export * from "./memory-store.js";

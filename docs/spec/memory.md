@@ -181,7 +181,7 @@ Reviewer 只接收显式 Frag，不继承 Coder Memory。这可以减少历史�
 
 同一 Memory 上的 append 和 Agent 调用形成资源依赖，避免并发写入导致 Message 顺序不确定。
 
-不同 Agent 默认拥有不同 Memory，但默认也共享 AFL 执行根目录作为主工作区，因此涉及 Agent 执行时会被 Workspace lock 串行。需要并行工作时，应为它们指定互不重叠的主工作区；要分发相同上下文时可以分别 copy：
+不同 Agent 默认拥有不同 Memory；省略 Workspace 时，每次 Agent allocation 也会在 `.afl/tmpworkspace/<run-id>/` 下获得独立主工作区，因此互不依赖的 Agent 可以并行。需要固定目录或共享只读代码时，可以显式指定互不重叠的主工作区和公共只读工作区；要分发相同上下文时可以分别 copy：
 
 ```text
 security_memory = memory.copy coder.memory

@@ -201,13 +201,12 @@ route_task(task):
 
     fallback:
         planner = agent @agent.planner
-        freedom_prompt = prompt "Choose or construct a flow for this unresolved task"
-        context = prompt @prompt.freedom_context, task, route
-        result = freedom.flow planner, freedom_prompt, context
+        freedom_prompt = prompt "Use an existing Node or construct and validate a small AFL flow for this unresolved task", task, route
+        result = freedom.flow planner, freedom_prompt, {min_routes: 0, max_routes: 2}, [known_worker], [@agent.worker], {task: task}
         ret result
 ```
 
-`freedom.flow` 在已知路由无法覆盖任务时接管，并返回 role-free Frag。Freedom binding 返回的 plan 需要通过 mode 和结构检查；generated flow 还会经过 parser 与 validator，可选 policy 可以拒绝执行。
+`freedom.flow` 在已知路由无法覆盖任务时接管。VM 只在这次 writer activation 中注入环境查询、Node 调用、IR 校验和 IR 执行工具；候选 Node、Agent 与参数引用都来自指令本身。Generated IR 必须先通过同一 parser、validator、作用域和 policy 检查，child Agent 的主工作区还不能与 planner 重叠。指令最终返回 planner 的 final response role-free Frag。
 
 ## 12. 可复用 Flow 集
 

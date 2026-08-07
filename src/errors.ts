@@ -3,6 +3,7 @@ import type { ComputeValue, SourceSpan } from "./ir.js";
 export interface AflDiagnostic {
   readonly code: string;
   readonly message: string;
+  readonly severity?: "warning";
   readonly span: SourceSpan;
   readonly sourceName?: string;
 }

@@ -91,7 +91,7 @@ export interface AgentExecutorCapabilities {
   readonly readOnlyWorkspaceContext: boolean;
   readonly structuredOutput: boolean;
   readonly interrupt: boolean;
-  readonly toolCallInterception: boolean;
+  readonly dynamicControlTools: boolean;
   readonly interactiveApproval: boolean;
   readonly sandboxEnforcement: boolean;
 }
@@ -314,7 +314,7 @@ Pi、Codex、Claude Code 等 coding Agent 会修改文件，因此 Agent Memory 
 - session fork 通常只复制对话，不复制文件系统；
 - AFL `fork` 当前只承诺 Memory 隔离，不承诺 workspace 隔离。
 
-Workspace 已作为 Agent declaration 的第二个 operand 进入 IR，而不是独立 handle 或指令。VM 将路径规范化后通过 `AgentExecutionRequest.workspace` 传给 Backend，并用层次化 read/write lock 控制重叠路径；省略时使用 AFL execution root。Pi binding 保留模型和稳定配置，`createExecutionContext(workspace)` 按 session 创建 `NodeExecutionEnv`、tools 和 tool context，因此不再固定全局 `cwd`。
+Workspace 已作为 Agent declaration 的第二个 operand 进入 IR，而不是独立 handle 或指令。VM 将路径规范化后通过 `AgentExecutionRequest.workspace` 传给 Backend，并用层次化 read/write lock 控制重叠路径；省略时按稳定 allocation identity 使用 `.afl/tmpworkspace/<run-id>/` 下的独立目录。Pi binding 保留模型和稳定配置，`createExecutionContext(workspace)` 按 session 创建 `NodeExecutionEnv`、tools 和 tool context，因此不再固定全局 `cwd`。
 
 Workspace lock 只协调当前 VM 进程，read-only descriptor 也只是 executor 上下文，不是权限边界。Git worktree、容器、远程环境和 OS sandbox 仍由 host/backend 负责，不进入 AFL 文件系统编程语义。
 

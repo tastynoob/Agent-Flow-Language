@@ -3,9 +3,44 @@ import test from "node:test";
 
 import {
   AflParseError,
+  canonicalModuleDigest,
   parseAfl,
   validateModule,
 } from "../dist/src/index.js";
+
+test("Node documentation is validated and participates in the module digest", () => {
+  const first = parseAfl(`
+worker(task):
+    # @description Execute the task carefully.
+    # @param task The controlled task.
+    # @returns A report.
+    entry:
+        ret task
+`);
+  const second = parseAfl(`
+worker(task):
+    # @description Execute the task quickly.
+    # @param task The controlled task.
+    # @returns A report.
+    entry:
+        ret task
+`);
+  assert.deepEqual(first.nodes[0].documentation, {
+    description: "Execute the task carefully.",
+    parameters: { task: "The controlled task." },
+    returns: "A report.",
+  });
+  assert.notEqual(canonicalModuleDigest(first), canonicalModuleDigest(second));
+
+  const invalid = validateModule(parseAfl(`
+worker(task):
+    # @param missing This parameter is not in the signature.
+    entry:
+        ret task
+`));
+  assert.equal(invalid.ok, false);
+  assert.equal(invalid.diagnostics.some((item) => item.code === "NODE_DOCUMENTATION_PARAM_UNKNOWN"), true);
+});
 
 test("parser accepts the flow-oriented instruction surface", () => {
   const module = parseAfl(`
@@ -33,7 +68,7 @@ main(task):
         child = fork seed, child.do task
         memory = memory.copy child.memory
         applied = memory.apply child, memory
-        result = freedom.move applied, [@move.retry, @move.ask], reports, batch_reports
+        result = freedom.route applied, reports, {min_routes: 1, max_routes: 8}, [worker], {reports: reports, batch: batch_reports}
         ret result
     failed:
         fail "unexpected"
@@ -66,6 +101,18 @@ main(task):
 `), (error) => {
     assert.equal(error instanceof AflParseError, true);
     assert.equal(error.diagnostics[0].code, "PARSE_FORK_ACTION");
+    return true;
+  });
+
+  assert.throws(() => parseAfl(`
+main():
+    entry:
+        planner = agent @agent.planner
+        result = freedom.move planner, [], "route", "context"
+        ret result
+`), (error) => {
+    assert.equal(error instanceof AflParseError, true);
+    assert.equal(error.diagnostics[0].code, "PARSE_OPCODE");
     return true;
   });
 });

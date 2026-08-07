@@ -26,7 +26,11 @@ if ((command !== "validate" && command !== "run") || file === undefined) {
     if (command === "validate") {
       const result = validateModule(module);
       if (result.ok) {
-        process.stdout.write(`${JSON.stringify({ valid: true, nodes: result.value.nodes.map((node) => node.name) })}\n`);
+        process.stdout.write(`${JSON.stringify({
+          valid: true,
+          nodes: result.value.nodes.map((node) => node.name),
+          ...(result.diagnostics.length === 0 ? {} : { diagnostics: result.diagnostics }),
+        }, null, result.diagnostics.length === 0 ? 0 : 2)}\n`);
       } else {
         process.stdout.write(`${JSON.stringify({ valid: false, diagnostics: result.diagnostics }, null, 2)}\n`);
         process.exitCode = 1;
