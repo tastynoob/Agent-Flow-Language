@@ -383,7 +383,7 @@ dst = shell "command" [, value ...]
 dst = call flow [, value ...]
 dst = dispatch [flow_call, flow_call, ...]
 dst = dispatch count, flow, task
-dst = fork source_agent, dst.do [role,] frag [, schema]
+dst = fork source_agent, dst.do frag
 dst = sync task_group [, formatter]
 dst = invoke symbol [, value ...]
 

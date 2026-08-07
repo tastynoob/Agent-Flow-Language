@@ -1,26 +1,20 @@
-# AFL Documentation
+# AFL 文档
 
-Agent Flow Language（AFL）是项目正式名称。本目录只描述当前 AFL parser、validator、VM 和 CLI 已实现的行为。AFL IR 仍处于 v0 阶段，但本文档中的语法和语义均应能在当前实现中解析、验证或执行。
+本目录只记录 AFL v0 当前支持的语言与运行行为。
 
-## IR 规范
+## 开始使用
 
-- [IR 概览](spec/ir.md)
-- [文本语法](spec/syntax.md)
-- [执行语义](spec/semantics.md)
-- [Memory 语义](spec/memory.md)
+- [Agent 参考技能](SKILL.md)：供 Agent 编写、审查和移植 AFL 工作流及 binding 的完整指南
+- [快速开始](guides/getting-started.md)：安装、验证和执行第一个工作流
+- [示例集](guides/examples.md)：常用指令与组合方式
+- [并行投票](guides/parallel-voting.md)：并行派发与结果汇合
+- [Agent 工具安全](guides/agent-security.md)：工具策略、人工请求与沙箱
 
-## 使用示例
+## 语言规范
 
-- [AFL IR 示例](guides/examples.md)
-- [Parallel Voting](guides/parallel-voting.md)
-- [Agent 工具安全与 Bubblewrap](guides/agent-security.md)
+- [IR 概览](spec/ir.md)：结构、值类别、指令和绑定边界
+- [文本语法](spec/syntax.md)：AFL 文件的合法写法
+- [执行语义](spec/semantics.md)：控制流、依赖调度与运行规则
+- [Memory 语义](spec/memory.md)：Message、Memory、复制、分支与持久化
 
-## VM 与 CLI
-
-VM 的最小命令为：
-
-```text
-afl-vm <bindings-module> <flow.afl>
-```
-
-VM 默认执行无参 `main()`。完整参数和 bindings module 约定见项目 [README](../README.md#afl-vm)。
+规范文档是当前行为的主要依据；示例用于说明组合方式，不能覆盖规范中的约束。

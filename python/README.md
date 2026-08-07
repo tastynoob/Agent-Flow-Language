@@ -1,5 +1,5 @@
 # Legacy Python Frontend
 
-This package belongs to the earlier Structured HIR experiment. It does not generate or execute the current AFL IR described in [`docs/`](../docs/core-ir-draft.md).
+This package belongs to the earlier Structured HIR experiment. It does not generate or execute the AFL IR described in the [current documentation](../docs/README.md).
 
-The package is retained only with the legacy source and tests while the new IR semantics are being designed. Its API and serialized output are not part of the current AFL specification.
+The package is retained as a legacy snapshot with its existing tests. Its API and serialized output are not part of the current AFL specification.
