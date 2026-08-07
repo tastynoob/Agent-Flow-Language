@@ -89,7 +89,7 @@ prompt、Agent、move 和 flow 都应具有可声明的接口，可以作为参�
 
 语言应区分两个层级：
 
-- `freedom.route`：让 planner 在当前指令显式列出的 Node 中选择并调用下一步；
+- `freedom.route`：让 planner 在当前指令显式列出的 Node 中选择动态 dispatch，返回可由 `sync` 管理的 TaskGroup；
 - `freedom.flow`：让 writer 在同一显式范围内组合、校验并执行临时 flow。
 
 `freedom` 至少接收以下上下文：

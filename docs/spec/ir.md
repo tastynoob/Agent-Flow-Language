@@ -66,6 +66,7 @@ Basic block 内的指令不因文本相邻而自动串行。VM 从名称引用�
 
 - `dispatch [flow_a(...), flow_b(...)]` 启动一组显式调用；
 - `dispatch count, flow, task` 启动 `count` 个同构调用；
+- `freedom.route` 让 planner 从显式候选 Node 中构造动态 TaskGroup；
 - `sync` 等待 TaskGroup 并收集结果；
 - `fork` 复制 source Agent 的 Memory，创建 branch Agent，并立即执行一次 `do`。
 

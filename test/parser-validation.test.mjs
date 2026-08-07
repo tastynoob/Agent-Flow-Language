@@ -68,7 +68,8 @@ main(task):
         child = fork seed, child.do task
         memory = memory.copy child.memory
         applied = memory.apply child, memory
-        result = freedom.route applied, reports, {min_routes: 1, max_routes: 8}, [worker], {reports: reports, batch: batch_reports}
+        routed = freedom.route applied, reports, {min_routes: 1, max_routes: 8}, [worker], {reports: reports, batch: batch_reports}
+        result = sync routed
         ret result
     failed:
         fail "unexpected"
@@ -249,6 +250,28 @@ main(task):
   assert.equal(codes.has("FORK_RECEIVER_MISMATCH"), true);
   assert.equal(codes.has("CALL_ARITY"), true);
   assert.equal(codes.has("TASK_GROUP_UNCONSUMED"), true);
+});
+
+test("freedom.route produces a TaskGroup that must be synced", () => {
+  const invalid = validateModule(parseAfl(`
+main():
+    entry:
+        planner = agent @agent.planner
+        jobs = freedom.route planner, "route", {}, [], {}
+        ret "done"
+`));
+  assert.equal(invalid.ok, false);
+  assert.equal(invalid.diagnostics.some((item) => item.code === "TASK_GROUP_UNCONSUMED"), true);
+
+  const valid = validateModule(parseAfl(`
+main():
+    entry:
+        planner = agent @agent.planner
+        jobs = freedom.route planner, "route", {}, [], {}
+        reports = sync jobs
+        ret reports
+`));
+  assert.equal(valid.ok, true);
 });
 
 test("validator rejects obviously bound or multiply-bound Memory", () => {

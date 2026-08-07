@@ -264,6 +264,8 @@ toolResult
 
 Pi Agent Core 的 session 比这更丰富。除了 Message entry，它还保存 model、thinking level、active tools、compaction、branch summary、custom message、label 和当前 leaf 等树形状态；AgentMessage 还可以出现 `bashExecution`、`custom`、`branchSummary`、`compactionSummary` 等扩展 role。AFL 不直接复制 Pi 自带的 session 文件格式，而由 Pi executor codec 将恢复所需信息写入 AFL 的语义化 message records。
 
+其中 `{"type":"session.tools","names":[...]}` 是 Pi `active_tools_change` 的投影，只表示当时激活的工具名称。工具实现、description 和 input schema 仍由 binding 或当前 Freedom activation 在运行时构造，不作为 Memory descriptor 快照重复保存。恢复 continuation 后，这些名称只保留为历史 session 状态；下一次 activation 实际可用的工具定义仍从当前 binding/VM 重建。这与当前不提供完整 VM snapshot 恢复的边界一致。
+
 当前 AFL Pi backend 使用 `InMemorySessionRepo`，由 VM 把完整的 message records 追加到对应 Memory 文件，而不让 Pi 在各 Workspace 下另建 session 文件。AFL 与 Pi 的转换边界分成两层：
 
 - AFL Memory 可以保存任意字符串 role；

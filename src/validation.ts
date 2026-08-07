@@ -654,7 +654,7 @@ function validateTaskGroups(
   const groups = new Map<string, SourceSpan>();
   for (const block of node.blocks) {
     for (const instruction of block.instructions) {
-      if (instruction.op === "dispatch.list" || instruction.op === "dispatch.batch") {
+      if (isTaskGroupProducer(instruction)) {
         groups.set(instruction.dst, instruction.span);
       }
     }
@@ -685,7 +685,7 @@ function validateTaskGroupPaths(
     const block = blocks.get(state.block);
     if (block === undefined) continue;
     const defines = block.instructions.some((instruction) =>
-      (instruction.op === "dispatch.list" || instruction.op === "dispatch.batch") && instruction.dst === name
+      isTaskGroupProducer(instruction) && instruction.dst === name
     );
     const syncs = block.instructions.filter((instruction) =>
       instruction.op === "sync" && instruction.taskGroup.name === name
@@ -830,6 +830,7 @@ function instructionResultKind(instruction: AflInstruction): ValueKind {
       return "memory";
     case "dispatch.list":
     case "dispatch.batch":
+    case "freedom.route":
       return "taskGroup";
     case "oper":
     case "script":
@@ -837,6 +838,13 @@ function instructionResultKind(instruction: AflInstruction): ValueKind {
     default:
       return "frag";
   }
+}
+
+function isTaskGroupProducer(
+  instruction: AflInstruction,
+): instruction is Extract<AflInstruction, { readonly op: "dispatch.list" | "dispatch.batch" | "freedom.route" }> {
+  return instruction.op === "dispatch.list" || instruction.op === "dispatch.batch" ||
+    instruction.op === "freedom.route";
 }
 
 function terminatorReferences(terminator: AflTerminator): NameExpr[] {

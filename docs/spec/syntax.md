@@ -344,13 +344,16 @@ branch = memory.apply coder, branch_memory
 
 ## 13. Freedom
 
-`freedom.route` 临时向普通 planner Agent 暴露环境查询和既有 Node 调用工具：
+`freedom.route` 临时向普通 planner Agent 暴露环境查询和动态路由登记工具，并返回 TaskGroup：
 
 ```text
-result = freedom.route planner, prompt, {min_routes: 1, max_routes: 2}, [node0, node1], {task: task, spec: spec}
+jobs = freedom.route planner, prompt, {min_routes: 1, max_routes: 2}, [node0, node1], {task: task, spec: spec}
+reports = sync jobs
 ```
 
-`freedom.flow` 额外暴露 generated IR 的校验和执行工具：
+Planner 通过 `afl.route.add` 登记 Node 调用；Node 在 planner activation 完成后由 VM 按 dispatch policy 启动，不把结果隐式交回 planner。`sync` 负责等待、格式化结果和传播 child failure。
+
+`freedom.flow` 暴露环境查询、既有 Node 执行以及 generated IR 的校验和执行工具：
 
 ```text
 result = freedom.flow writer, prompt, {min_routes: 0, max_routes: 4}, [node0, node1], [@agent.fast, @agent.strong], {task: task}
@@ -358,7 +361,7 @@ result = freedom.flow writer, prompt, {min_routes: 0, max_routes: 4}, [node0, no
 
 Node allowlist 只接受本 module 的 Node 名称；Flow 的 Agent allowlist 只接受 `@agent.*` symbol。`constraint` 是只含 `min_routes` 和 `max_routes` 的具名 record，两者分别要求本次 activation 至少和至多路由多少次；`min_routes` 可以为 0，`max_routes` 必须为正整数且不小于前者。并行度、超时和工具调用预算属于 VM policy，不进入 AFL 指令约束。
 
-受控参数也使用具名 record。Agent 只能通过 `{ref: "param:name"}` 选择显式参数或先前工具结果，也可以通过 `{string: "..."}` 传入自由文本。成功执行过 Node 或 generated IR 时，两种指令都返回 writer 的 final response Frag，且临时工具不会泄漏到该 Agent 后续的普通 `do`。VM 先检查已发起 route 是否满足 `min_routes`；通过后若没有成功执行任何 Node 或 IR，则返回空 Frag。环境查询和 IR 校验不算执行。
+受控参数也使用具名 record。Agent 可以通过 `{ref: "param:name"}` 选择显式参数，也可以通过 `{string: "..."}` 传入自由文本；Flow writer 还可以引用本次 activation 中先前工具产生的结果。Route planner 完成后，VM 检查已登记 route 是否满足 `min_routes` 并返回 TaskGroup；零 route 对应合法的空 TaskGroup。Flow 成功执行过 Node 或 generated IR 时返回 writer 的 final response Frag，未成功执行任何内容时返回空 Frag。临时工具都不会泄漏到该 Agent 后续的普通 `do`。
 
 Freedom activation 延续该 Agent 已有的 Memory 和 executor session，指令的 `prompt` 作为普通 user message 加入同一份 Memory。`environment.get` 不返回 AFL 语法；当前调用方可以在 `prompt` 中直接给出必要的最小语法，后续再由 AFL skill 提供完整语言知识。
 

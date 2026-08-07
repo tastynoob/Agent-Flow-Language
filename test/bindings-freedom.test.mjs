@@ -82,20 +82,29 @@ main():
   assert.equal(seen.formatter, true);
 });
 
-test("freedom.route exposes scoped tools and executes an allowed Node by reference", async (t) => {
+test("freedom.route registers allowed Nodes and returns a TaskGroup", async (t) => {
   const root = await temporaryRoot(t);
   const workspaces = new Map();
   const seenTools = [];
   const failures = [];
   let activations = 0;
   let nodeApprovals = 0;
+  let departmentStarted = false;
   const backend = controlBackend(async (request, host) => {
     workspaces.set(request.agent.name, request.workspace.primary.root);
     if (request.agent.name === "@agent.department") {
+      departmentStarted = true;
       assert.equal(request.control, undefined);
       return completed(`department:${request.memory.at(-1).content}`);
     }
     seenTools.push(request.control?.tools.map((tool) => tool.name) ?? []);
+    const tools = Object.fromEntries(request.control.tools.map((tool) => [tool.name, tool]));
+    assert.match(tools["afl.environment.get"].description, /already supplied by the user/u);
+    assert.match(tools["afl.route.add"].description, /args are positional/u);
+    assert.match(tools["afl.route.add"].description, /never the child result/u);
+    assert.match(tools["afl.route.add"].description, /directly without afl\.environment\.get/u);
+    assert.match(tools["afl.route.add"].description, /\{"ref":"param:<name>"\}/u);
+    assert.match(tools["afl.route.add"].inputSchema.properties.args.description, /signature order/u);
     const environment = await host.executeControlTool({
       id: "environment",
       name: "afl.environment.get",
@@ -106,6 +115,7 @@ test("freedom.route exposes scoped tools and executes an allowed Node by referen
     assert.equal(view.ok, true);
     assert.equal(view.environment.nodes[0].description, "Handle one department task.");
     assert.equal(view.environment.parameters[0].ref, "param:task");
+    assert.equal(Object.hasOwn(view.environment, "tools"), false);
     assert.deepEqual(view.environment.constraints, {
       requested: { min_routes: 1, max_routes: 1 },
       effective: { min_routes: 1, max_routes: 1 },
@@ -113,24 +123,25 @@ test("freedom.route exposes scoped tools and executes an allowed Node by referen
 
     const bad = await host.executeControlTool({
       id: "bad-ref",
-      name: "afl.node.execute",
+      name: "afl.route.add",
       input: { node: "department", args: [{ ref: "param:missing" }] },
       signal: request.signal,
     });
     failures.push(JSON.parse(bad.content).error.code);
-    const executed = await host.executeControlTool({
+    const registered = await host.executeControlTool({
       id: "department-call",
-      name: "afl.node.execute",
+      name: "afl.route.add",
       input: { node: "department", args: [{ ref: "param:task" }] },
       signal: request.signal,
     });
-    const result = JSON.parse(executed.content);
+    const result = JSON.parse(registered.content);
     assert.equal(result.ok, true);
-    assert.equal(result.ref, "result:1");
-    assert.deepEqual(result.value, { type: "frag", content: "department:edict" });
+    assert.equal(result.route, "route:1");
+    assert.equal(result.node, "department");
+    assert.equal(departmentStarted, false);
     const overflow = await host.executeControlTool({
       id: "department-overflow",
-      name: "afl.node.execute",
+      name: "afl.route.add",
       input: { node: "department", args: [{ ref: "param:task" }] },
       signal: request.signal,
     });
@@ -149,8 +160,9 @@ department(task):
 main(task):
     entry:
         planner = agent @agent.planner
-        result = freedom.route planner, "choose", {min_routes: 1, max_routes: 1}, [department], {task: task}
-        ret result
+        jobs = freedom.route planner, "choose", {min_routes: 1, max_routes: 1}, [department], {task: task}
+        reports = sync jobs
+        ret reports
 `, {
     agentExecutor: backend,
     policy: {
@@ -171,8 +183,8 @@ main(task):
     executionRoot: root,
     maxSteps: 1_000,
   });
-  assert.equal(result.output.content, "route-complete");
-  assert.deepEqual(seenTools, [["afl.environment.get", "afl.node.execute"]]);
+  assert.deepEqual(JSON.parse(result.output.content), ["department:edict"]);
+  assert.deepEqual(seenTools, [["afl.environment.get", "afl.route.add"]]);
   assert.deepEqual(failures, ["FREEDOM_REF_UNKNOWN", "FREEDOM_ROUTE_MAX_EXCEEDED"]);
   assert.equal(activations, 1);
   assert.equal(nodeApprovals, 1);
@@ -189,8 +201,9 @@ test("Freedom derives its control scope only from the instruction op", async (t)
 main():
     entry:
         planner = agent @agent.planner
-        result = freedom.route planner, "route", {}, [], {}
-        ret result
+        jobs = freedom.route planner, "route", {}, [], {}
+        reports = sync jobs
+        ret reports
 `);
   const instruction = module.nodes[0].blocks[0].instructions.find((item) =>
     item.op === "freedom.route");
@@ -202,7 +215,7 @@ main():
     agentExecutor: controlBackend(async (request) => {
       assert.deepEqual(
         request.control?.tools.map((tool) => tool.name),
-        ["afl.environment.get", "afl.node.execute"],
+        ["afl.environment.get", "afl.route.add"],
       );
       return completed("no route selected");
     }),
@@ -214,11 +227,11 @@ main():
     },
   });
   const result = await vm.run("main", [], { executionRoot: root, runId: "op-only-mode" });
-  assert.deepEqual(result.output, frag(""));
+  assert.deepEqual(result.output, frag("[]"));
   assert.equal(authorizedMode, "route");
 });
 
-test("freedom.route can execute independent Node tool calls in parallel", async (t) => {
+test("freedom.route can use its injected tool contract without an environment lookup", async (t) => {
   const root = await temporaryRoot(t);
   let active = 0;
   let maximumActive = 0;
@@ -240,16 +253,20 @@ test("freedom.route can execute independent Node tool calls in parallel", async 
       active -= 1;
       return completed(request.agent.name);
     }
+    assert.match(
+      request.control.tools.find((tool) => tool.name === "afl.route.add").description,
+      /Call once for each desired TaskGroup job/u,
+    );
     const calls = await Promise.all([
       host.executeControlTool({
         id: "first",
-        name: "afl.node.execute",
+        name: "afl.route.add",
         input: { node: "first", args: [] },
         signal: request.signal,
       }),
       host.executeControlTool({
         id: "second",
-        name: "afl.node.execute",
+        name: "afl.route.add",
         input: { node: "second", args: [] },
         signal: request.signal,
       }),
@@ -271,8 +288,9 @@ second():
 main():
     entry:
         planner = agent @agent.planner
-        result = freedom.route planner, "route both", {min_routes: 2, max_routes: 2}, [first, second], {}
-        ret result
+        jobs = freedom.route planner, "route both", {min_routes: 2, max_routes: 2}, [first, second], {}
+        reports = sync jobs
+        ret reports
 `, {
     agentExecutor: backend,
     policy: { maxConcurrency: 2 },
@@ -282,8 +300,77 @@ main():
     runId: "parallel-route",
     signal: AbortSignal.timeout(2_000),
   });
-  assert.equal(result.output.content, "parallel-complete");
+  assert.deepEqual(JSON.parse(result.output.content), ["@agent.first", "@agent.second"]);
   assert.equal(maximumActive, 2);
+});
+
+test("freedom.route defers child failure to sync", async (t) => {
+  const root = await temporaryRoot(t);
+  const backend = controlBackend(async (request, host) => {
+    const registered = await host.executeControlTool({
+      id: "failing",
+      name: "afl.route.add",
+      input: { node: "failing", args: [] },
+      signal: request.signal,
+    });
+    assert.equal(JSON.parse(registered.content).ok, true);
+    return completed("routing finished");
+  });
+  const vm = AflVm.fromSource(`
+failing():
+    entry:
+        fail "child failed"
+main():
+    entry:
+        planner = agent @agent.planner
+        jobs = freedom.route planner, "route", {min_routes: 1, max_routes: 1}, [failing], {}
+        reports = sync jobs
+        ret reports
+`, { agentExecutor: backend });
+  await assert.rejects(
+    vm.run("main", [], { executionRoot: root, runId: "route-child-failure" }),
+    { code: "FLOW_FAILED", message: "child failed" },
+  );
+});
+
+test("freedom.flow executes a Node immediately and returns the writer summary", async (t) => {
+  const root = await temporaryRoot(t);
+  let childCompleted = false;
+  const backend = controlBackend(async (request, host) => {
+    if (request.control === undefined) {
+      childCompleted = true;
+      return completed(`department:${request.memory.at(-1).content}`);
+    }
+    assert.deepEqual(
+      request.control.tools.map((tool) => tool.name),
+      ["afl.environment.get", "afl.node.execute", "afl.ir.validate", "afl.ir.execute"],
+    );
+    const executed = await host.executeControlTool({
+      id: "department",
+      name: "afl.node.execute",
+      input: { node: "department", args: [{ ref: "param:task" }] },
+      signal: request.signal,
+    });
+    const result = JSON.parse(executed.content);
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.value, { type: "frag", content: "department:job" });
+    assert.equal(childCompleted, true);
+    return completed("flow-summary");
+  });
+  const vm = AflVm.fromSource(`
+department(task):
+    entry:
+        worker = agent @agent.department
+        result = worker.do task
+        ret result
+main():
+    entry:
+        writer = agent @agent.writer
+        summary = freedom.flow writer, "execute", {min_routes: 1, max_routes: 1}, [department], [], {task: "job"}
+        ret summary
+`, { agentExecutor: backend });
+  const result = await vm.run("main", [], { executionRoot: root, runId: "flow-node-execute" });
+  assert.equal(result.output.content, "flow-summary");
 });
 
 test("freedom.flow validates and executes scoped IR without leaking tools into ordinary do", async (t) => {
@@ -304,7 +391,7 @@ test("freedom.flow validates and executes scoped IR without leaking tools into o
     const environment = JSON.parse((await host.executeControlTool({
       id: "environment",
       name: "afl.environment.get",
-      input: { include: ["nodes", "tools"] },
+      input: { include: ["nodes"] },
       signal: request.signal,
     })).content);
     assert.deepEqual(environment.environment.nodes.map((node) => node.name), ["department"]);
@@ -416,8 +503,9 @@ department(task):
 main():
     entry:
         planner = agent @agent.planner, ["planner", "shared"]
-        result = freedom.route planner, "plan", {}, [department], {}
-        ret result
+        jobs = freedom.route planner, "plan", {}, [department], {}
+        reports = sync jobs
+        ret reports
 `;
   const validation = validateModule(parseAfl(source));
   assert.equal(validation.ok, true);
@@ -431,21 +519,22 @@ main():
     }
     const response = await host.executeControlTool({
       id: "overlap",
-      name: "afl.node.execute",
+      name: "afl.route.add",
       input: { node: "department", args: [{ string: "task" }] },
       signal: request.signal,
     });
     const result = JSON.parse(response.content);
-    assert.equal(result.ok, false);
-    assert.equal(result.error.code, "FREEDOM_WORKSPACE_OVERLAP");
+    assert.equal(result.ok, true);
     return completed("overlap-handled");
   });
-  const result = await AflVm.fromSource(source, { agentExecutor: backend }).run(
-    "main",
-    [],
-    { executionRoot: root, runId: "overlap" },
+  await assert.rejects(
+    AflVm.fromSource(source, { agentExecutor: backend }).run(
+      "main",
+      [],
+      { executionRoot: root, runId: "overlap" },
+    ),
+    { code: "FREEDOM_WORKSPACE_OVERLAP" },
   );
-  assert.deepEqual(result.output, frag(""));
   assert.equal(childExecuted, false);
 });
 
@@ -453,8 +542,9 @@ test("Freedom controlled params reject VM handles hidden behind unknown Node par
   const vm = AflVm.fromSource(`
 route(planner, leaked):
     entry:
-        result = freedom.route planner, "route", {}, [], {leaked: leaked}
-        ret result
+        jobs = freedom.route planner, "route", {}, [], {leaked: leaked}
+        reports = sync jobs
+        ret reports
 main():
     entry:
         planner = agent @agent.planner
@@ -471,8 +561,9 @@ test("Freedom route constraints cannot expand VM policy limits", async (t) => {
 main():
     entry:
         planner = agent @agent.planner
-        result = freedom.route planner, "route", {max_routes: 3}, [], {}
-        ret result
+        jobs = freedom.route planner, "route", {max_routes: 3}, [], {}
+        reports = sync jobs
+        ret reports
 `, {
     agentExecutor: controlBackend(async () => {
       executed = true;
@@ -492,23 +583,25 @@ test("Freedom rejects VM scheduling fields in instruction constraints", () => {
 main():
     entry:
         planner = agent @agent.planner
-        result = freedom.route planner, "route", {max_parallel: 2}, [], {}
-        ret result
+        jobs = freedom.route planner, "route", {max_parallel: 2}, [], {}
+        reports = sync jobs
+        ret reports
 `, { agentExecutor: controlBackend(async () => completed("unexpected")) }), (error) =>
     error.diagnostics?.some((item) => item.code === "FREEDOM_CONSTRAINT_INVALID") === true);
 });
 
-test("Freedom returns an empty Frag when no Node or IR was executed", async (t) => {
+test("Freedom returns an empty TaskGroup for an empty Route and an empty Frag for an empty Flow", async (t) => {
   const root = await temporaryRoot(t);
   const route = AflVm.fromSource(`
 main():
     entry:
         planner = agent @agent.planner
-        result = freedom.route planner, "optional route", {min_routes: 0, max_routes: 1}, [], {}
-        ret result
+        jobs = freedom.route planner, "optional route", {min_routes: 0, max_routes: 1}, [], {}
+        reports = sync jobs
+        ret reports
 `, { agentExecutor: controlBackend(async () => completed("unexecuted route claim")) });
   const routeResult = await route.run("main", [], { executionRoot: root, runId: "empty-route" });
-  assert.deepEqual(routeResult.output, frag(""));
+  assert.deepEqual(routeResult.output, frag("[]"));
 
   const validationOnly = AflVm.fromSource(`
 main():
@@ -577,8 +670,9 @@ available():
 main():
     entry:
         planner = agent @agent.planner
-        result = freedom.route planner, "route", {min_routes: 1, max_routes: 1}, [available], {}
-        ret result
+        jobs = freedom.route planner, "route", {min_routes: 1, max_routes: 1}, [available], {}
+        reports = sync jobs
+        ret reports
 `, { agentExecutor: controlBackend(async () => completed("too-early")) });
   await assert.rejects(
     vm.run("main", [], { executionRoot: root, runId: "route-minimum" }),

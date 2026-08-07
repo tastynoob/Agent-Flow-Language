@@ -111,8 +111,11 @@ test("Pi scopes AFL control tools to one Freedom activation and restores binding
     },
     (context) => {
       contexts.push({ tools: context.tools.map((tool) => tool.name), messages: context.messages.length });
-      assert.deepEqual(context.tools.map((tool) => tool.name), ["afl_environment_get", "afl_node_execute"]);
+      assert.deepEqual(context.tools.map((tool) => tool.name), ["afl_environment_get", "afl_route_add"]);
       assert.match(context.tools[0].description, /Canonical AFL name: afl\.environment\.get/u);
+      assert.match(context.tools[0].description, /every active AFL tool includes its own usage instructions/u);
+      assert.match(context.tools[1].description, /args are positional/u);
+      assert.match(context.tools[1].description, /never the child result/u);
       assert.doesNotMatch(context.systemPrompt ?? "", /AFL Freedom Route activation/u);
       assert.equal(messageTexts(context.messages).includes("seed"), true);
       assert.equal(messageTexts(context.messages).includes("seed-complete"), true);
@@ -124,8 +127,8 @@ test("Pi scopes AFL control tools to one Freedom activation and restores binding
     (context) => {
       contexts.push({ tools: context.tools.map((tool) => tool.name), messages: context.messages.length });
       assert.equal(context.messages.some((message) => message.role === "toolResult"), true);
-      assert.deepEqual(context.tools.map((tool) => tool.name), ["afl_environment_get", "afl_node_execute"]);
-      assert.match(context.tools[1].description, /Canonical AFL name: afl\.node\.execute/u);
+      assert.deepEqual(context.tools.map((tool) => tool.name), ["afl_environment_get", "afl_route_add"]);
+      assert.match(context.tools[1].description, /Canonical AFL name: afl\.route\.add/u);
       assert.doesNotMatch(context.systemPrompt ?? "", /AFL Freedom Route activation/u);
       assert.equal(messageTexts(context.messages).includes("seed-complete"), true);
       return fauxAssistantMessage("route-complete");
@@ -166,7 +169,8 @@ main():
     entry:
         planner = agent @agent.planner
         seeded = planner.do "seed"
-        routed = freedom.route planner, "route", {}, [], {}
+        jobs = freedom.route planner, "route", {}, [], {}
+        reports = sync jobs
         ordinary = planner.do "ordinary"
         ret ordinary
 `, { agentExecutor: backend });
@@ -177,7 +181,7 @@ main():
   const state = await readMemoryState(root);
   const continuation = Object.values(state.memories)[0].continuation.state.payload;
   const serialized = JSON.stringify(continuation);
-  assert.match(serialized, /afl\.environment\.get/u);
+  assert.doesNotMatch(serialized, /afl\.environment\.get/u);
   assert.match(serialized, /afl_environment_get/u);
   assert.match(serialized, /seed-complete/u);
   assert.match(serialized, /route-complete/u);

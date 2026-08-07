@@ -85,7 +85,7 @@ Agent 输出在来源 Memory 中具有 `assistant` role，但同一内容交给 
 
 开放决策至少有两个不同尺度：从已暴露 Node 中选择下一步，以及现有行为不足时组合临时 flow。当前设计分别使用 `freedom.route` 和 `freedom.flow`，并只在对应 Agent activation 内注入所需控制工具。
 
-两者都直接返回被选行为的执行结果，而不是只返回一段自然语言计划。Route 的候选集合和临时 flow 都需要经过接口、能力、预算和 policy 检查。
+Route 把 planner 选择的 Node 调用显式化为 TaskGroup，由 AFL 使用 `sync` 汇合；Flow 则把 Node/IR 执行结果交给 writer，并返回 writer 的最终 Frag。两者都不把自然语言声明当成已执行 workflow，候选集合和临时 flow 仍需要经过接口、能力、预算和 policy 检查。
 
 长期 IR patch 或 self-modify 暂不与一次 fallback 混为同一语义；如果真实长期 Agent 案例需要，可以在临时 child flow 之上增加 revision 机制。
 

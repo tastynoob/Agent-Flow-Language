@@ -156,6 +156,8 @@ interface FreedomScope {
   readonly nodes: ReadonlyMap<string, AflNode>;
   readonly agents: readonly SymbolRef[];
   readonly refs: Map<string, VmArgument>;
+  readonly routes: QueuedFreedomRoute[];
+  nextRouteOrder: number;
   readonly counts: {
     control: number;
     route: number;
@@ -165,6 +167,18 @@ interface FreedomScope {
     execution: number;
     result: number;
   };
+}
+
+interface QueuedFreedomRoute {
+  readonly order: number;
+  readonly requestId: string;
+  readonly target: FlowTarget;
+  readonly args: readonly VmArgument[];
+}
+
+interface TaskGroupWork {
+  readonly span: SourceSpan;
+  execute(signal: AbortSignal, index: number): Promise<VmValue>;
 }
 
 interface FreedomRouteTracker {
@@ -1291,6 +1305,36 @@ export class AflVm {
     location: Required<TraceLocation>,
     parentSignal: AbortSignal,
   ): Promise<TaskGroupHandle> {
+    this.reserveGeneratedFreedomRoutes(frame.node.name, calls.map((call) => call.target), activation);
+    return this.startTaskGroup(
+      frame,
+      calls.map((call): TaskGroupWork => ({
+        span: call.span,
+        execute: (signal, index) => this.invokeFlow(
+          frame.module,
+          call.target,
+          call.args,
+          context,
+          signal,
+          `${this.childActivationPath(activation, location, blockVisit, "dispatch")}:${index}`,
+          activation.forbiddenWriterWorkspace,
+          activation.freedomDepth,
+          activation.freedomRouteTracker,
+        ),
+      })),
+      context,
+      location,
+      parentSignal,
+    );
+  }
+
+  private async startTaskGroup(
+    frame: MutableFrame,
+    work: readonly TaskGroupWork[],
+    context: VmRunContext,
+    location: Required<TraceLocation>,
+    parentSignal: AbortSignal,
+  ): Promise<TaskGroupHandle> {
     const maxWorkers = this.bindings.policy?.maxDispatchWorkers ?? 16;
     const maxTasks = this.bindings.policy?.maxDispatchTasks ?? 10_000;
     if (!Number.isInteger(maxWorkers) || maxWorkers <= 0) {
@@ -1299,30 +1343,19 @@ export class AflVm {
     if (!Number.isInteger(maxTasks) || maxTasks < 0) {
       throw new AflVmError("VM_POLICY_INVALID", "maxDispatchTasks must be a non-negative integer");
     }
-    if (calls.length > maxTasks) {
+    if (work.length > maxTasks) {
       throw new AflVmError(
         "DISPATCH_TASK_LIMIT_EXCEEDED",
-        `dispatch requested ${calls.length} tasks, exceeding maxDispatchTasks=${maxTasks}`,
+        `dispatch requested ${work.length} tasks, exceeding maxDispatchTasks=${maxTasks}`,
       );
     }
-    this.reserveGeneratedFreedomRoutes(frame.node.name, calls.map((call) => call.target), activation);
     const linked = linkedController(parentSignal);
     const workerLimit = new Semaphore(maxWorkers);
     const id = this.nextHandle(context, "task-group");
-    const tasks = calls.map((call, index) => {
+    const tasks = work.map((item, index) => {
       const task = workerLimit.use(linked.controller.signal, async () => normalizeFlowResult(
-        await this.invokeFlow(
-          frame.module,
-          call.target,
-          call.args,
-          context,
-          linked.controller.signal,
-          `${this.childActivationPath(activation, location, blockVisit, "dispatch")}:${index}`,
-          activation.forbiddenWriterWorkspace,
-          activation.freedomDepth,
-          activation.freedomRouteTracker,
-        ),
-        call.span,
+        await item.execute(linked.controller.signal, index),
+        item.span,
       ));
       void task.catch((error: unknown) => {
         linked.controller.abort(error);
@@ -1419,10 +1452,10 @@ export class AflVm {
     instruction: FreedomInstruction,
     context: VmRunContext,
     activation: ActivationContext,
-    _blockVisit: number,
+    blockVisit: number,
     location: Required<TraceLocation>,
     signal: AbortSignal,
-  ): Promise<Frag> {
+  ): Promise<Frag | TaskGroupHandle> {
     const mode = freedomInstructionMode(instruction);
     const planner = asAgent(evaluateValue(instruction.planner, frame), instruction.planner.span);
     const prompt = asFrag(evaluateValue(instruction.prompt, frame), instruction.prompt.span, "freedom prompt");
@@ -1502,6 +1535,8 @@ export class AflVm {
       nodes,
       agents,
       refs,
+      routes: [],
+      nextRouteOrder: 0,
       counts: {
         control: 0,
         route: 0,
@@ -1530,22 +1565,65 @@ export class AflVm {
       if (scope.counts.route < scope.limits.minRoutes) {
         throw new AflVmError(
           "FREEDOM_ROUTE_MIN_NOT_REACHED",
-          `Freedom started ${scope.counts.route} routes, below min_routes=${scope.limits.minRoutes}`,
+          `Freedom selected ${scope.counts.route} routes, below min_routes=${scope.limits.minRoutes}`,
           { span: instruction.span },
         );
       }
-      await this.trace(context, "freedom.completed", location, {
+      const details = {
         mode,
         controlCalls: scope.counts.control,
         routes: scope.counts.route,
         completedNodes: scope.counts.completedNode,
         completedIr: scope.counts.completedIr,
-      });
+      } as const;
+      if (instruction.op === "freedom.route") {
+        const group = await this.startFreedomRouteGroup(
+          frame,
+          scope,
+          context,
+          blockVisit,
+          location,
+          signal,
+        );
+        await this.trace(context, "freedom.completed", location, details);
+        return group;
+      }
+      await this.trace(context, "freedom.completed", location, details);
       return scope.counts.completedNode + scope.counts.completedIr === 0 ? frag("") : output;
     } finally {
       clearTimeout(timeout);
       linked.dispose();
     }
+  }
+
+  private startFreedomRouteGroup(
+    frame: MutableFrame,
+    scope: FreedomScope,
+    context: VmRunContext,
+    blockVisit: number,
+    location: Required<TraceLocation>,
+    signal: AbortSignal,
+  ): Promise<TaskGroupHandle> {
+    const routes = [...scope.routes].sort((left, right) => left.order - right.order);
+    return this.startTaskGroup(
+      frame,
+      routes.map((route): TaskGroupWork => ({
+        span: route.target.span,
+        execute: (taskSignal, index) => this.executeNode(
+          scope.origin.module,
+          route.target.name,
+          route.args,
+          context,
+          taskSignal,
+          `${scope.origin.activationPath}/freedom-route:${blockVisit}:${index}:${encodeURIComponent(route.requestId)}`,
+          scope.planner.workspace,
+          scope.freedomDepth,
+        ),
+      })),
+      context,
+      location,
+      signal,
+    );
   }
 
   private createFreedomRuntime(scope: FreedomScope): FreedomRuntime {
@@ -1636,6 +1714,8 @@ export class AflVm {
       switch (request.name) {
         case "afl.environment.get":
           return this.freedomEnvironment(scope, request.input);
+        case "afl.route.add":
+          return await this.queueFreedomRoute(scope, request);
         case "afl.node.execute":
           return await this.executeFreedomNode(scope, request);
         case "afl.ir.validate":
@@ -1666,12 +1746,55 @@ export class AflVm {
     }
   }
 
+  private async queueFreedomRoute(
+    scope: FreedomScope,
+    request: AgentControlToolRequest,
+  ): Promise<AgentControlToolResult> {
+    assertObjectInput(request.input, ["node", "args"]);
+    const target = requiredString(request.input, "node");
+    const node = scope.nodes.get(target);
+    if (node === undefined) {
+      throw new AflVmError("FREEDOM_NODE_DENIED", `Node '${target}' is not in this Freedom allowlist`);
+    }
+    const args = resolveControlArguments(request.input.args, scope.refs);
+    if (args.length !== node.parameters.length) {
+      throw new AflVmError(
+        "CALL_ARITY",
+        `Node '${target}' expects ${node.parameters.length} arguments, received ${args.length}`,
+      );
+    }
+    this.assertFreedomRouteCapacity(scope, 1);
+    const order = scope.nextRouteOrder;
+    scope.nextRouteOrder += 1;
+    if (await this.bindings.policy?.authorizeFreedomNode?.({
+      ...this.freedomPolicyRequest(scope),
+      target,
+      args: args.map((argument) => clonePortable(argument)),
+    }) === false) {
+      throw new AflVmError("FREEDOM_NODE_DENIED", `Node '${target}' was denied by policy`);
+    }
+    throwIfAborted(scope.signal);
+    throwIfAborted(request.signal);
+    this.reserveFreedomRoute(scope);
+    scope.routes.push({
+      order,
+      requestId: request.id,
+      target: { kind: "local", name: target, span: node.span },
+      args: args.map((argument) => clonePortable(argument)),
+    });
+    return controlResult({
+      ok: true,
+      route: `route:${order + 1}`,
+      node: target,
+    });
+  }
+
   private freedomEnvironment(
     scope: FreedomScope,
     input: Readonly<Record<string, unknown>>,
   ): AgentControlToolResult {
     assertObjectInput(input, ["include"]);
-    const allowedSections = ["agents", "nodes", "parameters", "constraints", "tools"] as const;
+    const allowedSections = ["agents", "nodes", "parameters", "constraints"] as const;
     let include: readonly (typeof allowedSections)[number][] = allowedSections;
     if (input.include !== undefined) {
       if (!Array.isArray(input.include) ||
@@ -1712,9 +1835,6 @@ export class AflVm {
         requested: structuredClone(scope.constraint),
         effective: freedomLimitsValue(scope.limits),
       };
-    }
-    if (selected.has("tools")) {
-      environment.tools = freedomControlTools(freedomInstructionMode(scope.instruction)).map((tool) => tool.name);
     }
     return controlResult({ ok: true, environment });
   }

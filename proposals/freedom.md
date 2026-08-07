@@ -6,8 +6,8 @@
 
 Freedom 的目标是允许 Agent 在 AFL 明确描述的边界内自行推进 workflow。它是必要的动态控制指令，不是特殊 Agent 类型、Agent binding 的永久能力，也不等于让模型任意调用宿主工具。VM 会按 Freedom 指令种类，在单次 activation 内临时向 writer Agent 暴露一组标准化的 AFL 控制工具：
 
-- `freedom.route` 允许查询当前 AFL 环境，并调用已有 Node；
-- `freedom.flow` 额外允许校验和执行 Agent 编写的 AFL IR；
+- `freedom.route` 允许查询当前 AFL 环境，并登记由 TaskGroup 执行的已有 Node；
+- `freedom.flow` 允许立即执行已有 Node，并额外允许校验和执行 Agent 编写的 AFL IR；
 - 普通 `agent.do` 默认不获得这些工具；
 - 工具调用仍受当前 run 的候选范围、参数范围、policy、预算、并发和取消约束。
 
@@ -71,18 +71,19 @@ Binding 可以提供 Agent 的公开描述和 executor capability，但不能扩
 
 ```text
 afl.environment.get
+afl.route.add
+afl.node.execute
 afl.ir.validate
 afl.ir.execute
-afl.node.execute
 ```
 
 ## 3. 工具暴露矩阵
 
-| 执行入口 | `environment.get` | `node.execute` | `ir.validate` | `ir.execute` |
-| --- | --- | --- | --- | --- |
-| 普通 `agent.do` | 否 | 否 | 否 | 否 |
-| `freedom.route` | 是 | 是 | 否 | 否 |
-| `freedom.flow` | 是 | 是 | 是 | 是 |
+| 执行入口 | `environment.get` | `route.add` | `node.execute` | `ir.validate` | `ir.execute` |
+| --- | --- | --- | --- | --- | --- |
+| 普通 `agent.do` | 否 | 否 | 否 | 否 | 否 |
+| `freedom.route` | 是 | 是 | 否 | 否 | 否 |
+| `freedom.flow` | 是 | 否 | 是 | 是 | 是 |
 
 工具列表由 VM 在每次 Freedom activation 开始时生成，并带有本次 activation 的作用域。即使同一个 Agent session 先后执行 Route 和 Flow，也不能沿用上一次 activation 的工具集合、候选 Node 或参数引用。
 
@@ -90,7 +91,7 @@ afl.node.execute
 
 ### 4.1 目标
 
-`afl.environment.get` 返回 writer 当前可见的 AFL 环境，使 Agent 不必依靠 prompt 猜测可用 Agent、Node、参数和控制能力。
+`afl.environment.get` 返回 writer 当前可见的 AFL 环境，使 Agent 不必依靠 prompt 猜测可用 Agent、Node、参数和约束。
 
 建议请求形状为：
 
@@ -101,14 +102,15 @@ interface AflEnvironmentGetInput {
     | "nodes"
     | "parameters"
     | "constraints"
-    | "tools"
   )[];
 }
 ```
 
 省略 `include` 时返回当前 Freedom 所需的完整环境，但不得返回 API key、原生 session id、绝对秘密路径或 binding 私有配置。
 
-`environment.get` 只描述本次 activation 的可见对象和约束，不返回 AFL 语法。v0 的真实测试把必要的最小语法直接写在 Freedom user prompt 中；后续将 AFL 打包为 skill，为 Agent 提供完整语言知识。无论知识从 prompt 还是 skill 获得，都不能替代 VM 的 parse、validate 和 authorize。
+`environment.get` 只描述本次 activation 的可见对象和约束，不返回 AFL 语法，也不返回控制工具说明。控制工具已经通过 executor 的临时 runtime tool set 暴露给模型，每个 descriptor 必须自带足以完成一次正确调用的用途、参数构造、执行时机和返回语义；模型不需要为了学习工具用法先调用 `environment.get`。只有需要发现动态 Node、Agent、ref 或 constraint 时才查询环境。
+
+完整 AFL 语法不适合重复塞入每个工具描述。v0 的真实测试可以把生成 IR 所需的最小语法写在 Freedom user prompt 中；后续将 AFL 打包为 skill，为 Agent 提供完整语言知识。无论知识从 prompt 还是 skill 获得，都不能替代 VM 的 parse、validate 和 authorize。
 
 ### 4.2 Node 信息
 
@@ -181,16 +183,16 @@ interface NodeDocumentation {
 
 Node 签名仍是参数名称和数量的语义来源。未知的 `@param` 名称产生 diagnostic；缺少文档在 v0 不阻止执行。Documentation 进入 module digest，因为修改公开职责会改变 Freedom Agent 看到的环境。
 
-## 6. `afl.node.execute`
+## 6. Node 路由与执行工具
 
-### 6.1 语义
+### 6.1 共享输入
 
-`afl.node.execute` 调用一个当前 Freedom activation 允许的既有 Node。Agent不能通过该工具提交、拼接或修改 IR，也不能把 Node 名称替换成外部 capability 或 flow symbol。
+`afl.route.add` 和 `afl.node.execute` 都只接受当前 Freedom activation 允许的既有 Node。Agent不能通过这两个工具提交、拼接或修改 IR，也不能把 Node 名称替换成外部 capability 或 flow symbol。
 
 建议请求形状为：
 
 ```ts
-interface AflNodeExecuteInput {
+interface AflNodeCallInput {
   readonly node: string;
   readonly args: readonly AflControlArgument[];
 }
@@ -200,18 +202,13 @@ type AflControlArgument =
   | { readonly string: string };
 ```
 
-`ref` 只能引用：
-
-- 当前 Freedom instruction 的显式参数；
-- 当前 activation 中先前 AFL 控制工具产生、仍然有效的结果引用。
+Route 的 `ref` 只能引用当前 Freedom instruction 的显式参数。Flow 的 `ref` 还可以引用当前 activation 中先前控制工具产生、仍然有效的结果。引用不是可进入普通 AFL value、Memory 或外部 flow 的全局 handle。
 
 `string` 允许 Agent产生任意字符串，例如任务说明、角色名称或模型名称。AFL 不把字符串自动转换为 Symbol、Agent 或其他 handle。Node 若接受模型名称，必须在自己的接口或 binding 中显式解析该字符串。
 
 首版不允许 Agent构造 number、boolean、list、record、Frag、Symbol 或 VM handle。后续若真实 workflow 需要其他安全字面量，应逐项增加。
 
-### 6.2 校验和执行
-
-VM 在调用前检查：
+VM 在接受调用前检查：
 
 - Node 位于当前工具的 allowlist；
 - 参数数量与 Node 签名一致；
@@ -219,16 +216,20 @@ VM 在调用前检查：
 - 当前 activation 的路由数量没有超出 constraint，运行资源没有超出 VM policy；
 - policy 批准该调用。
 
-调用使用 writer origin 的本地 Node resolution 和当前 run context。Node 结果返回给 Agent，同时由 VM分配 result ref，使非字符串结果可以受控地传给后续 Node 调用。
+### 6.2 `afl.route.add`
 
-同一个 assistant tool-use turn 中出现多个互不引用的 `afl.node.execute` 调用时，AFL executor contract 应允许 VM按 executor capability 与全局调度策略并行执行，并按 tool call id 返回结果。并行度不是 flow constraint；跨 turn 的调用天然可以根据前一轮结果继续路由。
+`afl.route.add` 只在 `freedom.route` 中可用。它把一个已校验的 Node 调用登记到本次 Route 的待执行集合，并立即返回登记确认；此时 Node 尚未启动，也不会产生 result ref。Planner 可以继续查看环境或登记其他调用，但不能在同一次 Route activation 中观察 child 结果。
 
-因此 `freedom.route` 可以同时覆盖：
+Planner final response 完成后，VM 检查 `min_routes`，按登记顺序把所有调用交给与普通 `dispatch` 相同的 TaskGroup 调度路径。调用使用 planner origin 的本地 Node resolution 和当前 run context；并发度、取消、worker 上限和失败传播都服从现有 TaskGroup 规则。TaskGroup 中的 child failure 在 `sync` 时报告。
 
-- 一次选择多个部门并行执行；
-- 查看部门结果后再调用补充 Node；
-- 根据任务复杂度向 Node 传入不同模型字符串；
-- 在约束耗尽或 Agent给出最终回答时结束。
+这种设计使动态候选选择留在 Agent 中，而执行、汇合和结果依赖显式保留在 AFL IR 中。需要依据第一批结果继续路由时，应在 AFL 中写成 `route -> sync -> route`，或使用 `freedom.flow`。
+
+### 6.3 `afl.node.execute`
+
+`afl.node.execute` 只在 `freedom.flow` 中可用。它立即使用 writer origin 执行 Node，等待完成后把结果作为 tool result 返回给 writer，并分配 activation-scoped result ref。Writer 可以据此调用更多 Node、修改 generated IR 或形成最终总结。
+
+同一个 assistant tool-use turn 中出现多个互不引用的 `afl.node.execute` 调用时，executor 可以并行转交 VM，并按 tool call id 返回结果。并行度不是 flow constraint；该能力服务于 Flow writer 的动态编排，不改变 Route 的显式 TaskGroup 语义。
+
 
 ## 7. `afl.ir.validate`
 
@@ -351,7 +352,8 @@ interface AflIrExecuteInput {
 建议表面形式为：
 
 ```afl
-result = freedom.route planner, prompt, constraint, [node0, node1, node2], {task: task, spec: spec}
+jobs = freedom.route planner, prompt, constraint, [node0, node1, node2], {task: task, spec: spec}
+reports = sync jobs
 ```
 
 五个 operand 分别是 planner Agent、业务 prompt、机器约束、Node allowlist 和显式参数环境。
@@ -360,12 +362,12 @@ VM把业务 prompt 作为普通 user message 追加到 planner 的既有 Memory�
 
 ```text
 afl.environment.get
-afl.node.execute
+afl.route.add
 ```
 
-Planner 可以查询 Node 文档、调用一个或多个 Node、观察结果后继续调用，最后以普通 assistant final response 结束。成功执行过 Node 时，`freedom.route` 返回该 final response 的 role-free Frag；Node tool call、结果、thinking 和 final response 都进入 planner 的原生 continuation，并按现有 Memory 规则持久化。
+Planner 可以查询 Node 文档并登记一个或多个 Node 调用，最后以普通 assistant final response 结束。该 response、thinking、登记调用和确认结果都进入 planner 的原生 continuation并按现有 Memory 规则持久化，但不作为 AFL 指令结果。VM在 planner 完成后统一启动已登记调用，`freedom.route` 返回 TaskGroup；调用方必须通过 `sync` 收集 child Frag 或处理失败。
 
-Route 不接收、解析或执行 Agent编写的 AFL source。Agent即使在 final response 中输出 AFL，也只会被当作普通文本。
+Route 不接收、解析或执行 Agent编写的 AFL source，也不把 child Node 结果回传给 planner。Agent即使在 final response 中输出 AFL 或声称任务已经执行，也只会被当作普通文本。`min_routes=0` 且没有登记调用时返回合法的空 TaskGroup，`sync` 后得到空结果集合。
 
 ### 9.2 `freedom.flow`
 
@@ -392,7 +394,7 @@ Writer 可以先查询环境，直接调用已有 Node，也可以编写 IR、�
 
 Flow writer 成功执行过 Node 或 IR 后，其 final response 作为指令结果。IR执行结果已经作为 tool result 回到 writer；是否调用更多 Node、再次执行 IR或总结结果由 writer 在 constraint 内决定。
 
-两种 Freedom activation 都必须区分“模型给出了答案”和“workflow 确实执行过”。VM先按已发起 route 检查 `min_routes`，不足时报告 `FREEDOM_ROUTE_MIN_NOT_REACHED`；通过检查后若没有任何 Node 或 IR 成功完成，则忽略模型对未执行工作的文本声明并返回空 Frag。`environment.get`、`ir.validate` 和失败的执行尝试都不满足成功执行条件。空 Frag 保持了 Freedom 指令稳定的结果类型；空 TaskGroup 会错误引入 `sync` 和 child flow 生命周期，因此不作为兜底值。
+Flow 必须区分“模型给出了答案”和“workflow 确实执行过”。VM先按已发起 route 检查 `min_routes`，不足时报告 `FREEDOM_ROUTE_MIN_NOT_REACHED`；通过检查后若没有任何 Node 或 IR 成功完成，则忽略 writer 对未执行工作的文本声明并返回空 Frag。`environment.get`、`ir.validate` 和失败的执行尝试都不满足成功执行条件。Route 则以登记调用为事实来源，始终返回真实 TaskGroup，不使用自然语言 final response 代替 jobs。
 
 ## 10. Constraint 与 Policy
 
@@ -403,7 +405,7 @@ min_routes              activation 至少发起的路由数
 max_routes              activation 至多启动的路由数
 ```
 
-一次 `afl.node.execute` 算作一次 route。`freedom.flow` 的 generated IR 每次从临时 Node 调用显式候选 Node 也算作一次 route，因此不能通过 IR 绕过约束；临时 IR 内部局部 Node 之间的调用不计数，重复调用同一候选分别计数。VM在启动 route 前检查 `max_routes`，writer 给出 final response 后检查 `min_routes`。
+Route 中一次 `afl.route.add` 算作一次 route；Flow 中一次 `afl.node.execute`，或 generated IR 从临时 Node 调用一个显式候选 Node，也算作一次 route，因此不能通过 IR 绕过约束。临时 IR 内部局部 Node 之间的调用不计数，重复调用同一候选分别计数。VM在登记或启动 route 前检查 `max_routes`，planner/writer 给出 final response 后检查 `min_routes`。
 
 控制工具总调用数、IR 校验/执行次数、generated IR 大小、activation 深度和 timeout 属于 `VmPolicy.freedomLimits`。并行度由 `VmPolicy.maxConcurrency`、dispatch policy 和 executor capability 决定。它们描述 VM 如何执行 flow，不作为 AFL source 中的业务约束。Policy 的 `maxRoutes` 为 source `max_routes` 提供全局上界。
 
@@ -433,6 +435,8 @@ Pi 首个实现把 AFL descriptor 映射成 activation-scoped `AgentHarnessTool`
 
 Freedom 不创建第二套 Agent 上下文，也不注入隐藏 system prompt。它继续使用同一个 Agent handle、Memory 和 Pi session，并把指令的业务 prompt 作为普通 user message 追加进去；activation 的差异只有临时 active tools。provider 若不接受 canonical 工具名，executor 可以用兼容别名，并在工具描述中标出 canonical 名称，而不额外修改 Agent prompt。
 
+临时工具的 descriptor 本身就是模型的操作手册。除了 JSON Schema，description 至少说明工具的适用场景、`ref`/`string` 参数形式、调用是登记还是即时执行、成功结果的意义，以及与其他工具的必要衔接。Pi 将这些 descriptor 直接放入本次模型请求的 runtime tool set；`environment.get` 不承担第二次分发说明书的职责。Memory 中名为 `session.tools` 的 record 只是 Pi `active_tools_change` 的语义化投影，只保存 active tool names，不是这里所说的 descriptor 集合。
+
 ### 11.2 标准描述和 host callback
 
 VM为每次 Freedom activation构造工具 descriptor，executor只负责向模型呈现并把调用转交 host：
@@ -459,7 +463,7 @@ Executor 不能缓存 descriptor 到下一次普通 `agent.do`。Tool call 和 t
 
 ## 12. VM 重入与锁
 
-控制工具会在 writer Agent executor 尚未结束时重新进入 VM。当前 VM 在整个 `agent.do` 期间持有 Agent、Memory、Workspace lock，并占用一个 external semaphore permit；直接在 tool handler 中执行 Node 或 IR会产生两类死锁：
+Flow 的 Node/IR 控制工具会在 writer Agent executor 尚未结束时重新进入 VM。当前 VM 在整个 `agent.do` 期间持有 Agent、Memory、Workspace lock，并占用一个 external semaphore permit；直接在 tool handler 中执行 Node 或 IR会产生两类死锁。Route 的 `route.add` 只保存调用规格，child Node 在 planner activation 完成并释放锁后才启动，因此不经过这条重入路径。
 
 - child Node 使用与 writer 重叠的 Workspace，而 writer 正等待 tool result；
 - `maxConcurrency=1` 时 writer 占用唯一 external permit，child Agent 无法开始。
@@ -483,20 +487,23 @@ Executor 不能缓存 descriptor 到下一次普通 `agent.do`。Tool call 和 t
 主路由形态为：
 
 ```afl
-reports = freedom.route shangshu, route_prompt, route_constraint, [hubu, libu, bingbu, xingbu, gongbu, libu_hr], {plan: execution_plan, assignments: assignments}
+jobs = freedom.route shangshu, route_prompt, route_constraint, [hubu, libu, bingbu, xingbu, gongbu, libu_hr], {plan: execution_plan, assignments: assignments}
+reports = sync jobs
+summary_prompt = prompt "Summarize the completed department reports", reports
+summary = shangshu.do summary_prompt
 ```
 
-尚书通过 `afl.environment.get` 查看六个部门的职责，通过一个或多个 `afl.node.execute` 调用相关部门。未选择的部门不会启动 Agent。同一 tool-use turn 中的多个部门调用由 VM按全局调度策略并行执行，结果回到尚书后可以继续补充路由或形成最终报告。
+尚书通过 `afl.environment.get` 查看六个部门的职责，通过一个或多个 `afl.route.add` 登记相关部门。未选择的部门不会启动 Agent。Planner 完成后，VM把登记调用作为 TaskGroup 并按全局调度策略并行执行；结果先显式回到 AFL 的 `sync`，再由后续普通 `do` 交给尚书汇总。
 
 ## 14. 实施顺序
 
 1. 为 Node 增加 documentation 解析、IR 字段、digest 和 diagnostics；
-2. 定义四个 AFL 控制工具的 descriptor、输入、输出、错误码和 reserved namespace；
+2. 定义五个 AFL 控制工具的 descriptor、输入、输出、错误码和 reserved namespace；
 3. 为 Agent handle 增加 writer origin，并定义 module overlay 和显式参数 reference；
 4. 扩展 Agent executor/host，使 Pi支持 activation-scoped AFL控制工具；
 5. 实现 control-tool suspension boundary，解决 Workspace lock 和 external semaphore 重入；
 6. 实现 `environment.get` 和由 Freedom 指令构造的 Node/Agent interface view；
-7. 实现 `node.execute` 的 allowlist、参数引用、并行 tool call 和 result reference；
+7. 实现 `route.add` 的调用登记与 TaskGroup 返回，以及 `node.execute` 的即时执行和 result reference；
 8. 实现 scope-aware `ir.validate` 和始终重新校验的 `ir.execute`；
 9. 将 `freedom.route` 和 `freedom.flow` 重写为带显式范围的原子 Agent activation，移除旧 Move/generated-plan 执行路径；
 10. 迁移三省六部样例并更新 syntax、IR、semantics 和 examples 文档；
@@ -507,35 +514,36 @@ reports = freedom.route shangshu, route_prompt, route_constraint, [hubu, libu, b
 至少覆盖：
 
 - 普通 `agent.do` 看不到任何 `afl.*` 工具；
-- Route 只看到 environment/node，Flow 看到全部四个工具；
+- Route 只看到 environment/route.add，Flow 看到 environment/node.execute/IR 工具；
 - 同一 Agent 执行 Freedom 后再次进入普通 `agent.do` 时，控制工具和参数引用已经撤销；
 - binding 不能覆盖 reserved tool name；
 - default Agent binding 不能扩大 Freedom 指令显式 Agent 列表；
-- environment 只返回当前 activation 可见的 Agent、Node、参数和工具；
+- environment 只返回当前 activation 可见的 Agent、Node、参数和约束；
 - analyzer 能从 Route/Flow 的显式 allowlist 记录每个候选 Node 的潜在动态依赖边；
 - Node documentation 被正确保存并进入 digest；
-- `node.execute` 拒绝未知 Node、越界 ref、错误 arity、对象构造和超预算调用；
+- `route.add` 和 `node.execute` 拒绝未知 Node、越界 ref、错误 arity、对象构造和超预算调用；
 - `min_routes` 与 `max_routes` 同时覆盖直接 Node 工具调用和 generated IR 对候选 Node 的调用；
-- 同一 turn 的多个 Node 调用按 VM 全局调度策略执行，结果按 tool call id 对应；
+- Route 登记的多个 Node 在 planner 完成后形成真实 TaskGroup，并按登记顺序由 `sync` 收集；
+- Flow 同一 turn 的多个 Node 执行按 tool call id 对应结果；
 - `ir.validate` 无副作用，并返回稳定 diagnostics 和 digest；
 - `ir.execute` 始终重新校验，digest 不一致时拒绝；
 - 临时 IR能调用 writer origin module 的 Node并复用顶层 binding；
 - 临时 IR不能覆盖 origin Node，也不能隐式读取 writer frame 局部变量；
 - root、local child、generated child 和 forked writer 的 origin resolution 正确；
 - `maxConcurrency=1` 和重叠 Workspace 场景不会因控制工具重入死锁；
-- Node/IR失败能返回给 writer继续决策，取消会传播到所有 child activation；
+- Route child failure 在 `sync` 传播，Flow 的 Node/IR失败能返回给 writer继续决策，取消会传播到所有 child activation；
 - control tool call、result、thinking 和 final response 完整流式持久化；
 - 恢复 Memory不会重复执行历史控制工具；
-- 三省六部能够一次并行调用多个部门，并根据结果继续路由。
+- 三省六部能够动态选择多个部门、显式 `sync` 并汇总结果。
 
 ## 16. 后续设计问题
 
-- 是否为 `afl.node.execute` 增加显式 batch 形状，而不只依赖 executor 同 turn 并发；
+- 是否为 `afl.route.add` 增加显式 batch 形状，减少 planner 登记大量同构调用时的工具轮次；
 - Flow 何时增加显式 Capability/External Flow scope；v0 只能通过候选 Node 间接使用；
 - 临时 module overlay 的本地 Node resolution 是否需要显式 namespace；
 - generated IR 何时允许递归 Freedom；v0 直接拒绝；
 - writer Agent被传入其他 Node后，origin 固定在创建位置的规则是否需要表面可视化；
 - Node 参数说明何时扩展为可机器检查的 interface schema；
-- 是否增加可选的直接返回协议，让调用方取得最后一次 Node/IR结果而不是 writer 总结；v0 的零执行兜底仍固定为空 Frag。
+- Flow 是否增加可选的直接返回协议，让调用方取得最后一次 Node/IR结果而不是 writer 总结。
 
-这些问题不改变核心方向：`freedom.route` 和 `freedom.flow` 是必要的、activation-scoped AFL 指令；候选 Node、Agent 和受控参数由当前 AFL 显式给出，binding 不定义 flow scope；Route 使用环境查询和既有 Node调用，Flow在此基础上增加 IR校验与 writer-origin IR执行。
+这些问题不改变核心方向：`freedom.route` 和 `freedom.flow` 是必要的、activation-scoped AFL 指令；候选 Node、Agent 和受控参数由当前 AFL 显式给出，binding 不定义 flow scope；Route 把 Agent 选择变成显式 TaskGroup，Flow 则允许 writer 即时执行 Node、校验和运行 writer-origin IR。
