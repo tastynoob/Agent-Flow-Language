@@ -159,9 +159,9 @@ Prompt source 是 symbol 时，VM 调用 Prompt binding 的 `render`。Source �
 
 Role-free 返回值可以被另一个 Agent 作为 `user` message 接收，也可以用其他 role 显式 append。
 
-Backend 可以在 `messages` 中返回中间 Message。VM 依次追加这些 Message，再以 `assistant` role 追加 `output`，指令返回包装 `output` 的 Frag。旧 `AgentAdapter` 由无状态兼容 backend 包装，仍会收到完整 Memory。
+Backend 只返回最终 `output`，VM 将其追加一次 `assistant` Message。旧 `AgentAdapter` 由无状态兼容 backend 包装，仍会收到完整 canonical Memory。
 
-支持原生 session 的 backend 可以返回 session ref。VM 记录该 session 已同步的 Memory revision，并把运行中的文本、工具和 usage 事件转交 Trace 与可选 `agentHost`。这些事件不是 Message，也不会自动写入 Memory。
+支持原生 session 的 backend 可以返回 session ref。VM 记录该 session 已同步的 Memory revision，并把运行中的文本、工具和 usage 事件转交 Trace 与可选 `agentHost`。这些事件不自动变成 AFL Message；支持 continuation codec 的 backend 在完整原生消息形成后，通过 executor host 把 tool call、tool result、thinking、compaction 等语义 records 流式追加到当前 Memory 文件。每个完整 record 都会推进可恢复 continuation，不等待最终 assistant 或 `do.end`。
 
 ### 7.6 输出格式约束
 
@@ -218,7 +218,7 @@ copied = memory.copy source_memory
 
 `memory.copy` 创建独立 Memory，并按原顺序复制 source 中的 Message。每条 Message 保留原 role；copy 之后双方更新互不自动传播。
 
-当 backend 支持 checkpoint 时，VM 还会复制一份 flow 不可读取的 continuation checkpoint，并绑定复制时的 Memory revision。该元数据只用于兼容的 `memory.apply` 或 `fork`，不改变 Message 序列。
+当 backend 支持 checkpoint/session export 时，VM 还会复制一份 flow 不可读取的 continuation，并绑定复制时的 Memory revision。该元数据只用于兼容的 `memory.apply` 或 `fork`，不改变 Message 序列。
 
 `memory.copy` 不接收新 role，因为它复制的是已经带 role 的 Message，而不是把一个 role-free Frag 加入 Memory。
 
@@ -230,7 +230,7 @@ new_agent = memory.apply source_agent, memory
 
 `memory.apply` 使用 source Agent 的 symbol 与 system prompt 创建新的 Agent handle，并把给定 Memory 作为其 working Memory。它不修改 source Agent，也不再次复制 Memory。Memory 已有 owner 时，VM 报告 `MEMORY_ALREADY_BOUND`；调用方需要独立副本时先执行 `memory.copy`。
 
-Memory checkpoint 的 backend、Agent symbol 和 system prompt 都兼容时，首次执行优先从 checkpoint fork 原生 session；否则 backend 只根据可移植 Message 重建 session。
+Live checkpoint 的 backend、Agent symbol、system prompt 和 Workspace 都兼容时，首次执行优先 fork 原生 session；否则同名 backend 从持久化 continuation 为目标 Agent binding 重建 session。不存在 continuation 时才根据 canonical Message 重建；continuation 属于其他 backend 时显式失败。
 
 ## 10. 控制流
 

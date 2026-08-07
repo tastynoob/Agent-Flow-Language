@@ -1,6 +1,6 @@
 import type { BackendSessionRef } from "./agent-executor.js";
 import type { ComputeValue, Frag, SymbolRef } from "./ir.js";
-import type { Message } from "./memory.js";
+import type { BackendSessionState, Message, PersistedMemoryBase } from "./memory.js";
 import type { AgentWorkspaceSet } from "./workspace.js";
 
 export interface MemoryHandle {
@@ -10,15 +10,17 @@ export interface MemoryHandle {
   revision: number;
   readonly slot: string;
   readonly moduleDigest: string;
+  readonly base?: PersistedMemoryBase;
   checkpoint?: MemoryCheckpoint;
   owner?: string;
 }
 
 export interface MemoryCheckpoint {
-  readonly session: BackendSessionRef;
+  readonly session?: BackendSessionRef;
+  readonly state?: BackendSessionState;
   readonly memoryRevision: number;
-  readonly agent: SymbolRef;
-  readonly workspaceKey: string;
+  readonly agent?: SymbolRef;
+  readonly workspaceKey?: string;
   readonly systemPrompt?: string;
 }
 

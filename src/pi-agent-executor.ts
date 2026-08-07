@@ -10,9 +10,11 @@ import {
   type AgentHarnessStreamOptions,
   type AgentHarnessTool,
   type AgentHarnessToolContextSource,
+  type AgentMessage,
   type ExecutionToolContext,
   type PromptTemplate,
   type Session,
+  type SessionTreeEntry,
   type Skill,
   type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
@@ -21,8 +23,10 @@ import {
   contentText,
   type Api,
   type AssistantMessage,
+  type ImageContent,
   type Model,
   type Models,
+  type TextContent,
   type Usage,
 } from "@earendil-works/pi-ai";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
@@ -33,6 +37,7 @@ import type {
   AgentExecutionResult,
   AgentExecutorBackend,
   AgentExecutorCapabilities,
+  AgentSessionImportRequest,
   BackendSessionRef,
 } from "./agent-executor.js";
 import { AgentExecutorError } from "./agent-executor.js";
@@ -40,6 +45,8 @@ import type { SymbolRef } from "./ir.js";
 import {
   AFL_MESSAGE_ROLE_SCHEMA,
   type AgentMemoryContract,
+  type BackendSessionRecord,
+  type BackendSessionState,
   type Message,
 } from "./memory.js";
 import { workspaceKey, type AgentWorkspaceSet } from "./workspace.js";
@@ -56,6 +63,7 @@ export interface PiAgentBinding<TContext extends object | undefined = undefined>
   readonly toolContext?: AgentHarnessToolContextSource<TContext>;
   readonly activeToolNames?: readonly string[];
   readonly thinkingLevel?: ThinkingLevel;
+  readonly thinkingReplay?: "include" | "exclude";
   readonly streamOptions?: AgentHarnessStreamOptions;
   readonly resources?: AgentHarnessResources;
   readonly createExecutionContext?: (
@@ -82,6 +90,7 @@ export interface PiCodingAgentBindingOptions {
   readonly model: Model<Api> | PiModelRef;
   readonly systemPrompt?: string;
   readonly thinkingLevel?: ThinkingLevel;
+  readonly thinkingReplay?: "include" | "exclude";
   readonly streamOptions?: AgentHarnessStreamOptions;
   readonly activeToolNames?: readonly string[];
 }
@@ -97,9 +106,17 @@ interface PiSessionRecord {
   readonly executionContext: PiExecutionContext<any>;
   readonly workspaceKey: string;
   readonly workspace: AgentWorkspaceSet;
+  sourceEntryCount: number;
+  readonly durableRecords: BackendSessionRecord[];
 }
 
 const PI_BACKEND_NAME = "pi";
+const PI_SESSION_FORMAT = "pi.session/v0";
+
+interface PiSessionPayload {
+  readonly version: 0;
+  readonly records: readonly BackendSessionRecord[];
+}
 
 export function createPiCodingAgentBinding(options: PiCodingAgentBindingOptions): PiAgentBinding<ExecutionToolContext> {
   return {
@@ -107,6 +124,7 @@ export function createPiCodingAgentBinding(options: PiCodingAgentBindingOptions)
     ...(options.systemPrompt === undefined ? {} : { systemPrompt: options.systemPrompt }),
     ...(options.activeToolNames === undefined ? {} : { activeToolNames: options.activeToolNames }),
     ...(options.thinkingLevel === undefined ? {} : { thinkingLevel: options.thinkingLevel }),
+    ...(options.thinkingReplay === undefined ? {} : { thinkingReplay: options.thinkingReplay }),
     ...(options.streamOptions === undefined ? {} : { streamOptions: options.streamOptions }),
     createExecutionContext: (workspace) => ({
       tools: [createReadTool(), createBashTool(), createEditTool(), createWriteTool()],
@@ -118,6 +136,7 @@ export function createPiCodingAgentBinding(options: PiCodingAgentBindingOptions)
 
 export class PiAgentExecutorBackend implements AgentExecutorBackend {
   readonly name = PI_BACKEND_NAME;
+  readonly sessionFormat = PI_SESSION_FORMAT;
   readonly capabilities: AgentExecutorCapabilities;
   readonly memory: AgentMemoryContract = Object.freeze({
     capabilities: Object.freeze({
@@ -226,7 +245,7 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     const preExecutionLeaf = await record.session.getLeafId();
     try {
       await this.importMessages(record, pending.slice(0, -1));
-      const unsubscribe = this.bindEvents(record.harness, host);
+      const unsubscribe = this.bindEvents(record, host);
       const removeApproval = this.bindApproval(record.harness, request, host);
       const abort = () => {
         void record.harness.abort().catch(() => {});
@@ -281,6 +300,7 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     });
     try {
       const executionContext = await this.resolveExecutionContext(source.binding, source.workspace);
+      const entries = await forkedSession.getEntries();
       const record = this.buildSessionRecord(
         forkedSession,
         source.agentName,
@@ -289,6 +309,8 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
         executionContext,
         source.workspaceKey,
         source.workspace,
+        entries.length,
+        sessionEntriesToRecords(entries),
       );
       const forkedMetadata = await forkedSession.getMetadata();
       this.sessions.set(forkedMetadata.id, record);
@@ -301,6 +323,67 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     } catch (error) {
       await this.deleteRawSession(forkedSession).catch(() => {});
       throw error;
+    }
+  }
+
+  async exportSession(session: BackendSessionRef, signal: AbortSignal): Promise<BackendSessionState> {
+    throwIfAborted(signal);
+    const record = this.requireSession(session);
+    const activeLeafId = await record.session.getLeafId();
+    const leafId = session.checkpoint ?? activeLeafId;
+    if (leafId !== null && await record.session.getEntry(leafId) === undefined) {
+      throw new AgentExecutorError("AGENT_SESSION_INVALID", `Pi checkpoint '${leafId}' does not exist`);
+    }
+    if (leafId !== activeLeafId) {
+      throw new AgentExecutorError("AGENT_SESSION_INVALID", "Pi cannot export a stale session checkpoint");
+    }
+    const payload = jsonRoundTrip({
+      version: 0,
+      records: record.durableRecords,
+    }) as PiSessionPayload;
+    return { backend: this.name, format: PI_SESSION_FORMAT, payload };
+  }
+
+  async importSession(request: AgentSessionImportRequest): Promise<BackendSessionRef> {
+    throwIfAborted(request.signal);
+    if (request.state.backend !== this.name || request.state.format !== PI_SESSION_FORMAT) {
+      throw new AgentExecutorError(
+        "AGENT_SESSION_INVALID",
+        `Pi cannot import session state '${request.state.backend}/${request.state.format}'`,
+      );
+    }
+    const payload = parsePiSessionPayload(request.state.payload);
+    const binding = this.resolveBinding(request.agent.name);
+    const effectiveSystemPrompt = request.systemPrompt ?? binding.systemPrompt;
+    const session = await this.sessionRepo.create();
+    try {
+      const model = this.resolveModel(binding.model);
+      await importSessionRecords(session, payload.records, model);
+      const executionContext = await this.resolveExecutionContext(binding, request.workspace);
+      const sourceEntryCount = (await session.getEntries()).length;
+      const record = this.buildSessionRecord(
+        session,
+        request.agent.name,
+        effectiveSystemPrompt,
+        binding,
+        executionContext,
+        workspaceKey(request.workspace),
+        request.workspace,
+        sourceEntryCount,
+        payload.records,
+      );
+      const metadata = await session.getMetadata();
+      const checkpoint = await session.getLeafId();
+      this.sessions.set(metadata.id, record);
+      return {
+        backend: this.name,
+        id: metadata.id,
+        ...(checkpoint === null ? {} : { checkpoint }),
+      };
+    } catch (error) {
+      await this.deleteRawSession(session).catch(() => {});
+      if (error instanceof AgentExecutorError) throw error;
+      throw new AgentExecutorError("AGENT_SESSION_INVALID", "Pi session continuation is invalid", { cause: error });
     }
   }
 
@@ -367,6 +450,8 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     executionContext: PiExecutionContext<any>,
     sessionWorkspaceKey: string,
     workspace: AgentWorkspaceSet,
+    sourceEntryCount = 0,
+    durableRecords: readonly BackendSessionRecord[] = [],
   ): PiSessionRecord {
     const harnessSystemPrompt = joinPrompts(systemPrompt, executionContext.contextPrompt);
     const harness = new AgentHarness<any, Skill, PromptTemplate, AgentHarnessTool<any>>({
@@ -389,6 +474,9 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
         ? {}
         : { resources: executionContext.resources ?? binding.resources }),
     });
+    if ((binding.thinkingReplay ?? "include") === "exclude") {
+      harness.on("context", (event) => ({ messages: withoutHistoricalThinking(event.messages) }));
+    }
     return {
       session,
       harness,
@@ -398,6 +486,8 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
       executionContext,
       workspaceKey: sessionWorkspaceKey,
       workspace,
+      sourceEntryCount,
+      durableRecords: structuredClone([...durableRecords]),
     };
   }
 
@@ -450,10 +540,14 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
       timestamp += 1;
       if (message.role === "user") {
         await record.harness.appendMessage({ role: "user", content: message.content, timestamp });
+        record.durableRecords.push(canonicalAppendRecord(message));
+        record.sourceEntryCount += 1;
         continue;
       }
       if (message.role === "assistant") {
         await record.harness.appendMessage(importedAssistantMessage(model, message.content, timestamp));
+        record.durableRecords.push(canonicalAppendRecord(message));
+        record.sourceEntryCount += 1;
         continue;
       }
       throw new AgentExecutorError(
@@ -463,8 +557,24 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     }
   }
 
-  private bindEvents(harness: AnyHarness, host: AgentExecutionHost): () => void {
-    return harness.subscribe(async (event) => {
+  private bindEvents(record: PiSessionRecord, host: AgentExecutionHost): () => void {
+    return record.harness.subscribe(async (event) => {
+      if (isSessionDurabilityEvent(event)) {
+        const entries = await record.session.getEntries({ afterEntrySeq: record.sourceEntryCount });
+        if (entries.length > 0) {
+          const records = sessionEntriesToRecords(entries);
+          if (records.length > 0) {
+            await host.persistContinuation({
+              backend: this.name,
+              format: PI_SESSION_FORMAT,
+              baseRecordCount: record.durableRecords.length,
+              records,
+            });
+            record.durableRecords.push(...structuredClone(records));
+          }
+          record.sourceEntryCount += entries.length;
+        }
+      }
       const mapped = mapEvent(event);
       if (mapped !== undefined) await host.emit(mapped);
     });
@@ -548,6 +658,498 @@ function importedAssistantMessage(model: Model<Api>, content: string, timestamp:
     stopReason: "stop",
     timestamp,
   };
+}
+
+function withoutHistoricalThinking(messages: readonly AgentMessage[]): AgentMessage[] {
+  let currentTurnStart = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === "user") {
+      currentTurnStart = index;
+      break;
+    }
+  }
+  return messages.map((message, index) => index < currentTurnStart && message.role === "assistant"
+    ? { ...message, content: message.content.filter((block) => block.type !== "thinking") }
+    : message);
+}
+
+function sessionEntriesToRecords(entries: readonly SessionTreeEntry[]): BackendSessionRecord[] {
+  const records = entries.flatMap(sessionEntryToRecords);
+  return jsonRoundTrip(records) as BackendSessionRecord[];
+}
+
+function sessionEntryToRecords(entry: SessionTreeEntry): BackendSessionRecord[] {
+  switch (entry.type) {
+    case "message":
+      return [agentMessageToRecord(entry.message)];
+    case "thinking_level_change":
+      return [{ type: "session.thinking", level: entry.thinkingLevel }];
+    case "model_change":
+      return [{ type: "session.model", provider: entry.provider, model: entry.modelId }];
+    case "active_tools_change":
+      return [{ type: "session.tools", names: [...entry.activeToolNames] }];
+    case "compaction":
+      return [{
+        type: "session.compaction",
+        summary: encodeText(entry.summary),
+        tokens_before: entry.tokensBefore,
+        ...(entry.retainedTail === undefined
+          ? {}
+          : { retained_tail: entry.retainedTail.map(agentMessageToRecord) }),
+        ...(entry.details === undefined ? {} : { details: entry.details }),
+        ...(entry.fromHook === undefined ? {} : { from_hook: entry.fromHook }),
+      }];
+    case "branch_summary":
+      return [{
+        type: "session.branch_summary",
+        summary: encodeText(entry.summary),
+        ...(entry.details === undefined ? {} : { details: entry.details }),
+        ...(entry.fromHook === undefined ? {} : { from_hook: entry.fromHook }),
+      }];
+    case "custom":
+      return [{
+        type: "session.custom",
+        custom_type: entry.customType,
+        ...(entry.data === undefined ? {} : { data: entry.data }),
+      }];
+    case "custom_message":
+      return [{
+        type: "session.custom_message",
+        custom_type: entry.customType,
+        display: entry.display,
+        ...encodeSimpleContent(entry.content),
+        ...(entry.details === undefined ? {} : { details: entry.details }),
+      }];
+    case "session_info":
+      return entry.name === undefined ? [] : [{ type: "session.name", name: entry.name }];
+    case "label":
+    case "leaf":
+      return [];
+  }
+}
+
+function agentMessageToRecord(message: AgentMessage): BackendSessionRecord {
+  if (message.role === "user") return { type: "user", ...encodeSimpleContent(message.content) };
+  if (message.role === "toolResult") {
+    return {
+      type: "tool.result",
+      id: message.toolCallId,
+      name: message.toolName,
+      status: message.isError ? "error" : "ok",
+      ...encodeSimpleContent(message.content),
+      ...(message.details === undefined ? {} : { details: message.details }),
+      ...(message.addedToolNames === undefined ? {} : { added_tools: [...message.addedToolNames] }),
+    };
+  }
+  if (message.role === "bashExecution") {
+    return {
+      type: "session.bash",
+      command: encodeText(message.command),
+      output: encodeText(message.output),
+      ...(message.exitCode === undefined ? {} : { exit_code: message.exitCode }),
+      cancelled: message.cancelled,
+      truncated: message.truncated,
+      ...(message.fullOutputPath === undefined ? {} : { full_output_path: message.fullOutputPath }),
+      ...(message.excludeFromContext === undefined ? {} : { exclude_from_context: message.excludeFromContext }),
+    };
+  }
+  if (message.role === "custom") {
+    return {
+      type: "session.custom_message",
+      custom_type: message.customType,
+      display: message.display,
+      ...encodeSimpleContent(message.content),
+      ...(message.details === undefined ? {} : { details: message.details }),
+    };
+  }
+  if (message.role === "branchSummary") {
+    return { type: "session.branch_summary", summary: encodeText(message.summary) };
+  }
+  if (message.role === "compactionSummary") {
+    return {
+      type: "session.compaction",
+      summary: encodeText(message.summary),
+      tokens_before: message.tokensBefore,
+    };
+  }
+  const final = message.stopReason === "stop";
+  const first = message.content[0];
+  const simple = message.content.length === 1 && first?.type === "text" && first.textSignature === undefined;
+  return {
+    type: "assistant",
+    ...(simple
+      ? { text: encodeText((first as TextContent).text) }
+      : { content: message.content.map(encodeAssistantBlock) }),
+    ...(final && simple ? {} : { final }),
+    ...(message.stopReason === "stop" ? {} : { stop_reason: message.stopReason }),
+    ...(message.errorMessage === undefined ? {} : { error: message.errorMessage }),
+  };
+}
+
+function canonicalAppendRecord(message: Message): BackendSessionRecord {
+  return { type: "session.append", role: message.role, text: encodeText(message.content) };
+}
+
+function encodeSimpleContent(
+  content: string | readonly (TextContent | ImageContent)[],
+): Record<string, unknown> {
+  if (typeof content === "string") return { text: encodeText(content) };
+  if (content.length === 1 && content[0]?.type === "text" &&
+      typeof content[0].text === "string" && content[0].textSignature === undefined) {
+    return { text: encodeText(content[0].text) };
+  }
+  return { content: content.map((block) => encodeSimpleBlock(block)) };
+}
+
+function encodeSimpleBlock(block: TextContent | ImageContent): BackendSessionRecord {
+  if (block.type === "text") {
+    return {
+      type: "text",
+      text: encodeText(block.text),
+      ...(block.textSignature === undefined ? {} : { signature: block.textSignature }),
+    };
+  }
+  return { type: "image", data: block.data, mime_type: block.mimeType };
+}
+
+function encodeAssistantBlock(
+  block: AssistantMessage["content"][number],
+): BackendSessionRecord {
+  if (block.type === "text") {
+    return {
+      type: "text",
+      text: encodeText(block.text),
+      ...(block.textSignature === undefined ? {} : { signature: block.textSignature }),
+    };
+  }
+  if (block.type === "thinking") {
+    return {
+      type: "thinking",
+      text: encodeText(block.thinking),
+      ...(block.thinkingSignature === undefined ? {} : { signature: block.thinkingSignature }),
+      ...(block.redacted === undefined ? {} : { redacted: block.redacted }),
+    };
+  }
+  return {
+    type: "tool.call",
+    id: block.id,
+    name: block.name,
+    arguments: structuredClone(block.arguments),
+    ...(block.thoughtSignature === undefined ? {} : { signature: block.thoughtSignature }),
+  };
+}
+
+async function importSessionRecords(
+  session: Session,
+  records: readonly BackendSessionRecord[],
+  model: Model<Api>,
+): Promise<void> {
+  let timestamp = Date.now() - records.length;
+  for (const record of records) {
+    timestamp += 1;
+    if (record.type === "append" || record.type === "session.append") {
+      const role = requireString(record.role, "append role");
+      if (role !== "user" && role !== "assistant") {
+        throw new AgentExecutorError("AGENT_MEMORY_ROLE_UNSUPPORTED", `Pi cannot restore AFL Memory role '${role}'`);
+      }
+      await session.appendMessage(role === "user"
+        ? { role, content: decodeText(record.text, "append text"), timestamp }
+        : importedAssistantMessage(model, decodeText(record.text, "append text"), timestamp));
+      continue;
+    }
+    if (record.type === "user" || record.type === "assistant" || record.type === "tool.result") {
+      await session.appendMessage(recordToAgentMessage(record, model, timestamp));
+      continue;
+    }
+    if (record.type === "session.thinking") {
+      await session.appendThinkingLevelChange(requireString(record.level, "thinking level"));
+      continue;
+    }
+    if (record.type === "session.model") {
+      await session.appendModelChange(
+        requireString(record.provider, "model provider"),
+        requireString(record.model, "model id"),
+      );
+      continue;
+    }
+    if (record.type === "session.tools") {
+      await session.appendActiveToolsChange(requireStringArray(record.names, "active tools"));
+      continue;
+    }
+    if (record.type === "session.compaction") {
+      const retainedTail = record.retained_tail === undefined
+        ? undefined
+        : requireRecordArray(record.retained_tail, "retained tail")
+          .map((item, index) => recordToAgentMessage(item, model, timestamp + index));
+      await session.appendCompaction(
+        decodeText(record.summary, "compaction summary"),
+        undefined,
+        requireNonNegativeNumber(record.tokens_before, "compaction token count"),
+        record.details,
+        optionalBoolean(record.from_hook, "compaction from_hook"),
+        undefined,
+        retainedTail,
+      );
+      continue;
+    }
+    if (record.type === "session.branch_summary") {
+      const fromHook = optionalBoolean(record.from_hook, "branch summary from_hook");
+      await session.moveTo(await session.getLeafId(), {
+        summary: decodeText(record.summary, "branch summary"),
+        ...(record.details === undefined ? {} : { details: record.details }),
+        ...(fromHook === undefined ? {} : { fromHook }),
+      });
+      continue;
+    }
+    if (record.type === "session.custom") {
+      await session.appendCustomEntry(requireString(record.custom_type, "custom type"), record.data);
+      continue;
+    }
+    if (record.type === "session.custom_message") {
+      await session.appendCustomMessageEntry(
+        requireString(record.custom_type, "custom message type"),
+        decodeSimpleContent(record, "custom message"),
+        requireBoolean(record.display, "custom message display"),
+        record.details,
+      );
+      continue;
+    }
+    if (record.type === "session.name") {
+      await session.appendSessionName(requireString(record.name, "session name"));
+      continue;
+    }
+    if (record.type === "session.bash") {
+      await session.appendMessage({
+        role: "bashExecution",
+        command: decodeText(record.command, "bash command"),
+        output: decodeText(record.output, "bash output"),
+        exitCode: record.exit_code === undefined
+          ? undefined
+          : requireInteger(record.exit_code, "bash exit code"),
+        cancelled: requireBoolean(record.cancelled, "bash cancelled"),
+        truncated: requireBoolean(record.truncated, "bash truncated"),
+        ...(record.full_output_path === undefined
+          ? {}
+          : { fullOutputPath: requireString(record.full_output_path, "bash output path") }),
+        ...(record.exclude_from_context === undefined
+          ? {}
+          : { excludeFromContext: requireBoolean(record.exclude_from_context, "bash context exclusion") }),
+        timestamp,
+      });
+      continue;
+    }
+    throw new AgentExecutorError("AGENT_SESSION_INVALID", `Unknown Pi continuation record '${record.type}'`);
+  }
+}
+
+function recordToAgentMessage(record: BackendSessionRecord, model: Model<Api>, timestamp: number): AgentMessage {
+  if (record.type === "user") {
+    return { role: "user", content: decodeSimpleContent(record, "user message"), timestamp };
+  }
+  if (record.type === "tool.result") {
+    return {
+      role: "toolResult",
+      toolCallId: requireString(record.id, "tool result id"),
+      toolName: requireString(record.name, "tool result name"),
+      content: decodeSimpleContentBlocks(record, "tool result"),
+      ...(record.details === undefined ? {} : { details: record.details }),
+      ...(record.added_tools === undefined
+        ? {}
+        : { addedToolNames: requireStringArray(record.added_tools, "added tools") }),
+      isError: record.status === "error",
+      timestamp,
+    };
+  }
+  if (record.type !== "assistant") {
+    throw new AgentExecutorError("AGENT_SESSION_INVALID", `Record '${record.type}' is not a Pi message`);
+  }
+  const stopReason = record.stop_reason === undefined
+    ? "stop"
+    : requireString(record.stop_reason, "assistant stop reason");
+  if (!["stop", "length", "toolUse", "error", "aborted"].includes(stopReason)) {
+    throw new AgentExecutorError("AGENT_SESSION_INVALID", `Pi assistant stop reason '${stopReason}' is invalid`);
+  }
+  return {
+    role: "assistant",
+    content: decodeAssistantContent(record),
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    usage: emptyUsage(),
+    stopReason: stopReason as AssistantMessage["stopReason"],
+    ...(record.error === undefined ? {} : { errorMessage: requireString(record.error, "assistant error") }),
+    timestamp,
+  };
+}
+
+function decodeAssistantContent(record: BackendSessionRecord): AssistantMessage["content"] {
+  if (record.text !== undefined) return [{ type: "text", text: decodeText(record.text, "assistant text") }];
+  const blocks = requireRecordArray(record.content, "assistant content");
+  return blocks.map((block) => {
+    if (block.type === "text") {
+      return {
+        type: "text" as const,
+        text: decodeText(block.text, "assistant text"),
+        ...(block.signature === undefined ? {} : { textSignature: requireString(block.signature, "text signature") }),
+      };
+    }
+    if (block.type === "thinking") {
+      return {
+        type: "thinking" as const,
+        thinking: decodeText(block.text, "assistant thinking"),
+        ...(block.signature === undefined
+          ? {}
+          : { thinkingSignature: requireString(block.signature, "thinking signature") }),
+        ...(block.redacted === undefined ? {} : { redacted: requireBoolean(block.redacted, "thinking redacted") }),
+      };
+    }
+    if (block.type === "tool.call") {
+      if (!isRecord(block.arguments)) {
+        throw new AgentExecutorError("AGENT_SESSION_INVALID", "Pi tool call arguments are invalid");
+      }
+      return {
+        type: "toolCall" as const,
+        id: requireString(block.id, "tool call id"),
+        name: requireString(block.name, "tool call name"),
+        arguments: structuredClone(block.arguments),
+        ...(block.signature === undefined
+          ? {}
+          : { thoughtSignature: requireString(block.signature, "tool call signature") }),
+      };
+    }
+    throw new AgentExecutorError("AGENT_SESSION_INVALID", `Unknown Pi assistant block '${String(block.type)}'`);
+  });
+}
+
+function decodeSimpleContent(
+  record: BackendSessionRecord,
+  description: string,
+): string | Array<{ type: "text"; text: string; textSignature?: string } | { type: "image"; data: string; mimeType: string }> {
+  if (record.text !== undefined) return decodeText(record.text, `${description} text`);
+  return decodeSimpleContentBlocks(record, description);
+}
+
+function decodeSimpleContentBlocks(
+  record: BackendSessionRecord,
+  description: string,
+): Array<{ type: "text"; text: string; textSignature?: string } | { type: "image"; data: string; mimeType: string }> {
+  if (record.text !== undefined) {
+    return [{ type: "text", text: decodeText(record.text, `${description} text`) }];
+  }
+  return requireRecordArray(record.content, `${description} content`).map((block) => {
+    if (block.type === "text") {
+      return {
+        type: "text" as const,
+        text: decodeText(block.text, `${description} text`),
+        ...(block.signature === undefined ? {} : { textSignature: requireString(block.signature, "text signature") }),
+      };
+    }
+    if (block.type === "image") {
+      return {
+        type: "image" as const,
+        data: requireString(block.data, `${description} image data`),
+        mimeType: requireString(block.mime_type, `${description} image MIME type`),
+      };
+    }
+    throw new AgentExecutorError("AGENT_SESSION_INVALID", `Unknown ${description} block '${String(block.type)}'`);
+  });
+}
+
+function encodeText(content: string): string | string[] {
+  return content.includes("\n") ? content.split("\n") : content;
+}
+
+function decodeText(value: unknown, description: string): string {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value) && value.every((line) => typeof line === "string")) return value.join("\n");
+  throw new AgentExecutorError("AGENT_SESSION_INVALID", `Pi ${description} is invalid`);
+}
+
+function requireRecordArray(value: unknown, description: string): BackendSessionRecord[] {
+  if (!Array.isArray(value) || !value.every((item) => isRecord(item) && typeof item.type === "string")) {
+    throw new AgentExecutorError("AGENT_SESSION_INVALID", `Pi ${description} is invalid`);
+  }
+  return value as BackendSessionRecord[];
+}
+
+function requireStringArray(value: unknown, description: string): string[] {
+  if (!Array.isArray(value) || !value.every((item) => typeof item === "string")) {
+    throw new AgentExecutorError("AGENT_SESSION_INVALID", `Pi ${description} is invalid`);
+  }
+  return [...value];
+}
+
+function requireString(value: unknown, description: string): string {
+  if (typeof value !== "string") {
+    throw new AgentExecutorError("AGENT_SESSION_INVALID", `Pi ${description} is invalid`);
+  }
+  return value;
+}
+
+function requireBoolean(value: unknown, description: string): boolean {
+  if (typeof value !== "boolean") {
+    throw new AgentExecutorError("AGENT_SESSION_INVALID", `Pi ${description} is invalid`);
+  }
+  return value;
+}
+
+function optionalBoolean(value: unknown, description: string): boolean | undefined {
+  return value === undefined ? undefined : requireBoolean(value, description);
+}
+
+function requireNonNegativeNumber(value: unknown, description: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new AgentExecutorError("AGENT_SESSION_INVALID", `Pi ${description} is invalid`);
+  }
+  return value;
+}
+
+function requireInteger(value: unknown, description: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    throw new AgentExecutorError("AGENT_SESSION_INVALID", `Pi ${description} is invalid`);
+  }
+  return value;
+}
+
+function parsePiSessionPayload(value: unknown): PiSessionPayload {
+  if (!isRecord(value) || value.version !== 0 || !Array.isArray(value.records)) {
+    throw new AgentExecutorError("AGENT_SESSION_INVALID", "Pi session continuation payload is invalid");
+  }
+  for (const record of value.records) {
+    if (!isRecord(record) || typeof record.type !== "string" || record.type.length === 0 || !isJsonValue(record)) {
+      throw new AgentExecutorError("AGENT_SESSION_INVALID", "Pi session continuation contains invalid entries");
+    }
+  }
+  return {
+    version: 0,
+    records: structuredClone(value.records) as BackendSessionRecord[],
+  };
+}
+
+function isSessionDurabilityEvent(event: AgentHarnessEvent): boolean {
+  return event.type === "message_end" || event.type === "save_point" ||
+    event.type === "session_compact" || event.type === "session_tree";
+}
+
+function jsonRoundTrip(value: unknown): unknown {
+  try {
+    const serialized = JSON.stringify(value);
+    if (serialized === undefined) throw new TypeError("value is not JSON serializable");
+    return JSON.parse(serialized) as unknown;
+  } catch (error) {
+    throw new AgentExecutorError("AGENT_SESSION_INVALID", "Pi session cannot be serialized", { cause: error });
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isJsonValue(value: unknown): boolean {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (Array.isArray(value)) return value.every(isJsonValue);
+  return isRecord(value) && Object.values(value).every((item) => item !== undefined && isJsonValue(item));
 }
 
 function mapEvent(event: AgentHarnessEvent): AgentExecutionEvent | undefined {

@@ -17,7 +17,9 @@
 - `memory.append`、`memory.copy`、`memory.apply` 继续保留，因为它们描述 Agent 之间如何操作和传递记忆，而不是描述存储设施；
 - 所有持久化记忆统一存放在 AFL execution root 下，不跟随各 Agent Workspace 分散保存；
 - binding 只能改变 Memory 存储目录或替换存储实现，不改变 AFL IR；
-- 首版只持久化 canonical Memory，不持久化或恢复 backend session、checkpoint 和完整 VM snapshot。
+- 每个真正进入过 `agent.do` 的 Memory 使用一份可增量追加的 pretty JSON stream，同时保存 canonical Memory 和 executor-owned continuation；后者用于恢复工具调用、thinking、compaction 等原生记录，但不进入 AFL IR；
+- `memory.copy` 和 `fork` 只建立惰性 base 引用，不因复制动作本身创建持久化文件；
+- 不恢复 instruction pointer、TaskGroup 或正在运行的外部工具进程，因此这仍不是完整 VM snapshot。
 
 ### Agent 语法
 
@@ -206,7 +208,8 @@ Agent 派生规则如下：
 - `memory.apply` 使用 source Agent 的 symbol、system prompt 和 Workspace 配置；
 - `memory.copy` 只复制 Memory，不携带 Workspace；
 - Agent 创建后 Workspace 配置不可由 AFL mutation；
-- checkpoint/session compatibility key 包含 Agent symbol、effective system prompt、model/binding identity 和带 access mode 的规范 Workspace roots。
+- 当前进程内的 live checkpoint/session compatibility key 包含 Agent symbol、effective system prompt、model/binding identity 和带 access mode 的规范 Workspace roots；
+- 持久化 continuation 由同名 executor 导入，并用目标 Agent 当前 binding 重建 harness。切换 executor 必须显式失败，不能只保留 canonical Message 后静默降级。
 
 ### VM 内部 Memory 持久化
 
@@ -235,13 +238,15 @@ Root entry、local call site、generated flow call site、dispatch task index �
 
 只有实际创建新 Memory 的位置分配 slot：隐式 Agent working Memory、`memory.copy` 和 `fork` branch。第三个 operand、`memory.apply`、node 参数或本地 flow call 传递已有 Memory handle 时沿用原 slot，不重新分配。VM 为每个 run 维护 `claimedSlots`；不同 live Memory handle claim 同一 slot 属于稳定错误，不能加载同一份 Message 后各自覆盖。
 
-新建的空 working Memory 可以只注册 slot，延迟到第一次 Message append 再写文件，因为“slot 不存在”和“从未写入的空 Memory”在下一次执行中等价。`memory.copy` 创建时已经包含 canonical Message，属于一次 durable allocation；copy instruction 必须在新 slot 保存成功后才完成，即使之后没有任何 append。`fork` branch 的首次 `agent.do` 输入提交同时保存其复制内容和新输入。
+Memory handle 和 persistence slot 可以在 VM 内提前创建，但默认文件 store 只有在该 Memory 第一次真正进入 `agent.do` 时才物化文件。Agent declaration、`memory.apply`、`memory.copy`、`fork` 和首次使用前的 `memory.append` 都只更新内存状态，不单独触发文件创建；第一次 `agent.do` 会先物化此前积累的 canonical Message 或 base 引用，再写入本次调用。已经物化的 Memory 继续增量保存后续 `memory.append` 和 `agent.do` 消息。
+
+`memory.copy` 和 `fork` 创建惰性 `{source slot, revision}` 引用，不复制源文件内容。副本从未被 Agent 使用，就不会留下文件；副本第一次进入 `agent.do` 时才创建自己的文件 header。若源 Memory 尚未物化，则它作为这次 Agent 上下文的传递依赖一并物化，保证 base 引用可以跨进程解析。
 
 同一 `runId` 中，slot identity 表示同一个长期 Memory。Allocation 时若 slot 已存在，VM 恢复其 Message/revision，并忽略本次 empty/copy/fork initializer；`memory.copy` 和 `fork` 只在 slot 首次出现时从 source 初始化。这是 persistence 对 allocation 的明确语义，不做隐式 merge 或 rebase。Flow 需要新的逻辑副本时必须使用新的 `runId`，或让它出现在不同的结构 activation/slot。
 
 同一 `runId` 再次启动相同 flow 时，VM 在 Memory handle 创建时按 slot 恢复 Message 和 revision。新的 `runId` 创建独立状态。`runId` 是 VM/CLI 参数，不进入 AFL IR。
 
-状态文件的 `rootModuleDigest` 必须与当前 root module 的 canonical IR 完全匹配，否则整个 run state 拒绝加载，不做按 slot 猜测的部分迁移。动态 generated flow 使用自己的 module digest 作为 slot segment，并由父 generated-flow call site 定位；生成源码变化时产生新 slot，旧 slot 继续保留。这不是完整 VM resume：执行仍从 entry 开始，不恢复 instruction pointer、条件分支、TaskGroup 或未完成外部调用。如果控制路径变化，不再出现的 slot 不会被绑定到其他 Memory。
+`program.jsons` header 的 root module digest 必须与当前 root module 的 canonical IR 完全匹配，否则整个 run state 拒绝加载，不做按 slot 猜测的部分迁移。动态 generated flow 使用自己的 module digest 作为 slot segment，并由父 generated-flow call site 定位；生成源码变化时产生新 slot，旧 slot 继续保留。这不是完整 VM resume：执行仍从 entry 开始，不恢复 instruction pointer、条件分支、TaskGroup 或外部工具进程。如果控制路径变化，不再出现的 slot 不会被绑定到其他 Memory。
 
 重复使用同一 `runId` 表示在已有 canonical Memory 上开始一次新的 flow execution。所有 `memory.append` 和 `agent.do` 都按本次执行正常追加，VM 不根据指令位置隐式去重。因此它适合“继续同一段对话”，不是失败指令的透明重放；包含一次性初始化 append 的 flow 应使用新 `runId`，或由 flow 自身决定是否再次追加。
 
@@ -257,17 +262,18 @@ assistant
 toolResult
 ```
 
-Pi Agent Core 的 session 比这更丰富。除了 Message entry，它还保存 model、thinking level、active tools、compaction、branch summary、custom message、label 和当前 leaf 等树形状态；AgentMessage 还可以出现 `bashExecution`、`custom`、`branchSummary`、`compactionSummary` 等扩展 role。Pi 自带的持久化实现使用 version 3 JSONL session，header 包含 session id、cwd 和 metadata，后续每行是一个带 parent id 的 session entry。
+Pi Agent Core 的 session 比这更丰富。除了 Message entry，它还保存 model、thinking level、active tools、compaction、branch summary、custom message、label 和当前 leaf 等树形状态；AgentMessage 还可以出现 `bashExecution`、`custom`、`branchSummary`、`compactionSummary` 等扩展 role。AFL 不直接复制 Pi 自带的 session 文件格式，而由 Pi executor codec 将恢复所需信息写入 AFL 的语义化 message records。
 
-当前 AFL Pi backend 尚未使用该 JSONL repo，而是使用 `InMemorySessionRepo`。AFL 与 Pi 的现有转换边界也比 Pi 原生 session 更窄：
+当前 AFL Pi backend 使用 `InMemorySessionRepo`，由 VM 把完整的 message records 追加到对应 Memory 文件，而不让 Pi 在各 Workspace 下另建 session 文件。AFL 与 Pi 的转换边界分成两层：
 
 - AFL Memory 可以保存任意字符串 role；
 - Pi backend Memory facet 的 `importRoles` 目前只有 `user` 和 `assistant`；
 - Pi 执行要求最新未同步 Message 是 `user`；
 - 导入 assistant 时，adapter 会根据当前 Pi model 补齐 api、provider、model、usage 和 timestamp；
-- tool result、tool call、thinking、compaction 和其他 Pi session entry 当前不会导出到 AFL Memory。
+- canonical Memory 只导入 `user`/`assistant` 边界消息；
+- tool result、tool call、thinking、compaction 和其他 Pi session 内容由 executor codec 保存在结构化 message 中，不伪装成 AFL canonical role。
 
-因此 v1 持久化文件保存的是可检查的 AFL canonical Memory，不是 Pi 原生 session。Role 继续使用 AFL label，并由 `roleSchema` 标记序列化与核心语义版本；executor adapter 负责把 canonical role 映射为自己的 native role。VM 不把 `human`、`model`、`toolResult` 等 executor/provider label 直接改写成 AFL role。
+因此 v0 文件中的 `message` record 同时服务于人工回溯和 executor continuation 恢复。Canonical `user`/最终 `assistant` 仍投影为 AFL Memory；thinking、tool call、tool result 等内容只属于 executor continuation。Executor adapter 负责把这些结构映射为自己的 native session，VM 不把 `human`、`model`、`toolResult` 等 provider label直接改写成 AFL role，也不保存一份重复的 native session snapshot。
 
 AFL 层的两个数据类型继续保持最小语义：
 
@@ -277,7 +283,7 @@ Message = { role: AFL role label, content: string }
 Memory  = Message[]
 ```
 
-`afl.message-role/v1` 保留 `user` 和 `assistant` 作为核心 role；`memory.append` 仍可以写入其他非空 role label，它们是 AFL extension role，不等于某个 provider 的原生 role，也不保证所有 executor 都能导入。平台无关指的是表示和语义不依附某个 backend，不代表每个 backend 都支持所有 extension role。
+`afl.message-role/v0` 保留 `user` 和 `assistant` 作为核心 role；`memory.append` 仍可以写入其他非空 role label，它们是 AFL extension role，不等于某个 provider 的原生 role，也不保证所有 executor 都能导入。平台无关指的是表示和语义不依附某个 backend，不代表每个 backend 都支持所有 extension role。
 
 Frag 本身永远没有 role。只有 Frag 被 `agent.do` 或 `memory.append` 放进 Memory 时，flow 才为它赋予 AFL role；Agent 输出写入自身 Memory 时使用 canonical assistant role，但返回给 flow 的结果仍是 role-free Frag。`Message` 和 role schema 常量移动到独立的 core Memory module，不能继续由 `adapters.ts` 拥有。
 
@@ -304,37 +310,43 @@ interface AgentExecutorBackend {
 }
 ```
 
-上面只列出本计划新增的 Memory facet，现有 `name`、其他 capabilities、`execute` 和当前进程内的 session lifecycle 仍保留。现有顶层 `memoryImportRoles` 移入该 facet；首版删除未被 Pi 使用的 `memoryExport`/`exportMemory`，等确实需要从 native session 重建 canonical Memory 时再单独设计。
+上面只列出 Memory facet。完整 continuation 通过 executor session lifecycle 的增量 message codec 与 `exportSession`/`importSession` 扩展点保存和恢复；record 必须可 JSON 序列化，并由 Memory header 中的 executor/format 标识。VM 只负责顺序追加、复制引用和按 executor 分发，不解析 executor-owned content block。
 
 Pi、其他 Agent platform 或普通 model adapter 分别实现 Memory facet，AFL parser/IR/Memory handle 无需知道它们的 native role。Facet capability 是运行时能力，不写入 AFL Memory payload。
 
 VM 与 executor 的公共边界始终只收发 canonical `Message[]`。在每次 `agent.do` 创建或续接 backend session 前，VM 使用完整 Memory 调用 `validateImport`，executor 再在 `execute` 内部转换 native message。Memory facet 校验失败只阻止该 Agent 执行，不删除已经持久化的 canonical Message，因为同一 Memory 仍可能交给另一个兼容 executor。
 
-首版从 `AgentExecutionResult` 和兼容 `AgentRunResult` 删除可选 `messages`。Backend 只返回最终 role-free output，VM 是唯一有权把它追加为 canonical assistant Message 的组件。Pi 的 tool、thinking、compaction 等 backend-only entry 继续留在当前进程的 native session 中，不建立目前没有实际消费者的第二套 Memory delta 协议。
+Backend 只返回最终 role-free output，VM 是唯一有权把它投影为 canonical assistant Message 的组件。Pi 在形成完整 assistant/tool message 后立即交给 persistence host；文件只写一次结构化消息，不在 `do` 结束时再次导出和复制完整 session。
+
+Pi binding 额外提供 `thinkingReplay: "include" | "exclude"`。默认 `include`，让同一 Pi session 的历史 thinking 继续进入后续模型上下文；`exclude` 只在 provider request 前过滤 assistant 的 `thinking` content block，不删除持久化 entry，也不删除 tool call 上可能用于 provider 连续性的 `thoughtSignature`。因此同一份完整记录可以由不同 Agent binding 选择不同 replay 策略。
 
 恢复规则采用保守策略：
 
 - canonical Memory 总是可以独立加载，不因 executor 缺失而损坏；
 - 每次执行 Agent 前，当前 executor 的 Memory facet 必须校验 `roleSchema` 和全部 canonical roles，不只在持久化恢复后校验；
 - VM 不因 backend 不可用或校验失败而自动切换 executor；一个 Agent activation 选定 backend 后保持不变；
-- host 可以通过显式 binding 把纯 AFL Memory 交给另一个兼容 executor/model，但必须创建新 session，不能复用旧 backend checkpoint；
+- 没有 continuation 时，host 可以通过显式 binding 把纯 AFL Memory 交给任一兼容 executor/model，并创建新 session；
+- 存在 continuation 时必须由同名 executor 导入；不同 executor 不能静默丢弃原生记录并从 canonical Memory 降级重建；
 - Memory facet 不支持某个 role 时显式失败，不能自动改名、删除或压平 Message；
-- `memory.copy` 只复制 canonical Message；`memory.apply` 由目标 Agent 当前 executor 的 Memory facet 重新验证；
+- `memory.copy` 同时冻结 canonical Message 和 continuation 的 source revision，但持久化层只建立 base 引用；`memory.apply` 由目标 Agent 当前 executor 验证 canonical Memory，并由 continuation 所属 executor 使用目标 binding 重建独立 session；
 - 跨 executor 迁移不需要改写 AFL Memory 文件，只需要目标 Memory facet 能完整导入其 role schema。
 
 Pi 已经为不同 provider/model 提供统一 Message 层，所以纯 `user/assistant` AFL Memory 通常可以重新导入不同 Pi model，但每次仍由目标 binding 的 Memory facet 做能力校验并创建新 session。
 
-Snapshot 恢复明确不在本计划范围内。`BackendSessionRef`、Pi session tree 和 checkpoint 只用于当前 VM 进程内的性能与 fork 优化，VM 退出后不恢复。未来如果需要 snapshot，将在独立提案中定义 backend-owned 格式和严格兼容性，不扩展本次 Memory 文件。
+完整 VM snapshot 恢复仍不在本计划范围内：instruction pointer、条件分支、TaskGroup、正在运行的外部工具进程和 Workspace 文件状态都不恢复。这里恢复的是文件中已经完整写入的 Agent conversation；最后一条记录若是尚无结果的 tool call，则作为 pending call 交给 executor 的恢复策略处理。Flow 仍从 entry 重新执行。持久化 continuation 与 executor 格式绑定；升级不兼容的 executor 格式或切换 executor 时显式报错。
 
 ### 统一 Memory 存储位置
 
-默认状态文件位于：
+默认状态位于：
 
 ```text
-<executionRoot>/.afl/memory/<encoded-run-id>.json
+<executionRoot>/.afl/memory/afl-<YYYYMMDD-HHmmss>-<short-id>/program.jsons
+<executionRoot>/.afl/memory/afl-<YYYYMMDD-HHmmss>-<short-id>/<memory-label>.jsons
 ```
 
-所有 Agent 的 Memory 都进入这一份 run state。Agent 主工作区和只读工作区不参与持久化路径计算，因此编号 Workspace 不会各自产生一套分散的 Memory cache。
+`afl` 是固定目录 header，创建日期用于人工定位，`short-id` 只用于避免同一时刻冲突并辅助查找 `runId`，不把 workflow 或任务名称编码进目录。再次使用相同 `runId` 时定位并复用原目录，而不是用当前日期新建目录。
+
+`program.jsons` 只记录 run 级 begin/end 和 module digest；它不是 VM snapshot。每个真正进入过 `agent.do` 的逻辑 Memory 使用一个可读名称的 JSON stream 文件，同名动态实例添加顺序编号，例如 `review-memory-01.jsons`。Agent 主工作区和只读工作区不参与持久化路径计算，因此编号 Workspace 不会各自产生一套分散的 Memory cache。
 
 Binding 可以覆盖统一目录或替换存储实现：
 
@@ -346,72 +358,183 @@ interface MemoryPersistenceBinding {
 
 interface MemoryStateStore {
   loadRun(runId: string, signal: AbortSignal): Promise<PersistedRunMemoryState | undefined>;
-  saveRun(state: PersistedRunMemoryState, signal: AbortSignal): Promise<void>;
+  saveRun(state: PersistedRunMemoryState, signal: AbortSignal, context?: MemorySaveContext): Promise<void>;
 }
 ```
 
-这里有两个彼此独立的 backend 扩展点：`MemoryStateStore` 决定 canonical Memory 保存到文件、内存或其他介质；`AgentMemoryContract` 声明并校验具体模型或 Agent executor 的导入能力。前者不理解模型 role，后者不决定持久化位置。
+这里有三个彼此独立的扩展点：`MemoryStateStore` 决定统一 run state 保存到文件、内存或其他介质；`AgentMemoryContract` 声明 canonical Memory 的导入能力；executor 的 session codec 负责 continuation message 的序列化和恢复。默认文件 store 可以在内部提供增量追加接口，但不把文件 framing 强加给自定义 snapshot store。
 
 规则如下：
 
 - `memoryPersistence` 未配置时使用 execution root 下的默认目录；
 - `directory` 相对路径以 execution root 解析；
 - `directory` 与 `store` 二选一，同时配置属于 binding error；
-- 自定义 store 仍保存统一 run state，不把存储职责交给单个 Agent；
-- `saveRun` 成功返回表示整份 run state 已原子提交；自定义 store 不能暴露部分更新；
+- 自定义 store 仍接收完整逻辑 run state；默认文件 store 使用 pretty JSON stream 增量追加；
+- 每条完整 record append 后都 flush/sync，本身就是可恢复状态，不需要额外 commit；
 - parse、validate 和构造 VM 时不创建 `.afl`，第一次实际保存时再创建目录。
 
 VM 在 run 开始时为 `(store namespace, runId)` 注册一个活跃的顶层 run context，并在 run 的 `finally` 中注销。默认文件 store 的 namespace 是规范化 Memory 目录；自定义 store 使用 store instance identity。同一进程不能同时启动第二个同 namespace、同 `runId` 的顶层 run，否则两套 run-level persistence queue 会竞争整份 state。这个限制不影响同一 run 内的并发 Agent，它们共享同一个 context 和 queue。跨进程的同 `runId` 并发执行仍不属于首版能力。
 
-默认文件格式是带版本的单 run JSON envelope：
+实验阶段的文件格式始终使用 `version: 0`，格式尚未稳定前不把方案调整称为版本迭代。文件不是 JSONL，也不是一个需要整体重写的 JSON array，而是一串由空白分隔的顶层 JSON object。每个 object 使用两空格缩进，对象之间留一个空行；`.jsons` 表示 AFL pretty JSON stream。
+
+`program.jsons` 的正常示例为：
 
 ```json
 {
-  "version": 1,
-  "format": "afl.memory-run",
-  "roleSchema": "afl.message-role/v1",
-  "runId": "review-42",
-  "rootModuleDigest": "sha256:canonical-ir-digest",
-  "memories": {
-    "module:sha256:canonical-ir-digest/entry:main/activation:root/block:entry@0/instruction:0:agent:coder/allocation:working": {
-      "revision": 3,
-      "messages": [
-        { "role": "user", "content": "..." },
-        { "role": "assistant", "content": "..." }
+  "type": "program.begin",
+  "version": 0,
+  "run_id": "review-42",
+  "module": "sha256:canonical-ir-digest",
+  "started_at": "2026-08-07T15:42:18+08:00"
+}
+
+{
+  "type": "program.end",
+  "status": "ok",
+  "finished_at": "2026-08-07T15:48:31+08:00"
+}
+```
+
+Memory 文件也是有上下文的顺序流。Schema 使用顶层 `type` 区分 record，不再使用 `{"message":{"assistant":...}}` 或 `{"do":{"begin":...}}` 等无必要嵌套。一次 `agent.do` 由 `do.begin` 打开，后续连续 records 天然属于它，正常结束或可控错误时可以写入 `do.end`：
+
+```json
+{
+  "type": "memory",
+  "version": 0,
+  "name": "coder",
+  "key": "main/coder",
+  "agent": "@agent.coder",
+  "executor": "pi"
+}
+
+{
+  "type": "do.begin",
+  "location": "main:draft",
+  "started_at": "2026-08-07T15:42:19+08:00"
+}
+
+{
+  "type": "user",
+  "text": [
+    "实现 qsort。",
+    "只允许修改 qsort.c，并使用 gcc 验证。"
+  ]
+}
+
+{
+  "type": "assistant",
+  "content": [
+    {
+      "type": "thinking",
+      "text": [
+        "先检查函数签名。",
+        "然后实现分区和递归逻辑。"
       ]
+    },
+    {
+      "type": "tool.call",
+      "id": "call-1",
+      "name": "source_file",
+      "arguments": {
+        "path": "qsort.c"
+      }
     }
+  ]
+}
+
+{
+  "type": "tool.result",
+  "id": "call-1",
+  "name": "source_file",
+  "status": "ok",
+  "text": "当前文件内容……"
+}
+
+{
+  "type": "assistant",
+  "text": [
+    "qsort 已实现。",
+    "gcc 验证通过。"
+  ]
+}
+
+{
+  "type": "do.end",
+  "status": "ok",
+  "finished_at": "2026-08-07T15:43:06+08:00"
+}
+```
+
+一次 `do` 表示一次完整的 `agent.do`，内部可以包含任意数量的模型轮次、thinking、tool call 和 tool result。除 Memory header 外，executor、Agent、format 等稳定信息不在后续 records 上重复；时间只记录在 `do.begin` 和可选的 `do.end`。恢复所必需的 tool call id、thinking signature 等信息保留在对应语义结构中，可重新生成的 session id、逐消息时间戳和统计信息不保存。
+
+记忆文本使用统一的 `Text` 表示：单行直接保存字符串，多行按换行拆成字符串数组，读取时用 `\n` 连接。末尾空字符串保留原文结尾换行：
+
+```text
+Text = string | string[]
+```
+
+纯文本 user/assistant 直接使用顶层 `text: Text`；assistant 同时包含 thinking、text 和 tool call 时使用按原顺序排列的 `content` block 数组。Tool arguments 仍使用普通 JSON value，不为展示目的改写其数据结构。`memory.append` 在 Memory 已物化后使用简洁的独立记录：
+
+```json
+{
+  "type": "append",
+  "role": "user",
+  "text": "评审指出需要补充重复元素测试。"
+}
+```
+
+`memory.copy` 和 `fork` 本身不创建文件。副本第一次被 Agent 使用时，Memory header 保存冻结的 source file/revision 引用，不复制源历史：
+
+```json
+{
+  "type": "memory",
+  "version": 0,
+  "name": "review_memory",
+  "key": "main/review[1]",
+  "agent": "@agent.reviewer",
+  "executor": "pi",
+  "base": {
+    "file": "coder.jsons",
+    "revision": 2
   }
 }
 ```
 
-VM load 时保留文件中的全部 slots，包括本次控制路径尚未 claim 的 slots；后续 save 以这份完整状态为基础，只替换已经 mutation 的 slot，避免条件分支暂时未经过时丢失旧 Memory。Memory GC 不在首版范围。
+Loader 递归解析 base；循环、缺失文件或不存在的 revision 属于损坏状态。Revision 根据完整 canonical records 推导，不依赖 `do.end`。
 
-VM 使用 run-level persistence queue 串行保存不同 Memory 的最新完整 state，避免两个 Agent 同时完成时互相覆盖。内置文件存储使用同目录 temporary file、flush/close 和 atomic rename，并清理失败的 temporary file；指令在对应状态保存成功后才算完成。Queue 第一次保存失败后进入 failed 状态，拒绝所有后续 mutation 并使整个 run 失败。损坏 JSON、未知 version、非法 Message 或 revision 必须报告稳定错误，不能静默清空。
+`do.end` 只是便于人工回溯的可选 tail metadata，不是 commit marker。JSON stream reader 顺序解析顶层 object，并记录最后一个完整 object 的结束字节位置。恢复遵循以下规则：
 
-Version 1 只有 append mutation，因此每个 slot 必须满足 `revision === messages.length`。不一致的数据拒绝加载；未来若增加 edit/delete，再通过新的文件 version 修改 revision 规则。
+- 每个已经完整写入的 memory、append、user、assistant 和 tool record 都独立有效；
+- 文件在一个打开的 `do` 中结束，表示进程直接崩溃，该区段状态记为 interrupted；
+- 没有 `do.end` 时仍恢复其中所有完整的 user、assistant、thinking、tool call 和 tool result；
+- EOF 处不完整的最后一个 object 截断到上一个完整 object 的结束位置，不能简单按换行截断；之前的完整 records 不受影响，文件中部的损坏 JSON 仍然显式报错；
+- 最后一条完整记录若是没有 tool result 的 tool call，则作为 pending call 交给 executor 恢复策略，VM 不虚构结果；
+- 恢复后追加新的 `do.begin` 会隐式关闭此前未收尾的区段，不需要补写 tail；
+- `do.end` 若存在，可以保存 `status: "ok" | "error"`、结束时间，以及浅层的 `error_code`/`error_message`，但不决定消息是否可恢复。
 
-Version 1 文件只包含 AFL canonical Memory 及其格式、run、root module digest、role schema、slot 和 revision 信息，不保存 executor、model、provider 或其他 backend metadata。Memory facet capability 在运行时从当前 executor 获取，不属于 Memory 数据。
+VM 使用 run-level persistence queue 串行化文件写入。每个 record 通过 `JSON.stringify(record, null, 2)` 生成，末尾追加两个换行作为可读分隔，然后在返回前完成 append + sync；parser 依赖 JSON object 边界而不是空行。Queue 第一次失败后进入 terminal failed 状态，拒绝后续 mutation 并使整个 run 失败。
 
 持久化文件不包含：
 
-- `BackendSessionRef`、Pi session 或 `MemoryCheckpoint`；
+- 仅当前进程有效的 `BackendSessionRef` 和 runtime handle；
 - Memory owner 和运行时 handle id；
 - Workspace path 或工作区文件；
-- VM instruction pointer、TaskGroup、进程和未完成工具调用。
+- VM instruction pointer、TaskGroup、外部工具进程和完整 VM snapshot。
 
-恢复 Memory 后，backend session 和 owner 重新建立。Pi 首次执行时根据恢复的 AFL Message 创建新 session；当前进程内的 checkpoint/fork 优化保持不变。
+恢复 Memory 后，owner 重新建立。若 slot 有 continuation，VM 要求对应 executor 导入并创建新的 live session；若没有，则由 canonical Message 创建新 session。当前进程内的 checkpoint/fork 优化保持不变。
 
-Memory durability 与 Agent 外部副作用使用以下提交顺序：
+Memory durability 与 Agent 外部副作用使用以下写入顺序：
 
-1. `agent.do` 先把输入 Message 追加到 canonical Memory 并等待保存成功；保存失败时不调用 backend。
-2. Memory facet 校验完整 Memory，backend 执行模型与工具循环。
-3. VM 校验最终 output 和 schema，把它追加为唯一的 canonical assistant Message。
-4. VM 等待输出后的完整 run state 保存成功，再把返回的 native session/checkpoint 标记为可继续使用并完成指令。
-5. 第 2 步以后任何校验或保存失败都使整个 run 失败；VM 丢弃 Agent 上的 session/checkpoint，并尽力调用 backend `close`，不能继续使用已经推进但未与 durable Memory 对齐的 session。
+1. Memory 第一次进入 `agent.do` 时创建文件并写入 header；已有 canonical Message 或 base 引用先完成物化。
+2. VM 写入 `do.begin` 和 canonical user message，并等待 sync 成功；保存失败时不调用 backend。
+3. Backend 每形成一条完整的 assistant/tool message 就立即追加并 sync；thinking、tool call 和 tool result 因此在同一次 `do` 内可恢复。
+4. VM 校验最终 output 和 schema，把最终 assistant 投影为 canonical Message；正常结束时可以写 `do.end`，但完成指令不依赖 tail 才能识别此前消息。
+5. 可控错误可以写 error tail；进程崩溃时不补写任何内容，恢复以最后一个完整 JSON object 为准。
+6. 任何保存失败都使 persistence queue 和整个 run 进入失败状态，不能在 failed queue 后继续追加较新的消息。
 
-模型调用、工具执行和 Workspace 文件修改无法与 Memory 文件形成同一事务。VM 不自动重试失败的 `agent.do`，也不承诺 exactly-once；输出保存失败时，文件副作用可能已经发生，而 durable Memory 只包含先前已提交的输入。调用方重新运行前需要接受这种 at-least-once 边界或自行检查 Workspace。
+模型调用、工具执行和 Workspace 文件修改无法与 Memory 文件形成同一事务。VM 不自动重试失败的 `agent.do`，也不承诺 exactly-once；崩溃时已经执行的工具副作用可能只留下 tool call 而没有 tool result。调用方或 executor 恢复 pending call 前需要接受这种 at-least-once 边界或自行检查 Workspace。
 
-首版不提供跨进程同时写同一 `runId`、状态删除、过期、压缩、GC、native session persistence 或完整 snapshot，也不把 Pi version 3 JSONL session 嵌入 v1 AFL Memory 文件。
+当前版本不提供跨进程同时写同一 `runId`、状态删除、过期、GC 或完整 VM snapshot。已经完成的 compaction message 会进入对应 Memory JSON stream，但 AFL VM 不主动触发或解释 compaction。
 
 ## Acceptance Criteria
 
@@ -486,10 +609,11 @@ Memory durability 与 Agent 外部副作用使用以下提交顺序：
 - AC-8: Memory persistence 完全是 VM 内部行为。
   - Positive Tests (expected to PASS):
     - 隐式 Agent Memory、显式绑定 Memory、copy Memory 和 fork Memory 都自动注册 persistence slot。
-    - `memory.copy` 即使没有后续 append，也在指令完成前保存复制后的 Message。
-    - `memory.append` 和 `agent.do` mutation 自动更新统一 run state。
+    - Memory 只有在第一次真正进入 `agent.do` 时才物化文件；未被 Agent 使用的 working/copy/fork Memory 不留下文件。
+    - `memory.copy`/`fork` 只建立 source revision 引用，首次使用前不复制或保存历史内容。
+    - Memory 物化时保存此前的 `memory.append`，物化后的 append 和 `agent.do` message 自动增量写入。
     - 现有 `memory.append/copy/apply` 不增加 persistence operand。
-    - 每次 Agent 执行前，executor Memory facet 校验完整 canonical Memory，持久化 payload 不随 executor 改变。
+    - 每次 Agent 执行前，executor Memory facet 校验完整 canonical Memory；executor continuation 与 canonical Message 分层保存。
     - Agent executor 只返回 role-free output，VM 只追加一次 canonical assistant Message。
     - Agent 输入和返回给 flow 的 Frag 始终是 role-free content，只有写入 Memory 时才形成带 canonical role 的 Message。
   - Negative Tests (expected to FAIL):
@@ -506,7 +630,8 @@ Memory durability 与 Agent 外部副作用使用以下提交顺序：
     - 已存在的 copy/fork slot 恢复长期 Memory，只有首次 allocation 才从 source 初始化。
     - 同一 runId 的新 execution 从 entry 开始，并在恢复的 Memory 后正常追加新 Message。
     - Canonical Memory 在执行前由当前 backend facet 校验 role schema 和全部 roles。
-    - Host 显式选择兼容相同 role schema 的 executor/model 时，可以从 canonical Memory 创建全新 session。
+    - 没有 continuation 时，Host 显式选择兼容相同 role schema 的 executor/model，可以从 canonical Memory 创建全新 session。
+    - 有 continuation 时，同名 executor 跨进程恢复完整 native transcript，并用目标 Agent 当前 binding 重建 harness。
   - Negative Tests (expected to FAIL):
     - 动态 handle counter或 Agent 完成顺序改变 persistence slot。
     - 不匹配的 module digest/run state 被绑定到当前 flow。
@@ -515,11 +640,12 @@ Memory durability 与 Agent 外部副作用使用以下提交顺序：
     - 已存在的 copy/fork slot 与本次 source 自动 merge/rebase，或被 source 静默覆盖。
     - Memory facet 不支持某个 canonical role 时仍创建 session，或自动改写、删除 Message。
     - VM 因当前 backend 不可用或校验失败而自动切换 executor。
-    - 新 executor 复用另一个 executor 的 checkpoint/session。
+    - 新 executor 复用或静默丢弃另一个 executor 的 continuation。
 
 - AC-10: Memory 始终保存在 execution root 的统一位置。
   - Positive Tests (expected to PASS):
-    - 默认状态文件位于 `<executionRoot>/.afl/memory/`。
+    - 默认状态文件位于 `<executionRoot>/.afl/memory/afl-<date>-<short-id>/`，包含 `program.jsons` 和实际使用过的 Memory JSON streams。
+    - 目录名包含创建日期但不包含具体 workflow/任务名称；相同 runId 恢复原目录。
     - 编号 primary Workspace 不会各自产生 Memory cache。
     - Binding directory override 和自定义 store 能替换默认位置/介质。
   - Negative Tests (expected to FAIL):
@@ -529,30 +655,34 @@ Memory durability 与 Agent 外部副作用使用以下提交顺序：
 - AC-11: Run state 的并发、错误和能力边界确定。
   - Positive Tests (expected to PASS):
     - Persistence queue 保存包含所有并发 Memory 更新的最新 state。
-    - Version 1 JSON 只保存 canonical `memories`、`roleSchema`、`rootModuleDigest` 和运行定位字段，并使用 atomic rename 完成 round trip。
-    - Version 1 每个 slot 满足 `revision === messages.length`。
-    - Version 1 JSON 中不存在 executor、provider、model 或 backend session metadata。
+    - 实验格式始终使用 `version: 0`，不因尚未稳定的设计调整递增版本。
+    - 每个 Memory 文件按浅层 `type` records、`do.begin`、连续 messages 和可选 `do.end` 组织，不重复 transaction id、时间戳、executor 或 cursor。
+    - Pi thinking/tool call/tool result 在形成完整 message 后立即追加并成为可恢复状态，不等待 `do.end`。
+    - 没有 tail 的打开 do 被识别为进程崩溃，最后一个完整 JSON object 之前的消息全部恢复；截断的 EOF object 被丢弃。
+    - `memory.copy`/`fork` 使用 base file/revision 引用，目标文件不重复源 Message 或 session tree。
+    - 单行记忆文本保存为 string，多行保存为 string array，并能无损保留末尾换行。
     - 同一 store namespace/runId 的第二个活跃顶层 run 被拒绝；同一 run 内的并发 Agent 正常共享 persistence queue。
-    - Agent input 保存成功后才调用 backend，output 保存成功后才提交 native session continuation。
+    - Agent input 保存成功后才调用 backend，每条完整 executor message append + sync 后立即可恢复。
     - 文档明确重新运行从 entry 开始，不是完整 VM resume。
     - build、unit tests、VM acceptance tests、package smoke 和 Pi mock smoke 全部通过。
   - Negative Tests (expected to FAIL):
     - 较旧 state 覆盖较新 revision，或保存失败后 instruction 仍成功。
-    - 输出保存或 post-execution validation 失败后继续复用已经推进的 native session，或自动重试 Agent。
-    - Session、checkpoint、Workspace、TaskGroup、instruction pointer 或损坏数据被当作可恢复 Memory。
+    - 保存队列失败后继续写入较新的 message，或自动重试 Agent。
+    - Live session ref、Workspace、TaskGroup、instruction pointer 或损坏数据被当作可恢复 continuation。
 
 - AC-12: Pi role mapping 与 canonical Memory 边界明确。
   - Positive Tests (expected to PASS):
     - Pi Memory facet 只接受 capability 声明的 AFL roles，并把 canonical `user/assistant` 映射为 Pi AgentMessage。
-    - 同一 canonical Memory 经 Pi 与 mock executor 保存后得到相同的 version 1 Memory payload，不出现 executor-specific section。
+    - Pi 的 tool call、tool result、thinking、compaction 和 leaf 保存在 continuation，不污染 canonical Message。
+    - Pi binding 可以选择是否 replay 历史 thinking，过滤不会修改持久化 transcript，也不会删除当前工具循环的 thinking。
     - Agent 输出返回的 Frag 不携带 assistant role，只有写入 Memory 的 Message 携带 canonical role。
-    - 切换 Pi model 前由目标 Memory facet 校验 role 可导入性，并创建新 session。
+    - 切换 Pi model 或 Agent binding 时由目标 Memory facet 校验 role，并由 Pi continuation 创建新 session。
     - `Message` 与 role schema 定义位于 core Memory module，不依赖 adapter 或 Pi 类型。
   - Negative Tests (expected to FAIL):
-    - Pi 的 `toolResult`、custom、compaction 或 session tree entry 被压成普通 AFL role 后写入 v1 Memory。
+    - Pi 的 `toolResult`、custom、compaction 或 session tree entry 被压成普通 AFL role 后写入 canonical Message。
     - Backend 通过 native session entry 或额外 messages 绕过 VM 修改 canonical Memory。
-    - Executor、provider 或 model metadata 出现在 version 1 AFL Memory 文件的任何位置。
-    - VM 尝试从 version 1 Memory 文件恢复 Pi session、checkpoint 或其他 native state。
+    - VM 解析或改写 executor payload 内的 provider/model/native role。
+    - `thinkingReplay: "exclude"` 删除持久化 thinking，或过滤同一工具循环刚产生的 thinking。
 
 ## Path Boundaries
 
@@ -584,23 +714,24 @@ Memory durability 与 Agent 外部副作用使用以下提交顺序：
 - Canonical role schema、model/executor-independent Memory payload、executor Memory facet 运行时兼容性检查；
 - canonical module digest、稳定 activation lineage、进程内 active-run guard 和 persistence failure contract；
 - 默认 `<executionRoot>/.afl/memory` 与 binding override；
-- versioned JSON、atomic write、保存队列、错误诊断、文档和回归测试。
+- `version: 0` 的 pretty program/Memory JSON streams、保存队列、错误诊断、文档和回归测试。
 
 缺少任一项时，不应把功能标记为完成。
 
 ### Allowed Choices
 
 - Can use: 现有 ValueExpr、TypeScript ScriptAdapter、ResourceLocks 和 Node.js 标准库；
-- Can use: 单 run versioned JSON、同目录 temporary file + atomic rename、测试用 in-memory store；
+- Can use: 带日期的 run 目录、`program.jsons`、per-Memory append-only pretty JSON stream、可选 do tail、测试用 in-memory store；
 - Can change: 实验性 Agent/Pi API，不保留旧的第二 operand Memory 语法或 Pi 固定 `cwd` API；
 - Cannot add: Workspace symbol/binding、Workspace instruction/handle、named clause 或通用 Agent options record；
 - Cannot add: `memory.save/load`、persistence option 指令、flow-visible slot 或宿主缓存路径；
 - Cannot change: batch dispatch 的参数或 index 语义；
-- Can switch: host 通过显式 binding 把纯 canonical Memory 交给兼容的 executor/model Memory facet，并创建全新 backend session；
+- Can switch: 没有 continuation 时，host 通过显式 binding 把纯 canonical Memory 交给兼容的 executor/model Memory facet，并创建全新 backend session；
 - Cannot turn into: 通用 named arguments、资源生命周期管理或文件系统编程接口；
 - Cannot claim: read-only Workspace 是 sandbox 权限边界；
-- Cannot persist: backend session/checkpoint、Workspace state 或完整 VM snapshot；
-- Cannot add: Workspace clone、跨进程 locks、Memory GC、native session/snapshot persistence 或远端数据库实现。
+- Can persist: 已完整写入的 backend conversation records，作为统一 run state 中 flow 不可见的 executor continuation；
+- Cannot persist: live session ref、Workspace state、instruction pointer、正在运行的外部工具进程或完整 VM snapshot；
+- Cannot add: Workspace clone、跨进程 locks、Memory GC、完整 VM snapshot 或远端数据库实现。
 
 ## Dependencies and Sequence
 
@@ -608,7 +739,7 @@ Memory durability 与 Agent 外部副作用使用以下提交顺序：
 
 1. Milestone 1: 固化 Agent operand 与 persistence contract
    - 为 string/list/empty Workspace、第三个 Memory operand、非法 shape 和旧语法编写失败测试。
-   - 定义 `AgentWorkspaceSet`、core `Message`/role schema、`MemoryStateStore`、executor Memory facet 和 version 1 envelope。
+   - 定义 `AgentWorkspaceSet`、core `Message`/role schema、`MemoryStateStore`、executor Memory facet 和 v0 envelope。
    - 定义 `VmRunOptions.executionRoot`、canonical module digest、activation lineage/slot 和同 runId active-run guard 规则。
 
 2. Milestone 2: 实现 Workspace operand
@@ -625,8 +756,8 @@ Memory durability 与 Agent 外部副作用使用以下提交顺序：
 
 4. Milestone 4: 实现 VM 内部 Memory persistence
    - 为 node/call/dispatch/fork/loop activation 建立确定性 lineage 和 Memory slots。
-   - 实现统一 run state load、active-run guard、mutation save、failed-state persistence queue 和 atomic file store。
-   - 只保存 canonical Memory，并在每次 Agent 执行前校验 role schema 和 import roles。
+   - 实现统一 run state load、active-run guard、mutation save、failed-state persistence queue 和 durable file store。
+   - 保存 canonical Memory，并在每次 Agent 执行前校验 role schema 和 import roles。
    - 接入 implicit/bound Memory、append、copy、apply、fork 和 VM-owned assistant Message 更新。
    - 验证同 runId 恢复/继续追加、并发完成顺序、slot collision、损坏文件和各提交阶段的 store failure。
 
@@ -635,6 +766,19 @@ Memory durability 与 Agent 外部副作用使用以下提交顺序：
    - 更新 syntax、IR、Memory、semantics、executor proposal、Pi role/session 边界和并发示例。
    - 将 `.afl/` 加入 `.gitignore`，测试使用临时 execution root 或 in-memory store。
    - 运行 build、全量测试、package smoke 和 Pi mock smoke，检查 Memory 未写入编号 Workspace。
+
+6. Milestone 6: 完整 executor continuation
+   - 为 executor 增加 JSON-safe session export/import，并在 slot 中保存 backend、format、payload 和同步 revision。
+   - Pi 导出和恢复完整 session tree，包括 tool call、tool result、thinking、compaction 和 leaf。
+   - `memory.copy`/`memory.apply` 复制并重建 continuation；跨 executor 使用显式失败。
+   - Pi binding 提供历史 thinking replay 策略，并验证过滤不修改持久化 transcript。
+
+7. Milestone 7: per-Memory pretty JSON stream
+   - 默认文件 store 改为带日期的 run 目录、`program.jsons` 和每个已使用 Memory 一份 `.jsons`，保持自定义 snapshot store 可用。
+   - executor host 接收完整的结构化 message；Pi 在 message 形成后立即同步写入 thinking/tool call/tool result。
+   - 使用 Memory header、`do.begin`、连续 messages 和可选 `do.end` 形成可读上下文；每条完整 record 独立可恢复。
+   - EOF 截断 object 被丢弃；没有 tail 的调用标记为 interrupted，但其完整 messages 继续恢复。
+   - copy/fork 在第一次被 Agent 使用时物化，并用 source file/revision base 消除完整前缀复制。
 
 实现顺序为：Agent operand/持久化契约 -> Workspace VM -> Pi -> Memory persistence -> 文档和全量验证。Workspace request 需要先稳定，Pi 才能按 Agent 创建正确环境；activation lineage 需要先稳定，Memory store 才能可靠恢复。
 
@@ -650,12 +794,12 @@ Memory durability 与 Agent 外部副作用使用以下提交顺序：
 - Workspace dependency 和 session compatibility key 使用规范绝对路径与 access mode，不能使用未解析字符串。
 - `fork` 共享 Workspace set 但复制 Memory；这不意味着复制 worktree。
 - Memory slot 是 VM bookkeeping，不加入 `VmValue`、Frag 或 AFL 指令表。
-- AFL Memory 文件只写 canonical role。Provider/model role label 的差异由 executor 私有转换处理，不在文件加载阶段启发式改名。
-- Version 1 Memory 不记录 executor 或 model；可移植性由目标 executor Memory facet 对 `roleSchema` 和全部 roles 的支持决定。
-- 纯 Memory 切换 executor/model 时总是创建新 session；本计划不实现 native session 或 snapshot 恢复。
+- AFL canonical Message 只写 canonical role。Provider/model role label 的差异留在 executor continuation 内，不在文件加载阶段启发式改名。
+- v0 Memory 文件中的 canonical Message 保持可移植；continuation 通过 header 中的 executor/format 明确绑定 backend，VM 不解析 executor-owned content block。
+- 没有 continuation 的纯 Memory 可以切换兼容 executor；存在 continuation 时只能由同名 executor 导入。二者都不等于完整 VM snapshot 恢复。
 - Activation lineage 在并发任务启动前由结构位置和 task index 分配，不能使用 Promise 完成顺序或全局 handle counter。
-- 整个 run state 写入由一个 persistence queue 串行化；每次保存使用包含未 claim slots 在内的最新完整 state image。
-- Agent input 在调用 backend 前写入 Memory 并持久化；backend 失败时保留已经提交的输入，但当前 native session continuation 作废，整个 run 失败且不自动重试。
-- 默认 FileMemoryStore 在第一次 mutation 前不创建目录。Run id 必须编码为安全文件名，不能产生 path traversal。
-- 同一进程内禁止相同 store namespace/runId 的两个顶层 run 同时活跃；同一 run 内的并发 Agent 共享一条 queue。跨进程同 runId 并发执行首版不保证正确，atomic rename 只保证单个文件不会半写。
+- 同一 run 的 program 与各 Memory JSON stream 写入由一个 persistence queue 串行化；不同 Memory 不再反复重写完整 state image。
+- Agent input 在调用 backend 前写入 Memory 并持久化；backend 失败或进程崩溃时保留全部完整 messages，恢复不依赖 `do.end`。
+- 默认 FileMemoryStore 在第一个 Memory 真正进入 `agent.do` 前不创建 Memory 文件。Run id 和 Memory label 必须编码为安全文件名，不能产生 path traversal；目录名只使用固定 header、日期和短标识。
+- 同一进程内禁止相同 store namespace/runId 的两个顶层 run 同时活跃；同一 run 内的并发 Agent 共享一条 queue。跨进程同 runId 并发执行当前不保证正确。
 - `proposals/agent-executor-backend.md` 中 Workspace 暂不进入 IR 的旧描述需要更新为：Workspace 是 Agent declaration operand，provider/model 仍由 binding 决定，Memory persistence 仍由 VM 管理。

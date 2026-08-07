@@ -102,6 +102,11 @@ export interface BackendSessionRef {
   readonly checkpoint?: string;
 }
 
+export interface BackendSessionMessageRecord {
+  readonly type: string;
+  readonly [field: string]: unknown;
+}
+
 export interface AgentExecutionRequest {
   readonly runId: string;
   readonly node: string;
@@ -148,6 +153,15 @@ export interface AgentExecutorBackend {
     signal: AbortSignal,
   ): Promise<BackendSessionRef>;
 
+  exportSession?(
+    session: BackendSessionRef,
+    signal: AbortSignal,
+  ): Promise<BackendSessionState>;
+
+  importSession?(
+    request: AgentSessionImportRequest,
+  ): Promise<BackendSessionRef>;
+
   close?(
     session: BackendSessionRef,
     signal: AbortSignal,
@@ -157,7 +171,7 @@ export interface AgentExecutorBackend {
 
 `AgentExecutorBackend.execute()` 自身就承诺推进一次完整的 Agent 工作激活，因此接口不再需要 `mode` 或 sequence capability。普通的无状态模型 adapter 可以根据 AFL Memory 发起一次请求，并在得到无需继续处理的模型输出后返回 `completed`；它不需要伪造多轮 session。
 
-`BackendSessionRef` 是 VM 基础设施数据，不是 Frag，也不能由 AFL flow 读取、拼接或发送给另一个 flow。它只在当前 backend 实例中使用，不写入 AFL canonical Memory；native session 或 snapshot 恢复需要后续独立契约。
+`BackendSessionRef` 是当前 backend 实例中的 live reference，不写入持久化文件。`BackendSessionState` 是 executor codec 根据 Memory pretty JSON stream 中完整 message records 重建的 continuation；VM 将其视为 backend-owned state。二者都不是 Frag，也不能由 AFL flow 读取、拼接或发送给外部 flow。
 
 `AgentMemoryContract` 声明 executor 可导入的 AFL role schema 和 role，并在每次执行前校验完整 canonical Memory。Backend 只返回最终 role-free output，VM 负责追加唯一的 canonical `assistant` Message。
 
@@ -177,12 +191,15 @@ export type AgentExecutionEvent =
 
 export interface AgentExecutionHost {
   emit(event: AgentExecutionEvent): void | Promise<void>;
+  persistContinuation(record: BackendSessionMessageRecord): void | Promise<void>;
   requestApproval(request: AgentApprovalRequest): Promise<AgentApprovalDecision>;
   requestInput(request: AgentInputRequest): Promise<string>;
 }
 ```
 
-VM 可以先把事件转交 TraceSink；CLI 或其他 host 可以在此基础上提供流式输出、审批 UI 和用户输入。Backend 自己仍负责把宿主答复映射回原生 runtime 协议。
+VM 可以先把事件转交 TraceSink；CLI 或其他 host 可以在此基础上提供流式输出、审批 UI 和用户输入。`persistContinuation` 不接收 token delta，而是在 backend 已经形成一条完整、可序列化的 assistant/tool message 后追加语义化 record。默认文件 store 会在该 Promise 返回前 append + sync；每条完整 record 本身即可恢复，不等待 `do.end` 或额外 commit。Backend 自己仍负责把宿主答复映射回原生 runtime 协议。
+
+Memory 文件的 v0 framing、文本表示、惰性物化和崩溃恢复规则统一以 [`agent-workspace-memory-persistence.md`](agent-workspace-memory-persistence.md) 为准，本提案不再另行定义一套 journal envelope。
 
 ## 6. Memory 与原生 Session
 
@@ -204,31 +221,31 @@ VM 为 Backend session 记录已经同步的 Memory revision：
 
 1. 第一次执行时，Backend 根据 system prompt 和 AFL Memory 创建原生 session；
 2. 后续执行时，VM 同时提供当前 revision 与该 session 已同步的 revision，Backend 只导入两者之间新增的 Message；
-3. Backend 完成工作后，把模型可见的新增 Message 返回给 VM；
-4. VM 先更新 AFL Memory，再把更新后的 revision 记录为 session 同步位置；
+3. Backend 完成工作后返回最终 role-free output 和 session ref；
+4. Backend 在完整 assistant/tool message 形成后立即流式追加；VM 最后把最终 output 投影为唯一的 canonical assistant Message，可选 `do.end` 只记录收尾信息；
 5. 无法导入某种 role 时，Backend 显式拒绝或要求配置转换规则，不自动改变 role。
 
-Backend 可以保留比 AFL Memory 更丰富的原生工具事件和压缩状态，但这些状态只能通过兼容的原生 session 续接。
+Backend 可以保留比 AFL Memory 更丰富的原生工具事件、thinking 和压缩状态。支持 session codec/export/import 的 backend 将这些状态作为结构化 continuation messages 随 Memory 文件持久化；VM 只管理顺序追加、`do` 上下文和 base reference，不解析 executor-owned content block。
 
 ### 6.3 System Prompt 变化
 
 System prompt 属于 Agent 配置，不是普通 Memory Message。后端 session 创建后再次修改 system prompt 时，基础行为建议为：
 
-1. 使现有 session continuation 失效；
-2. 使用新的 system prompt 和当前 AFL Memory 创建新 session；
+1. 使现有 live session continuation 失效；
+2. 同名 backend 优先用持久化 continuation 和新的 system prompt 创建新 session；没有 continuation 时才从当前 AFL Memory 重建；
 3. 后端明确支持等价的动态更新时，才原地修改。
 
 这样 Reviewer 在复制 Coder Memory 后设置自己的 system prompt 时，会创建独立 Reviewer session，不会污染 Coder session。
 
 ### 6.4 Copy、Apply 与 Fork
 
-Memory 的语言可见内容仍是 Message 序列。实现可以附带一个不可由 flow 读取的原生 continuation checkpoint：
+Memory 的语言可见内容仍是 Message 序列。实现可以附带一个不可由 flow 读取的原生 continuation：
 
-- `memory.copy` 复制 Message，并在 backend 支持时记录源 session 的稳定 checkpoint；
-- `memory.apply` 绑定相同 executor 和兼容 Agent 配置时，可以从 checkpoint 建立新 session；
-- Agent symbol、executor 或 system prompt 不兼容时，丢弃原生 continuation，只使用 Message 重建 session；
+- `memory.copy` 复制 Message，并在 backend 支持时冻结源 session checkpoint 与导出状态；
+- live checkpoint 与 Agent 配置兼容时，`memory.apply` 可以直接 fork；配置不同时由同名 executor 用导出状态和目标 binding 建立新 session；
+- executor 不兼容时显式失败，不能静默丢弃已有 continuation；只有本来就没有 continuation 时才只使用 Message 重建 session；
 - `fork` 仍是 copy、apply 和立即执行的快捷形式，并优先使用后端原生 fork；
-- 后端没有 checkpoint/fork 时，从复制后的 AFL Memory 创建独立 session。
+- 后端没有 checkpoint/export 时，从复制后的 AFL Memory 创建独立 session。
 
 Checkpoint 对应哪个 Memory revision 必须明确，避免 source Agent 在 copy 之后继续工作时把新增内容带入旧副本。
 
@@ -270,6 +287,8 @@ Pi 的统一模型接口也更符合 AFL 作为通用 flow IR 的定位：flow �
 | 进度和工具事件 | `AgentHarness.subscribe()` |
 | 取消 | `AgentHarness.abort()` |
 | checkpoint / fork | Session tree leaf 与 `InMemorySessionRepo.fork()` |
+| 持久化 continuation | `Session.getEntries()`、session tree leaf 与内存 session 重建 |
+| thinking replay 策略 | `AgentHarness.on("context", ...)` 过滤历史 thinking block |
 | 模型 provider | `pi-ai` 的 `Models` 与 `builtinModels()` |
 | 工具调用拦截 | `AgentHarness.on("tool_call", ...)`，按配置转交 host |
 
@@ -279,7 +298,7 @@ Pi core 没有提供与 `outputSchema` 等价的一等接口，首版声明 `str
 
 Pi Backend 显式配置 system prompt、模型、工具、tool context 和可选 resources。它不经过 pi-coding-agent 的 ResourceLoader，也不会隐式发现项目 extensions、skills 或交互配置，避免 flow 的实际语义被未声明的资源改变。
 
-当前 session 存在于 backend 实例的 `InMemorySessionRepo`。Checkpoint 使用 Pi 会话树 leaf，并与 AFL Memory revision 绑定；持久化 repository、文件位置和跨进程恢复策略尚未实现，未来仍属于 host 配置，不暴露给 AFL flow。
+Live session 存在于 backend 实例的 `InMemorySessionRepo`。Checkpoint 使用 Pi 会话树 leaf，并与 AFL Memory revision 绑定；Pi 在 harness `message_end`/save point 后把完整的新增 assistant/tool message 流式追加到当前 Memory 文件，`importSession` 根据所有完整 records 跨进程重建新的 in-memory session。缺少 `do.end` 只表示进程中断，不使此前完整消息失效。文件位置仍由 VM 的 Memory persistence binding 管理，不暴露给 AFL flow。
 
 Pi 的 subagent、交互 UI 或工作流扩展不进入 AFL Backend。多 Agent 编排继续由 AFL IR 和 VM 负责，Pi 只执行一次 `do` 所代表的 Agent 工作。
 
@@ -325,14 +344,14 @@ Agent 工作指令合并已经作为前置步骤完成，所有层只处理 `age
 - 现有 `AgentAdapter` 的兼容包装；
 - Agent handle 上的 backend session，以及 Memory revision/checkpoint 元数据；
 - `do`、`memory.copy`、`memory.apply` 和 `fork` 对 executor lifecycle 的调用；
-- 基于 `pi-agent-core` 的进程内 Backend，使用 `AgentHarness` 与 `InMemorySessionRepo`；
-- Pi session 创建/恢复、完整 `do` 周期、事件转发、Memory 同步、消息级 checkpoint/fork 和取消；
+- 基于 `pi-agent-core` 的 Backend，运行时使用 `AgentHarness` 与 `InMemorySessionRepo`；
+- Pi session 创建/恢复、完整 `do` 周期、事件转发、Memory 同步、消息级 checkpoint/fork、session tree export/import 和取消；
 - 显式配置 system prompt、model、tools、tool context 和工作目录，不默认导入项目 extensions；
 - 对 Pi 尚未提供的 structured output、强制 sandbox 和交互审批如实声明 capability；
 - fake backend conformance tests，避免测试依赖真实模型或用户账户；
 - 单独的 live smoke，用于验证真实 Pi runtime 和模型 provider，不作为默认测试前置条件。
 
-Canonical Memory 持久化和 Agent Workspace operand 由 VM 提供；完整 snapshot、Workspace handle、权限系统、Codex Backend 和其他 Agent runtime 仍可在上述接口稳定后分别扩展。
+Canonical Memory 与 opaque executor continuation 的统一持久化、Agent Workspace operand 由 VM 提供；完整 VM snapshot、Workspace handle、权限系统、Codex Backend 和其他 Agent runtime 仍可在上述接口稳定后分别扩展。
 
 ## 12. 验收行为
 

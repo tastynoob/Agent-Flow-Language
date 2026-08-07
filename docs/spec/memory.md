@@ -23,7 +23,7 @@ Frag 是不带 role 的字符串 wrapper。Memory 是按顺序保存的、带 ro
 
 JSON 可以作为 Frag content 的一种格式，但 Memory 不要求内容必须是 JSON。Flow 可以自行约定纯文本、Markdown、XML 或其他字符串协议。
 
-模型没有显式输出的内部推理不属于 AFL Memory。
+模型的 thinking、工具调用和工具结果不伪装成 AFL Message role；它们属于 executor continuation。VM 会把 continuation 与 AFL Memory 一起持久化，但 flow 不能读取或修改其内部结构。
 
 ## 2. Agent 默认绑定
 
@@ -58,7 +58,7 @@ result = coder.do tool, tool_result
 
 Agent 输出在来源 Memory 中是 assistant Message，但返回 Frag 不带 `assistant`。因此它进入另一个 Agent 时可以重新解释为 `user`、`tool` 或其他 role。
 
-一次 `do` 可以由 Agent executor 完成多个模型或工具步骤。工具调用、thinking 和 compaction 等 backend-native entry 不进入 AFL Memory。Executor 只返回最终输出，VM 是唯一将它追加为 canonical `assistant` Message 的组件，并把同一字符串作为 role-free Frag 返回。
+一次 `do` 可以由 Agent executor 完成多个模型或工具步骤。工具调用、thinking 和 compaction 等 backend-native entry 不进入 AFL canonical Message 序列，但会作为 opaque continuation 随同 Memory slot 持久化。Executor 只返回最终输出，VM 是唯一将它追加为 canonical `assistant` Message 的组件，并把同一字符串作为 role-free Frag 返回。
 
 ## 4. `memory.append`
 
@@ -102,7 +102,7 @@ review_memory = memory.copy coder.memory
 
 Copy 不需要 role operand。它处理的是已经带 role 的完整 Message 序列；把单个 role-free Frag 加入 Memory 应使用 `memory.append`。
 
-执行器支持原生 checkpoint 时，copy 还可以携带一份 flow 不可读取的 continuation checkpoint。Checkpoint 与复制时的 Message revision 绑定；source 后续执行不会改变既有 copy 所指向的位置。它不是 Message，也不影响 Memory 的可移植内容。
+执行器支持 session export 时，copy 还会携带一份 flow 不可读取的 continuation。Continuation 与复制时的 Message revision 绑定；source 后续执行不会改变既有 copy 所指向的位置。它不是 Message，也不影响 Memory 的可移植内容。
 
 ## 6. `memory.apply`
 
@@ -117,7 +117,7 @@ branch_memory = memory.copy source_agent.memory
 branch = memory.apply source_agent, branch_memory
 ```
 
-如果 Memory 的隐藏 checkpoint 与 source Agent 配置及当前 executor 兼容，新 Agent 首次执行时会 fork 原生 session；不兼容时只从 Message 重建上下文。
+如果 Memory 的 live checkpoint 与 source Agent 配置兼容，新 Agent 首次执行时直接 fork 原生 session；否则由同名 executor 从持久化 continuation 为目标 Agent binding 重建独立 session。只有不存在 continuation 时才从 canonical Message 重建；continuation 属于其他 executor 时显式失败。
 
 ## 7. System Prompt
 
@@ -217,4 +217,10 @@ Fork 完成后：
 
 当前 parser 和 VM 只实现 `memory.append`、`memory.copy`、`memory.apply` 以及 Agent 的 `.memory` 引用。没有 `memory.format`、`memory.select`、`memory.merge` 或 shared Memory 指令；持久化是 VM 内部行为，不增加 AFL 指令。
 
-Version 1 持久化文件保存 role schema、run id、root module digest、稳定 slot、Message 和 revision。默认 working Memory 在首次写入前不会创建空记录，`memory.copy` 即使复制空 Memory 也会创建记录。文件不保存 executor、model、Pi native session 或 checkpoint，也不提供 snapshot 恢复。相同 `runId` 在同一个 store namespace 上一次只允许一个活跃的顶层 VM run；同一 run 内的并发 Agent 共享一条持久化队列。
+实验格式固定使用 `version: 0`。默认文件布局为 `.afl/memory/afl-<YYYYMMDD-HHmmss>-<short-id>/program.jsons` 加同目录下的 `<memory-label>.jsons`。文件不是 JSONL，也不是单个 JSON array，而是两空格缩进、对象间空行分隔的顶层 JSON object stream。每个真正进入过 `agent.do` 的稳定 Memory slot 使用一份文件；仅声明 Agent、`memory.copy`、`fork`、`memory.apply` 或首次使用前的 `memory.append` 都不会单独物化文件。
+
+Memory 文件依次保存 `memory` header、`do.begin`、连续的 `user`/`assistant`/`tool.result` 等浅层 records，以及正常结束或可控错误时的可选 `do.end`；错误 tail 使用浅层 `error_code`/`error_message`。Pi 在每个完整语义消息形成后 append 并 sync，因此 thinking、tool call 和 tool result 不必等整次 `do` 完成才落盘。每个完整 JSON object 本身就是可恢复状态；缺少 `do.end` 表示进程可能直接中断，但不撤销此前完整 records。EOF 处不完整的最后一个 object 会截断到上一个完整 object 的结束字节，文件中部损坏则显式失败。
+
+`memory.copy` 和 `fork` 的新 slot header 使用 source file/revision 作为 base，只保存自身后续增量，不复制 canonical Message 或 Pi continuation 前缀；源尚未物化时会先递归物化源引用。逻辑加载结果仍是完整 Memory。持久化不包含 VM instruction pointer、TaskGroup、外部工具进程或 Workspace 文件 snapshot；再次运行仍从 flow entry 开始。
+
+Pi Agent binding 可以用 `thinkingReplay: "include" | "exclude"` 决定历史 thinking 是否进入后续模型上下文，默认是 `include`。该选项只过滤 request context，不修改持久化 records。存在 continuation 时必须由同名 executor 恢复；VM 不允许切换 executor 后静默丢弃完整记录。相同 `runId` 在同一个 store namespace 上一次只允许一个活跃的顶层 VM run；同一 run 内的并发 Agent 共享一条持久化队列。

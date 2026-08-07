@@ -99,4 +99,4 @@ Basic block 内的指令不因文本相邻而自动串行。VM 从名称引用�
 - [示例](../guides/examples.md)展示可解析的组合方式；
 - [Parallel Voting](../guides/parallel-voting.md)展示两种 dispatch 形式。
 
-当前实现不提供 package 声明语法、retry、race、all-settled、iterable map 或 snapshot 恢复。Canonical Memory 可以跨进程落盘和恢复；executor native session 仍仅在当前 backend 实例内有效。Agent executor 的运行中事件可以进入 Trace 和可选 `agentHost`，但不是 AFL IR 值。
+当前实现不提供 package 声明语法、retry、race、all-settled、iterable map 或完整 VM snapshot 恢复。Canonical Memory 与可选的 executor continuation 可以跨进程落盘；continuation 只能由同名且支持其格式的 backend 恢复。Agent executor 的运行中事件可以进入 Trace 和可选 `agentHost`，但不是 AFL IR 值。

@@ -1,0 +1,3 @@
+[
+  "Implement a generic quicksort in qsort.c. Export void afl_qsort(void *base, size_t nmemb, size_t size, int (*compar)(const void *, const void *)). Do not call the C library qsort. The implementation must sort arbitrary fixed-size elements and handle empty, single-element, duplicate, negative, already-sorted, and reverse-sorted integer inputs. Include a self-testing main in qsort.c that checks all of those cases and prints exactly ALL_TESTS_PASSED on success. Use source_file to create or inspect qsort.c and gcc_verify to compile and run it. The task is incomplete until gcc_verify reports VERIFY_OK. Return only a concise status summary; keep the complete implementation in qsort.c."
+]

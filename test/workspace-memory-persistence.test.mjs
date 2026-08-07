@@ -6,6 +6,7 @@ import test from "node:test";
 
 import {
   AflVm,
+  FileMemoryStateStore,
   MockAgentAdapter,
   RunMemoryPersistence,
   canonicalModuleDigest,
@@ -128,7 +129,7 @@ test("input is durable before execution and output-save failure invalidates the 
       sandboxEnforcement: false,
     },
     memory: {
-      capabilities: { roleSchemas: ["afl.message-role/v1"], importRoles: ["user", "assistant"] },
+      capabilities: { roleSchemas: ["afl.message-role/v0"], importRoles: ["user", "assistant"] },
       validateImport() {},
     },
     async execute() {
@@ -159,7 +160,7 @@ test("input is durable before execution and output-save failure invalidates the 
   assert.equal(closes, 1);
 });
 
-test("memory.copy durably allocates an empty slot while implicit empty Memory stays lazy", async (t) => {
+test("memory.copy remains lazy when neither source nor copy enters agent.do", async (t) => {
   const root = await temporaryRoot(t);
   const vm = AflVm.fromSource(`
 main():
@@ -170,12 +171,72 @@ main():
 `, {});
 
   await vm.run("main", [], { runId: "empty-copy", executionRoot: root });
-  const state = await readOnlyState(root);
-  const entries = Object.entries(state.memories);
-  assert.equal(entries.length, 1);
-  assert.match(entries[0][0], /allocation:copy$/u);
-  assert.deepEqual(entries[0][1].messages, []);
-  assert.equal(entries[0][1].revision, 0);
+  await assert.rejects(access(join(root, ".afl")), { code: "ENOENT" });
+});
+
+test("memory.copy journals a base reference instead of duplicating source messages", async (t) => {
+  const root = await temporaryRoot(t);
+  const agents = new MockAgentAdapter().on("@agent.worker", () => "done");
+  const vm = AflVm.fromSource(`
+main():
+    entry:
+        worker = agent @agent.worker
+        result = worker.do "turn"
+        copied = memory.copy worker.memory
+        reviewer = agent @agent.worker
+        branch = memory.apply reviewer, copied
+        reviewed = branch.do "review"
+        ret reviewed
+`, { agents });
+
+  await vm.run("main", [], { runId: "copy-reference", executionRoot: root });
+  const journals = await readRawJournals(root);
+  assert.equal(journals.length, 2);
+  const copied = journals.find((journal) => journal.header.base !== undefined);
+  const source = journals.find((journal) => journal.header.base === undefined);
+  assert.ok(copied);
+  assert.ok(source);
+  assert.equal(source.filename, "worker.jsons");
+  assert.equal(copied.filename, "copied.jsons");
+  assert.equal(copied.header.base.file, source.filename);
+  assert.equal(copied.header.base.revision, 2);
+  assert.equal(JSON.stringify(copied.records).includes('"turn"'), false);
+  assert.equal(source.records.filter((record) => record.type === "user" || record.type === "assistant").length, 2);
+});
+
+test("using a nested lazy copy materializes its base chain without duplicating history", async (t) => {
+  const root = await temporaryRoot(t);
+  let observed;
+  const agents = new MockAgentAdapter().on("@agent.worker", (request) => {
+    observed = request.messages.map((message) => message.content);
+    return "done";
+  });
+  const vm = AflVm.fromSource(`
+main():
+    entry:
+        source = agent @agent.worker
+        memory.append source.memory, user, "seed"
+        first = memory.copy source.memory
+        second = memory.copy first
+        reviewer = agent @agent.worker
+        branch = memory.apply reviewer, second
+        result = branch.do "turn"
+        ret result
+`, { agents });
+
+  await vm.run("main", [], { runId: "nested-copy", executionRoot: root });
+  assert.deepEqual(observed, ["seed", "turn"]);
+  const journals = await readRawJournals(root);
+  assert.equal(journals.length, 3);
+  const source = journals.find((journal) => journal.header.base === undefined);
+  const first = journals.find((journal) => journal.header.base?.file === source?.filename);
+  const second = journals.find((journal) => journal.header.base?.file === first?.filename);
+  assert.ok(source);
+  assert.ok(first);
+  assert.ok(second);
+  assert.equal(source.records.filter((record) => record.type === "append").length, 1);
+  assert.equal(first.records.length, 0);
+  assert.equal(JSON.stringify(second.records).includes('"seed"'), false);
 });
 
 test("the same runId permits one active top-level run per store namespace", async (t) => {
@@ -282,6 +343,7 @@ test("a failed Memory save prevents already-queued snapshots from reaching the s
     digest,
     [{ role: "user", content: "first" }],
     1,
+    undefined,
     signal,
   );
   await firstSaveEntered;
@@ -290,6 +352,7 @@ test("a failed Memory save prevents already-queued snapshots from reaching the s
     digest,
     [{ role: "user", content: "second" }],
     1,
+    undefined,
     signal,
   );
   const outcomes = Promise.allSettled([first, second]);
@@ -304,21 +367,68 @@ test("a failed Memory save prevents already-queued snapshots from reaching the s
   await assert.rejects(persistence.close(), { code: "MEMORY_STATE_SAVE_FAILED" });
 });
 
-test("corrupt Memory revisions are rejected instead of being reset", async (t) => {
+test("invalid data in the middle of a Memory stream is rejected", async (t) => {
   const root = await temporaryRoot(t);
   const agents = new MockAgentAdapter().on("@agent.worker", () => "done");
   const vm = AflVm.fromSource(SINGLE_AGENT_FLOW, { agents });
   await vm.run("main", [], { runId: "corrupt-state", executionRoot: root });
   const directory = join(root, ".afl", "memory");
-  const [filename] = await readdir(directory);
-  const state = JSON.parse(await readFile(join(directory, filename), "utf8"));
-  Object.values(state.memories)[0].revision = 99;
-  await writeFile(join(directory, filename), JSON.stringify(state));
+  const [runDirectory] = await readdir(directory);
+  const [filename] = (await readdir(join(directory, runDirectory))).filter((name) => name !== "program.jsons");
+  const path = join(directory, runDirectory, filename);
+  const records = parsePrettyJsonStream(await readFile(path, "utf8"));
+  await writeFile(path, `${JSON.stringify(records[0], null, 2)}\n\nnot-json\n\n${JSON.stringify(records[1], null, 2)}\n`);
 
   await assert.rejects(
     vm.run("main", [], { runId: "corrupt-state", executionRoot: root }),
     { code: "MEMORY_STATE_INVALID" },
   );
+});
+
+test("a partial final object is truncated while complete records remain recoverable", async (t) => {
+  const root = await temporaryRoot(t);
+  const agents = new MockAgentAdapter().on("@agent.worker", () => "done");
+  const vm = AflVm.fromSource(SINGLE_AGENT_FLOW, { agents });
+  await vm.run("main", [], { runId: "initial-crash", executionRoot: root });
+  const directory = join(root, ".afl", "memory");
+  const [runDirectory] = await readdir(directory);
+  const [filename] = (await readdir(join(directory, runDirectory))).filter((name) => name !== "program.jsons");
+  const path = join(directory, runDirectory, filename);
+  const complete = parsePrettyJsonStream(await readFile(path, "utf8"))
+    .filter((record) => record.type !== "do.end")
+    .map((record) => `${JSON.stringify(record, null, 2)}\n\n`)
+    .join("");
+  await writeFile(path, `${complete}{\n  "type": "assistant",\n  "text": [\n`);
+
+  const result = await vm.run("main", [], { runId: "initial-crash", executionRoot: root });
+  assert.equal(result.output.content, "done");
+  const state = await readOnlyState(root);
+  assert.equal(Object.values(state.memories)[0].revision, 4);
+});
+
+test("a controlled agent error writes a shallow optional do.end tail", async (t) => {
+  const root = await temporaryRoot(t);
+  const agents = new MockAgentAdapter().on("@agent.worker", () => {
+    throw new Error("model unavailable");
+  });
+  const vm = AflVm.fromSource(SINGLE_AGENT_FLOW, { agents });
+
+  await assert.rejects(
+    vm.run("main", [], { runId: "error-tail", executionRoot: root }),
+    { code: "ADAPTER_ERROR" },
+  );
+  const [journal] = await readRawJournals(root);
+  const tail = journal.records.at(-1);
+  assert.deepEqual(
+    { type: tail.type, status: tail.status, code: tail.error_code, message: tail.error_message },
+    {
+      type: "do.end",
+      status: "error",
+      code: "ADAPTER_ERROR",
+      message: "model unavailable",
+    },
+  );
+  assert.equal("error" in tail, false);
 });
 
 test("Workspace paths are canonical and hierarchical write conflicts are serialized", async (t) => {
@@ -459,9 +569,30 @@ async function temporaryRoot(t) {
 
 async function readOnlyState(root) {
   const directory = join(root, ".afl", "memory");
-  const files = await readdir(directory);
-  assert.equal(files.length, 1);
-  return JSON.parse(await readFile(join(directory, files[0]), "utf8"));
+  const runDirectories = await readdir(directory);
+  assert.equal(runDirectories.length, 1);
+  const [program] = parsePrettyJsonStream(
+    await readFile(join(directory, runDirectories[0], "program.jsons"), "utf8"),
+  );
+  return FileMemoryStateStore.create(directory).loadRun(
+    program.run_id,
+    new AbortController().signal,
+  );
+}
+
+async function readRawJournals(root) {
+  const directory = join(root, ".afl", "memory");
+  const [runDirectory] = await readdir(directory);
+  const runPath = join(directory, runDirectory);
+  const filenames = (await readdir(runPath)).filter((name) => name !== "program.jsons");
+  return Promise.all(filenames.map(async (filename) => {
+    const values = parsePrettyJsonStream(await readFile(join(runPath, filename), "utf8"));
+    return { filename, header: values[0], records: values.slice(1) };
+  }));
+}
+
+function parsePrettyJsonStream(text) {
+  return text.trim().split(/\n\s*\n(?=\{)/u).map((value) => JSON.parse(value));
 }
 
 function delay(milliseconds) {

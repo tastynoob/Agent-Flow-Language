@@ -99,7 +99,19 @@ export default {
 
 `createPiCodingAgentBinding` 显式启用 Pi core 的 `read`、`bash`、`edit` 和 `write` 工具，并为每个 Agent activation 按 AFL Workspace 创建执行上下文。工具的 `cwd` 是 Agent 主工作区；只读工作区作为上下文信息提供，目前尚无 OS 级只读 sandbox。默认也不加载 pi-coding-agent 的 CLI、extensions 或交互 UI。
 
-AFL canonical Memory 默认保存在执行根目录的 `.afl/memory/`，同一 `runId` 再次执行时会恢复对应 slot。Pi native session 和 checkpoint 仍只存在于当前 backend 实例，不属于持久化文件，也不支持 snapshot 恢复。Pi backend 暂不支持带 schema 的 `do`。
+AFL canonical Memory 默认保存在执行根目录的 `.afl/memory/afl-<date>-<id>/`。`program.jsons` 记录 run header；每个真正进入过 `agent.do` 的 Memory 使用一份两空格缩进、对象间空行分隔的 `.jsons` pretty JSON stream。同一 `runId` 再次执行时会恢复对应 slot。Pi backend 在一次 `do` 内按完整语义消息流式追加 thinking、工具调用与工具结果；每个完整 JSON object 都可恢复，不依赖 `do.end`。`memory.copy` 使用 source file/revision 引用，不重复写入整段历史。这仍是 executor continuation，不是 VM snapshot。Pi backend 暂不支持带 schema 的 `do`。
+
+受限工具的 coder-reviewer 示例见 [`examples/coder-reviewer-qsort-bindings.mjs`](examples/coder-reviewer-qsort-bindings.mjs)。它只允许 Agent 读写 `qsort.c`，并通过固定的 GCC 命令编译和运行自测。建议从独立工作目录运行：
+
+```bash
+mkdir -p /tmp/afl-qsort-demo
+cd /tmp/afl-qsort-demo
+DEEPSEEK_API_KEY=... /path/to/Agent-Flow-Language/bin/afl-vm.mjs \
+  /path/to/Agent-Flow-Language/examples/coder-reviewer-qsort-bindings.mjs \
+  /path/to/Agent-Flow-Language/examples/coder-reviewer.afl \
+  --args-file /path/to/Agent-Flow-Language/examples/coder-reviewer-qsort.args.json \
+  --run-id qsort-demo
+```
 
 `afl` 命令负责静态验证；旧 `afl run` 形式暂时保留兼容：
 

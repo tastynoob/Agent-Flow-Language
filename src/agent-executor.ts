@@ -3,6 +3,8 @@ import type { SymbolRef } from "./ir.js";
 import {
   AFL_MESSAGE_ROLE_SCHEMA,
   type AgentMemoryContract,
+  type BackendSessionJournalDelta,
+  type BackendSessionState,
   type Message,
 } from "./memory.js";
 import type { AgentWorkspaceSet } from "./workspace.js";
@@ -24,6 +26,14 @@ export interface BackendSessionRef {
   readonly backend: string;
   readonly id: string;
   readonly checkpoint?: string;
+}
+
+export interface AgentSessionImportRequest {
+  readonly state: BackendSessionState;
+  readonly agent: SymbolRef;
+  readonly systemPrompt?: string;
+  readonly workspace: AgentWorkspaceSet;
+  readonly signal: AbortSignal;
 }
 
 export interface AgentExecutionRequest {
@@ -85,18 +95,22 @@ export interface AgentInputRequest {
 
 export interface AgentExecutionHost {
   emit(event: AgentExecutionEvent): void | Promise<void>;
+  persistContinuation(delta: BackendSessionJournalDelta): void | Promise<void>;
   requestApproval(request: AgentApprovalRequest): Promise<AgentApprovalDecision>;
   requestInput(request: AgentInputRequest): Promise<string>;
 }
 
 export interface AgentExecutorBackend {
   readonly name: string;
+  readonly sessionFormat?: string;
   readonly capabilities: AgentExecutorCapabilities;
   readonly memory: AgentMemoryContract;
 
   execute(request: AgentExecutionRequest, host: AgentExecutionHost): Promise<AgentExecutionResult>;
   checkpoint?(session: BackendSessionRef, signal: AbortSignal): Promise<BackendSessionRef>;
   fork?(session: BackendSessionRef, signal: AbortSignal): Promise<BackendSessionRef>;
+  exportSession?(session: BackendSessionRef, signal: AbortSignal): Promise<BackendSessionState>;
+  importSession?(request: AgentSessionImportRequest): Promise<BackendSessionRef>;
   close?(session: BackendSessionRef, signal: AbortSignal): Promise<void>;
 }
 
