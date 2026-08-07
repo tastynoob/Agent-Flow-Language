@@ -19,8 +19,20 @@ import {
   type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
 import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
+import { isDeepStrictEqual } from "node:util";
+import { Value } from "typebox/value";
+import {
+  BubblewrapExecutionEnv,
+  type BubblewrapExecutionEnvOptions,
+} from "./bubblewrap-execution-env.js";
+import {
+  createAgentToolActionDisplay,
+  redactAgentToolText,
+  type AgentToolExecutionBoundary,
+} from "./agent-tool-policy.js";
 import {
   contentText,
+  Type,
   type Api,
   type AssistantMessage,
   type ImageContent,
@@ -40,6 +52,7 @@ import type {
   AgentExecutorBackend,
   AgentExecutorCapabilities,
   AgentSessionImportRequest,
+  AgentTransactionResult,
   BackendSessionRef,
 } from "./agent-executor.js";
 import { AgentExecutorError } from "./agent-executor.js";
@@ -68,6 +81,8 @@ export interface PiAgentBinding<TContext extends object | undefined = undefined>
   readonly thinkingReplay?: "include" | "exclude";
   readonly streamOptions?: AgentHarnessStreamOptions;
   readonly resources?: AgentHarnessResources;
+  readonly toolBoundaries?: Readonly<Record<string, AgentToolExecutionBoundary>>;
+  readonly sandboxEnforcement?: boolean;
   readonly createExecutionContext?: (
     workspace: AgentWorkspaceSet,
   ) => PiExecutionContext<TContext> | Promise<PiExecutionContext<TContext>>;
@@ -79,13 +94,32 @@ export interface PiExecutionContext<TContext extends object | undefined = undefi
   readonly activeToolNames?: readonly string[];
   readonly resources?: AgentHarnessResources;
   readonly contextPrompt?: string;
+  readonly toolBoundaries?: Readonly<Record<string, AgentToolExecutionBoundary>>;
+  readonly toolWorkspace?: string;
+  readonly normalizeToolAction?: (
+    toolName: string,
+    input: Readonly<Record<string, unknown>>,
+    signal: AbortSignal,
+  ) => Readonly<Record<string, unknown>> | Promise<Readonly<Record<string, unknown>>>;
+  readonly elevation?: PiElevationContext<TContext>;
+  readonly dispose?: () => void | Promise<void>;
+}
+
+export interface PiElevationContext<TContext extends object | undefined = undefined> {
+  readonly tools: readonly AgentHarnessTool<TContext>[];
+  readonly toolContext: AgentHarnessToolContextSource<TContext>;
+  readonly toolWorkspace: string;
+  readonly normalizeToolAction?: (
+    toolName: string,
+    input: Readonly<Record<string, unknown>>,
+    signal: AbortSignal,
+  ) => Readonly<Record<string, unknown>> | Promise<Readonly<Record<string, unknown>>>;
 }
 
 export interface PiAgentExecutorOptions {
   readonly models?: Models;
   readonly agents?: Readonly<Record<string, PiAgentBinding<any>>>;
   readonly defaultBinding?: PiAgentBinding<any>;
-  readonly approval?: "never" | "always";
 }
 
 export interface PiCodingAgentBindingOptions {
@@ -95,6 +129,11 @@ export interface PiCodingAgentBindingOptions {
   readonly thinkingReplay?: "include" | "exclude";
   readonly streamOptions?: AgentHarnessStreamOptions;
   readonly activeToolNames?: readonly string[];
+  readonly sandbox?: false | PiBubblewrapSandboxOptions;
+}
+
+export interface PiBubblewrapSandboxOptions extends Omit<BubblewrapExecutionEnvOptions, "workspace"> {
+  readonly backend: "bubblewrap";
 }
 
 type AnyHarness = AgentHarness<any, Skill, PromptTemplate, AgentHarnessTool<any>>;
@@ -108,12 +147,36 @@ interface PiSessionRecord {
   readonly executionContext: PiExecutionContext<any>;
   readonly workspaceKey: string;
   readonly workspace: AgentWorkspaceSet;
+  readonly hostRouter: PiHostRouter;
   sourceEntryCount: number;
   readonly durableRecords: BackendSessionRecord[];
 }
 
+interface PiHostRouter {
+  readonly pendingSandboxActions: Map<string, PendingSandboxAction>;
+  readonly elevationCandidates: ElevationCandidate[];
+  activation?: {
+    readonly host: AgentExecutionHost;
+    readonly request: AgentExecutionRequest;
+  };
+}
+
+interface PendingSandboxAction {
+  readonly toolCallId: string;
+  readonly toolName: string;
+  readonly input: Readonly<Record<string, unknown>>;
+}
+
+interface ElevationCandidate extends PendingSandboxAction {
+  readonly source: "policy-block" | "sandbox-error";
+}
+
 const PI_BACKEND_NAME = "pi";
 const PI_SESSION_FORMAT = "pi.session/v0";
+const AFL_TRANSACTION_TOOL_NAME = "afl_transaction_request";
+const AFL_TRANSACTION_CANONICAL_NAME = "afl.transaction.request";
+const AFL_ELEVATION_TOOL_NAME = "afl_elevated_tool";
+const AFL_ELEVATION_CANONICAL_NAME = "afl.elevation.execute";
 
 interface PiSessionPayload {
   readonly version: 0;
@@ -121,6 +184,7 @@ interface PiSessionPayload {
 }
 
 export function createPiCodingAgentBinding(options: PiCodingAgentBindingOptions): PiAgentBinding<ExecutionToolContext> {
+  const sandbox = options.sandbox ?? false;
   return {
     model: options.model,
     ...(options.systemPrompt === undefined ? {} : { systemPrompt: options.systemPrompt }),
@@ -128,11 +192,43 @@ export function createPiCodingAgentBinding(options: PiCodingAgentBindingOptions)
     ...(options.thinkingLevel === undefined ? {} : { thinkingLevel: options.thinkingLevel }),
     ...(options.thinkingReplay === undefined ? {} : { thinkingReplay: options.thinkingReplay }),
     ...(options.streamOptions === undefined ? {} : { streamOptions: options.streamOptions }),
-    createExecutionContext: (workspace) => ({
-      tools: [createReadTool(), createBashTool(), createEditTool(), createWriteTool()],
-      toolContext: { env: new NodeExecutionEnv({ cwd: workspace.primary.root }) },
-      contextPrompt: workspaceContextPrompt(workspace),
-    }),
+    sandboxEnforcement: sandbox !== false,
+    createExecutionContext: async (workspace) => {
+      if (sandbox === false) {
+        const env = new NodeExecutionEnv({ cwd: workspace.primary.root });
+        return {
+          tools: codingTools(),
+          toolContext: { env },
+          contextPrompt: workspaceContextPrompt(workspace),
+          toolWorkspace: workspace.primary.root,
+          toolBoundaries: codingToolBoundaries("host"),
+          normalizeToolAction: createCodingToolActionNormalizer(env),
+        };
+      }
+      if (sandbox.backend !== "bubblewrap") {
+        throw new AgentExecutorError(
+          "AGENT_SANDBOX_UNAVAILABLE",
+          `Unsupported Pi coding sandbox '${String(sandbox.backend)}'`,
+        );
+      }
+      const env = await BubblewrapExecutionEnv.create({ ...sandbox, workspace });
+      const hostEnv = new NodeExecutionEnv({ cwd: workspace.primary.root });
+      return {
+        tools: codingTools(),
+        toolContext: { env },
+        contextPrompt: sandboxWorkspaceContextPrompt(env.readOnlyRoots, true),
+        toolWorkspace: env.cwd,
+        toolBoundaries: codingToolBoundaries("sandbox"),
+        normalizeToolAction: createCodingToolActionNormalizer(env),
+        elevation: {
+          tools: codingTools(),
+          toolContext: { env: hostEnv },
+          toolWorkspace: workspace.primary.root,
+          normalizeToolAction: createCodingToolActionNormalizer(hostEnv),
+        },
+        dispose: () => env.cleanup(),
+      };
+    },
   };
 }
 
@@ -165,15 +261,18 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
   private readonly models: Models;
   private readonly agents: Readonly<Record<string, PiAgentBinding<any>>>;
   private readonly defaultBinding: PiAgentBinding<any> | undefined;
-  private readonly approval: "never" | "always";
   private readonly sessions = new Map<string, PiSessionRecord>();
   private readonly sessionRepo = new InMemorySessionRepo();
+  private toolRequestSequence = 0;
 
   constructor(options: PiAgentExecutorOptions) {
     this.models = options.models ?? builtinModels();
     this.agents = options.agents ?? {};
     this.defaultBinding = options.defaultBinding;
-    this.approval = options.approval ?? "never";
+    const knownBindings = [
+      ...Object.values(this.agents),
+      ...(this.defaultBinding === undefined ? [] : [this.defaultBinding]),
+    ];
     this.capabilities = Object.freeze({
       nativeSession: true,
       checkpoint: true,
@@ -183,8 +282,9 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
       structuredOutput: false,
       interrupt: true,
       dynamicControlTools: true,
-      interactiveApproval: this.approval === "always",
-      sandboxEnforcement: false,
+      interactiveApproval: true,
+      sandboxEnforcement: knownBindings.length > 0 &&
+        knownBindings.every((binding) => binding.sandboxEnforcement === true),
     });
   }
 
@@ -249,21 +349,25 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
       await this.importMessages(record, pending.slice(0, -1));
       const unsubscribe = this.bindEvents(record, host);
       let restoreControlTools: (() => Promise<void>) | undefined;
-      let removeApproval: (() => void) | undefined;
+      let removeAuthorization: (() => void) | undefined;
       let result: AgentExecutionResult;
       const abort = () => {
         void record.harness.abort().catch(() => {});
       };
       try {
+        record.hostRouter.pendingSandboxActions.clear();
+        record.hostRouter.elevationCandidates.splice(0);
+        record.hostRouter.activation = { host, request };
         restoreControlTools = await this.configureControlTools(record, request, host);
-        removeApproval = this.bindApproval(record.harness, request, host);
+        removeAuthorization = this.bindAuthorization(record, request, host);
         request.signal.addEventListener("abort", abort, { once: true });
         result = request.signal.aborted
           ? await this.cancelledResult(record)
           : await this.toResult(record, await record.harness.prompt(prompt.content));
       } finally {
+        delete record.hostRouter.activation;
         request.signal.removeEventListener("abort", abort);
-        removeApproval?.();
+        removeAuthorization?.();
         await restoreControlTools?.();
         unsubscribe();
       }
@@ -314,8 +418,9 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     const forkedSession = await this.sessionRepo.fork(metadata, {
       ...(session.checkpoint === undefined ? {} : { entryId: session.checkpoint, position: "at" }),
     });
+    let executionContext: PiExecutionContext<any> | undefined;
     try {
-      const executionContext = await this.resolveExecutionContext(source.binding, source.workspace);
+      executionContext = await this.resolveExecutionContext(source.binding, source.workspace);
       const entries = await forkedSession.getEntries();
       const record = this.buildSessionRecord(
         forkedSession,
@@ -337,6 +442,7 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
         ...(checkpoint === null ? {} : { checkpoint }),
       };
     } catch (error) {
+      await disposeExecutionContext(executionContext);
       await this.deleteRawSession(forkedSession).catch(() => {});
       throw error;
     }
@@ -372,10 +478,11 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     const binding = this.resolveBinding(request.agent.name);
     const effectiveSystemPrompt = request.systemPrompt ?? binding.systemPrompt;
     const session = await this.sessionRepo.create();
+    let executionContext: PiExecutionContext<any> | undefined;
     try {
       const model = this.resolveModel(binding.model);
       await importSessionRecords(session, payload.records, model);
-      const executionContext = await this.resolveExecutionContext(binding, request.workspace);
+      executionContext = await this.resolveExecutionContext(binding, request.workspace);
       const sourceEntryCount = (await session.getEntries()).length;
       const record = this.buildSessionRecord(
         session,
@@ -397,6 +504,7 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
         ...(checkpoint === null ? {} : { checkpoint }),
       };
     } catch (error) {
+      await disposeExecutionContext(executionContext);
       await this.deleteRawSession(session).catch(() => {});
       if (error instanceof AgentExecutorError) throw error;
       throw new AgentExecutorError("AGENT_SESSION_INVALID", "Pi session continuation is invalid", { cause: error });
@@ -438,8 +546,9 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     workspace: AgentWorkspaceSet,
   ): Promise<PiSessionRecord> {
     const session = await this.sessionRepo.create();
+    let executionContext: PiExecutionContext<any> | undefined;
     try {
-      const executionContext = await this.resolveExecutionContext(binding, workspace);
+      executionContext = await this.resolveExecutionContext(binding, workspace);
       const record = this.buildSessionRecord(
         session,
         agentName,
@@ -453,6 +562,7 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
       this.sessions.set(metadata.id, record);
       return record;
     } catch (error) {
+      await disposeExecutionContext(executionContext);
       await this.deleteRawSession(session).catch(() => {});
       throw error;
     }
@@ -470,20 +580,59 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     durableRecords: readonly BackendSessionRecord[] = [],
   ): PiSessionRecord {
     const harnessSystemPrompt = joinPrompts(systemPrompt, executionContext.contextPrompt);
+    const hostRouter: PiHostRouter = {
+      pendingSandboxActions: new Map(),
+      elevationCandidates: [],
+    };
+    const configuredTools = executionContext.tools ?? binding.tools ?? [];
+    const reservedNames = new Set([
+      AFL_TRANSACTION_TOOL_NAME,
+      AFL_TRANSACTION_CANONICAL_NAME,
+      AFL_ELEVATION_TOOL_NAME,
+      AFL_ELEVATION_CANONICAL_NAME,
+    ]);
+    const reserved = configuredTools.find((tool) => reservedNames.has(tool.name));
+    if (reserved !== undefined) {
+      throw new AgentExecutorError(
+        "AGENT_CAPABILITY_UNSUPPORTED",
+        `Agent binding cannot register reserved AFL built-in tool '${reserved.name}'`,
+      );
+    }
+    const normalToolContext = executionContext.toolContext ?? binding.toolContext;
+    if (executionContext.elevation !== undefined && normalToolContext === undefined) {
+      throw new AgentExecutorError(
+        "AGENT_CAPABILITY_UNSUPPORTED",
+        "Pi elevation requires a normal sandbox tool context",
+      );
+    }
+    const builtInTools = [
+      createTransactionRequestTool(hostRouter),
+      ...(executionContext.elevation === undefined
+        ? []
+        : [createElevationTool(hostRouter, {
+            tools: configuredTools,
+            toolContext: normalToolContext!,
+            toolWorkspace: executionContext.toolWorkspace ?? workspace.primary.root,
+            ...(executionContext.normalizeToolAction === undefined
+              ? {}
+              : { normalizeToolAction: executionContext.normalizeToolAction }),
+          }, executionContext.elevation)]),
+    ];
+    const tools = [...configuredTools, ...builtInTools];
+    const configuredActiveNames = executionContext.activeToolNames ?? binding.activeToolNames;
+    const activeToolNames = configuredActiveNames === undefined
+      ? undefined
+      : [...new Set([...configuredActiveNames, ...builtInTools.map((tool) => tool.name)])];
     const harness = new AgentHarness<any, Skill, PromptTemplate, AgentHarnessTool<any>>({
       session,
       models: this.models,
       model: this.resolveModel(binding.model),
       ...(harnessSystemPrompt === undefined ? {} : { systemPrompt: harnessSystemPrompt }),
-      ...((executionContext.tools ?? binding.tools) === undefined
-        ? {}
-        : { tools: [...(executionContext.tools ?? binding.tools)!] }),
+      tools,
       ...((executionContext.toolContext ?? binding.toolContext) === undefined
         ? {}
         : { toolContext: executionContext.toolContext ?? binding.toolContext }),
-      ...((executionContext.activeToolNames ?? binding.activeToolNames) === undefined
-        ? {}
-        : { activeToolNames: [...(executionContext.activeToolNames ?? binding.activeToolNames)!] }),
+      ...(activeToolNames === undefined ? {} : { activeToolNames }),
       ...(binding.thinkingLevel === undefined ? {} : { thinkingLevel: binding.thinkingLevel }),
       ...(binding.streamOptions === undefined ? {} : { streamOptions: binding.streamOptions }),
       ...((executionContext.resources ?? binding.resources) === undefined
@@ -502,6 +651,7 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
       executionContext,
       workspaceKey: sessionWorkspaceKey,
       workspace,
+      hostRouter,
       sourceEntryCount,
       durableRecords: structuredClone([...durableRecords]),
     };
@@ -527,7 +677,10 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     const baselineActiveNames = record.harness.getActiveTools().map((tool) => tool.name);
     const aliases = controlToolAliases(request.control.tools);
     const reserved = baselineTools.find((tool) =>
-      tool.name.startsWith("afl.") || aliases.has(tool.name));
+      (tool.name.startsWith("afl.") &&
+        tool.name !== AFL_TRANSACTION_CANONICAL_NAME &&
+        tool.name !== AFL_ELEVATION_CANONICAL_NAME) ||
+      aliases.has(tool.name));
     if (reserved !== undefined) {
       throw new AgentExecutorError(
         "AGENT_CAPABILITY_UNSUPPORTED",
@@ -555,7 +708,11 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     }));
     await record.harness.setTools(
       [...baselineTools, ...controlTools],
-      controlTools.map((tool) => tool.name),
+      [
+        AFL_TRANSACTION_TOOL_NAME,
+        ...(record.executionContext.elevation === undefined ? [] : [AFL_ELEVATION_TOOL_NAME]),
+        ...controlTools.map((tool) => tool.name),
+      ],
     );
     return async () => {
       await record.harness.setTools(baselineTools, baselineActiveNames);
@@ -620,6 +777,13 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
 
   private bindEvents(record: PiSessionRecord, host: AgentExecutionHost): () => void {
     return record.harness.subscribe(async (event) => {
+      if (event.type === "tool_execution_end") {
+        const pending = record.hostRouter.pendingSandboxActions.get(event.toolCallId);
+        record.hostRouter.pendingSandboxActions.delete(event.toolCallId);
+        if (pending !== undefined && event.isError) {
+          record.hostRouter.elevationCandidates.push({ ...pending, source: "sandbox-error" });
+        }
+      }
       if (isSessionDurabilityEvent(event)) {
         const entries = await record.session.getEntries({ afterEntrySeq: record.sourceEntryCount });
         if (entries.length > 0) {
@@ -641,22 +805,72 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     });
   }
 
-  private bindApproval(harness: AnyHarness, request: AgentExecutionRequest, host: AgentExecutionHost): () => void {
-    if (this.approval !== "always") return () => {};
-    return harness.on("tool_call", async (event) => {
-      const decision = await host.requestApproval({
+  private bindAuthorization(
+    record: PiSessionRecord,
+    request: AgentExecutionRequest,
+    host: AgentExecutionHost,
+  ): () => void {
+    const controlNames = new Set(request.control?.tools.map((tool) => piControlToolName(tool.name)) ?? []);
+    controlNames.add(AFL_TRANSACTION_TOOL_NAME);
+    if (record.executionContext.elevation !== undefined) controlNames.add(AFL_ELEVATION_TOOL_NAME);
+    return record.harness.on("tool_call", async (event) => {
+      this.toolRequestSequence += 1;
+      if (controlNames.has(event.toolName)) {
+        await host.emit({ type: "tool.started", id: event.toolCallId, name: event.toolName });
+        return undefined;
+      }
+      const executionBoundary = record.executionContext.toolBoundaries?.[event.toolName] ??
+        record.binding.toolBoundaries?.[event.toolName] ??
+        "host";
+      const input = event.input as Readonly<Record<string, unknown>>;
+      const effectiveInput = await record.executionContext.normalizeToolAction?.(
+        event.toolName,
+        input,
+        request.signal,
+      ) ?? input;
+      const authorization = await host.authorizeTool({
+        requestId: `${request.runId}:pi-tool:${this.toolRequestSequence}`,
         runId: request.runId,
         node: request.node,
         block: request.block,
         agent: request.agent,
-        action: "tool",
-        id: event.toolCallId,
-        name: event.toolName,
-        input: event.input,
+        backend: this.name,
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+        executionBoundary,
+        workspace: request.workspace,
+        input,
+        effectiveInput,
+        display: createAgentToolActionDisplay(
+          event.toolName,
+          effectiveInput,
+          record.executionContext.toolWorkspace ?? request.workspace.primary.root,
+        ),
+        signal: request.signal,
       });
-      return decision === "approved"
-        ? undefined
-        : { block: true, reason: "AFL host denied this tool call" };
+      if (authorization.status === "denied") {
+        if (authorization.elevatable && executionBoundary === "sandbox") {
+          record.hostRouter.elevationCandidates.push({
+            toolCallId: event.toolCallId,
+            toolName: event.toolName,
+            input: structuredClone(input),
+            source: "policy-block",
+          });
+        }
+        const elevationHint = authorization.elevatable && record.executionContext.elevation !== undefined
+          ? " Try a safer alternative first; if its cost is unacceptable, retry the same tool and arguments with afl_elevated_tool."
+          : "";
+        return { block: true, reason: `[${authorization.code}] ${authorization.reason}${elevationHint}` };
+      }
+      if (executionBoundary === "sandbox") {
+        record.hostRouter.pendingSandboxActions.set(event.toolCallId, {
+          toolCallId: event.toolCallId,
+          toolName: event.toolName,
+          input: structuredClone(input),
+        });
+      }
+      await host.emit({ type: "tool.started", id: event.toolCallId, name: event.toolName });
+      return undefined;
     });
   }
 
@@ -700,12 +914,232 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
   private async deleteSession(record: PiSessionRecord): Promise<void> {
     const metadata = await record.session.getMetadata();
     this.sessions.delete(metadata.id);
+    await disposeExecutionContext(record.executionContext);
     await this.sessionRepo.delete(metadata);
   }
 
   private async deleteRawSession(session: Session): Promise<void> {
     await this.sessionRepo.delete(await session.getMetadata());
   }
+}
+
+function createTransactionRequestTool(hostRouter: PiHostRouter): AgentHarnessTool<any> {
+  return {
+    name: AFL_TRANSACTION_TOOL_NAME,
+    label: "Request user action",
+    description: [
+      "Ask the user to perform an external prerequisite action, then pause until they confirm completion.",
+      "Use this when work cannot continue without something only the user or host can provide, such as installing a missing tool.",
+      "This tool does not grant permissions or perform the action. After it returns completed, verify the resume condition yourself.",
+      `Canonical AFL name: ${AFL_TRANSACTION_CANONICAL_NAME}.`,
+    ].join(" "),
+    parameters: Type.Object({
+      title: Type.String({ minLength: 1, description: "Short human-readable request title" }),
+      request: Type.String({ minLength: 1, description: "The exact action the user needs to perform" }),
+      reason: Type.String({ minLength: 1, description: "Why the agent cannot continue without this action" }),
+      resume_when: Type.Optional(Type.String({
+        minLength: 1,
+        description: "An observable condition the agent will verify after the user confirms completion",
+      })),
+    }),
+    executionMode: "sequential",
+    execute: async (toolCallId, params, signal) => {
+      const input = params as {
+        readonly title: string;
+        readonly request: string;
+        readonly reason: string;
+        readonly resume_when?: string;
+      };
+      const activation = hostRouter.activation;
+      if (activation === undefined) {
+        throw new AgentExecutorError(
+          "AGENT_CAPABILITY_UNSUPPORTED",
+          "AFL transaction requests are only available during an active Agent execution",
+        );
+      }
+      const result = await activation.host.requestTransaction({
+        id: toolCallId,
+        title: input.title,
+        request: input.request,
+        reason: input.reason,
+        ...(input.resume_when === undefined ? {} : { resumeWhen: input.resume_when }),
+        signal: signal ?? activation.request.signal,
+      });
+      return transactionToolResult(result);
+    },
+  };
+}
+
+function transactionToolResult(result: AgentTransactionResult): {
+  content: TextContent[];
+  details: AgentTransactionResult;
+} {
+  const text = result.status === "completed"
+    ? "The user marked the requested action as completed. Verify the resume condition before continuing."
+    : result.status === "denied"
+    ? `The user declined the requested action: ${result.message}`
+    : `The transaction request could not be presented [${result.code}]: ${result.message}`;
+  return { content: [{ type: "text", text }], details: result };
+}
+
+function createElevationTool(
+  hostRouter: PiHostRouter,
+  sandbox: PiElevationContext<any>,
+  host: PiElevationContext<any>,
+): AgentHarnessTool<any> {
+  if (host.tools.length === 0) {
+    throw new AgentExecutorError(
+      "AGENT_CAPABILITY_UNSUPPORTED",
+      "Pi elevation context must provide at least one target tool",
+    );
+  }
+  const sandboxTargets = new Map(sandbox.tools.map((tool) => [tool.name, tool]));
+  const hostTargets = new Map<string, AgentHarnessTool<any>>();
+  for (const tool of host.tools) {
+    if (hostTargets.has(tool.name) || tool.name.startsWith("afl.") || tool.name.startsWith("afl_")) {
+      throw new AgentExecutorError(
+        "AGENT_CAPABILITY_UNSUPPORTED",
+        `Invalid or duplicate elevated Pi tool '${tool.name}'`,
+      );
+    }
+    if (!sandboxTargets.has(tool.name)) {
+      throw new AgentExecutorError(
+        "AGENT_CAPABILITY_UNSUPPORTED",
+        `Elevated Pi tool '${tool.name}' has no matching sandbox tool`,
+      );
+    }
+    hostTargets.set(tool.name, tool);
+  }
+  const toolNames = host.tools.map((tool) => tool.name);
+  const parameters = Type.Object({
+    tool: Type.String({
+      minLength: 1,
+      enum: toolNames,
+      description: `Tool to retry. Must be one of: ${toolNames.join(", ")}`,
+    }),
+    arguments: Type.Object({}, {
+      additionalProperties: true,
+      description: "Exact arguments from the previously blocked or sandbox-failed tool call",
+    }),
+    reason: Type.String({
+      minLength: 1,
+      description: "Why safer alternatives are too costly or why the sandbox boundary prevents completion",
+    }),
+  });
+  return {
+    name: AFL_ELEVATION_TOOL_NAME,
+    label: "Request elevated tool execution",
+    description: [
+      "Retry one previously blocked tool action after mandatory one-shot human approval.",
+      "Use it only after the same tool and arguments were soft-blocked by policy or failed during sandbox execution, and safer alternatives are impractical.",
+      "A policy-blocked action remains inside the sandbox; only an action that actually failed in the sandbox may use the host executor.",
+      "Hard policy denials cannot be elevated. Use afl_transaction_request when the user must perform an external action.",
+      "For host retries, relative paths and command working directories resolve to the primary host workspace; do not use /workspace as a host path.",
+      `Available elevated tools: ${host.tools.map((tool) => tool.name).join(", ")}.`,
+      `Canonical AFL name: ${AFL_ELEVATION_CANONICAL_NAME}.`,
+    ].join(" "),
+    parameters,
+    executionMode: "sequential",
+    execute: async (toolCallId, params, signal, onUpdate) => {
+      const input = params as {
+        readonly tool: string;
+        readonly arguments: Readonly<Record<string, unknown>>;
+        readonly reason: string;
+      };
+      const activation = hostRouter.activation;
+      if (activation === undefined) {
+        throw new AgentExecutorError(
+          "AGENT_CAPABILITY_UNSUPPORTED",
+          "AFL elevated tool execution is only available during an active Agent execution",
+        );
+      }
+      const hostTarget = hostTargets.get(input.tool);
+      const sandboxTarget = sandboxTargets.get(input.tool);
+      if (hostTarget === undefined || sandboxTarget === undefined) {
+        throw new AgentExecutorError(
+          "AGENT_CAPABILITY_UNSUPPORTED",
+          `Elevated Pi tool '${input.tool}' is not available`,
+        );
+      }
+      if (!Value.Check(hostTarget.parameters, input.arguments)) {
+        throw new AgentExecutorError(
+          "AGENT_EXECUTION_FAILED",
+          `Invalid arguments for elevated Pi tool '${hostTarget.name}'`,
+        );
+      }
+      let failedIndex = -1;
+      for (let index = hostRouter.elevationCandidates.length - 1; index >= 0; index -= 1) {
+        const action = hostRouter.elevationCandidates[index]!;
+        if (action.toolName === hostTarget.name && isDeepStrictEqual(action.input, input.arguments)) {
+          failedIndex = index;
+          break;
+        }
+      }
+      if (failedIndex < 0) {
+        throw new AgentExecutorError(
+          "AGENT_CAPABILITY_UNSUPPORTED",
+          `Elevated Pi tool '${hostTarget.name}' must retry the same arguments from a soft policy block or failed sandbox execution in the current Agent call`,
+        );
+      }
+      const candidate = hostRouter.elevationCandidates[failedIndex]!;
+      const targetContext = candidate.source === "policy-block" ? sandbox : host;
+      const target = candidate.source === "policy-block" ? sandboxTarget : hostTarget;
+      const requestSignal = signal ?? activation.request.signal;
+      const effectiveInput = await targetContext.normalizeToolAction?.(
+        target.name,
+        input.arguments,
+        requestSignal,
+      ) ?? input.arguments;
+      const baseDisplay = createAgentToolActionDisplay(
+        target.name,
+        effectiveInput,
+        targetContext.toolWorkspace,
+      );
+      const elevatedCallId = `${toolCallId}:elevated`;
+      const authorization = await activation.host.requestElevation({
+        id: elevatedCallId,
+        toolName: target.name,
+        input: input.arguments,
+        effectiveInput,
+        executionBoundary: candidate.source === "policy-block" ? "sandbox" : "host",
+        reason: input.reason,
+        display: {
+          ...baseDisplay,
+          title: `Elevated ${target.label ?? target.name}`,
+          details: {
+            ...baseDisplay.details,
+            reason: redactAgentToolText(input.reason),
+          },
+        },
+        signal: requestSignal,
+      });
+      if (authorization.status === "denied") {
+        throw new Error(`Elevated execution denied [${authorization.code}]: ${authorization.reason}`);
+      }
+      await activation.host.emit({ type: "tool.started", id: elevatedCallId, name: target.name });
+      try {
+        const context = typeof targetContext.toolContext === "function"
+          ? await targetContext.toolContext()
+          : targetContext.toolContext;
+        const result = await target.execute(
+          elevatedCallId,
+          input.arguments,
+          requestSignal,
+          onUpdate,
+          context,
+        );
+        hostRouter.elevationCandidates.splice(failedIndex, 1);
+        await activation.host.emit({ type: "tool.completed", id: elevatedCallId, name: target.name, ok: true });
+        return {
+          content: result.content,
+          details: { status: "executed", tool: target.name, source: candidate.source },
+        };
+      } catch (error) {
+        await activation.host.emit({ type: "tool.completed", id: elevatedCallId, name: target.name, ok: false });
+        throw error;
+      }
+    },
+  };
 }
 
 function importedAssistantMessage(model: Model<Api>, content: string, timestamp: number): AssistantMessage {
@@ -1218,7 +1652,7 @@ function mapEvent(event: AgentHarnessEvent): AgentExecutionEvent | undefined {
     return { type: "message.delta", text: event.assistantMessageEvent.delta };
   }
   if (event.type === "tool_execution_start") {
-    return { type: "tool.started", id: event.toolCallId, name: event.toolName };
+    return { type: "tool.requested", id: event.toolCallId, name: event.toolName };
   }
   if (event.type === "tool_execution_update") {
     return { type: "tool.updated", id: event.toolCallId, name: event.toolName };
@@ -1267,6 +1701,61 @@ function workspaceContextPrompt(workspace: AgentWorkspaceSet): string {
     );
   }
   return lines.join("\n");
+}
+
+function sandboxWorkspaceContextPrompt(readOnlyRoots: readonly string[], elevationAvailable: boolean): string {
+  const lines = [
+    "Primary workspace: /workspace",
+    "Use /workspace as the working directory for file and command operations.",
+  ];
+  if (elevationAvailable) {
+    lines.push(
+      "When a tool is soft-blocked by policy, try a safer alternative first. Use afl_elevated_tool with the same tool and arguments only when the alternative cost is unacceptable, and explain why.",
+      "When an otherwise safe operation actually fails because the sandbox cannot access a host resource, afl_elevated_tool may retry the same tool and arguments on the host after approval.",
+      "For host retries, relative paths use the primary host workspace; do not pass /workspace as a host path.",
+      "Hard policy denials must not be retried through elevation. Use afl_transaction_request only when the user must perform an external action.",
+    );
+  }
+  if (readOnlyRoots.length > 0) {
+    lines.push(
+      "Read-only workspaces (context only; do not modify them):",
+      ...readOnlyRoots.map((root, index) => `- ${root} (workspace ${index})`),
+    );
+  }
+  return lines.join("\n");
+}
+
+function codingTools(): AgentHarnessTool<ExecutionToolContext>[] {
+  return [createReadTool(), createBashTool(), createEditTool(), createWriteTool()];
+}
+
+function codingToolBoundaries(
+  boundary: AgentToolExecutionBoundary,
+): Readonly<Record<string, AgentToolExecutionBoundary>> {
+  return { read: boundary, bash: boundary, edit: boundary, write: boundary };
+}
+
+function createCodingToolActionNormalizer(env: ExecutionToolContext["env"]): (
+  toolName: string,
+  input: Readonly<Record<string, unknown>>,
+  signal: AbortSignal,
+) => Promise<Readonly<Record<string, unknown>>> {
+  return async (toolName, input, signal) => {
+    if (toolName === "bash") return { ...input, cwd: env.cwd, env: {}, inheritEnv: true };
+    if (toolName !== "read" && toolName !== "edit" && toolName !== "write") return input;
+    if (typeof input.path !== "string") return input;
+    const resolved = await env.absolutePath(input.path, signal);
+    if (!resolved.ok) throw resolved.error;
+    return { ...input, path: resolved.value };
+  };
+}
+
+async function disposeExecutionContext(context: PiExecutionContext<any> | undefined): Promise<void> {
+  try {
+    await context?.dispose?.();
+  } catch {
+    // Execution environment cleanup is best-effort during session teardown.
+  }
 }
 
 function controlToolAliases(tools: readonly AgentControlToolDescriptor[]): ReadonlySet<string> {

@@ -13,6 +13,7 @@ Agent Flow Language（AFL）是项目正式名称。本目录只描述当前 AFL
 
 - [AFL IR 示例](guides/examples.md)
 - [Parallel Voting](guides/parallel-voting.md)
+- [Agent 工具安全与 Bubblewrap](guides/agent-security.md)
 
 ## VM 与 CLI
 

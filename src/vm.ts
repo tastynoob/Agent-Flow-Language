@@ -18,8 +18,21 @@ import {
   type AgentExecutionRequest,
   type AgentExecutionStopReason,
   type AgentExecutorBackend,
+  type AgentElevationRequest,
+  type AgentToolAuthorization,
+  type AgentTransactionRequest,
+  type AgentTransactionResult,
   type BackendSessionRef,
 } from "./agent-executor.js";
+import { AgentApprovalError, type AgentApprovalQueueEvent } from "./approval-queue.js";
+import {
+  AgentToolPolicyEngine,
+  agentToolActionDigest,
+  createAgentToolActionDisplay,
+  redactAgentToolText,
+  snapshotAgentToolAction,
+  type AgentToolAction,
+} from "./agent-tool-policy.js";
 import {
   linkedController,
   ResourceLocks,
@@ -206,6 +219,7 @@ export class AflVm {
   readonly module: AflModule;
   readonly bindings: VmBindings;
   private readonly agentExecutor: AgentExecutorBackend | undefined;
+  private readonly agentToolPolicy: AgentToolPolicyEngine | undefined;
 
   constructor(module: AflModule, bindings: VmBindings) {
     this.module = assertValidModule(module);
@@ -213,6 +227,10 @@ export class AflVm {
     this.agentExecutor = bindings.agentExecutor ?? (
       bindings.agents === undefined ? undefined : new AgentAdapterExecutorBackend(bindings.agents)
     );
+    const preTool = bindings.agentSecurity?.preTool;
+    this.agentToolPolicy = preTool === undefined || preTool === false
+      ? undefined
+      : new AgentToolPolicyEngine(preTool);
   }
 
   static fromSource(source: string, bindings: VmBindings, sourceName?: string): AflVm {
@@ -956,8 +974,24 @@ export class AflVm {
               location: `${location.node}:${location.block}:${location.instruction}`,
             }, signal);
             externalLease = await SuspendableSemaphoreLease.open(context.external, signal);
-            const host = this.createAgentHost(context, location, persistenceAttempt, externalLease, control);
-            await this.trace(context, "agent.started", location, { agent: agent.id });
+            const host = this.createAgentHost(
+              context,
+              location,
+              persistenceAttempt,
+              externalLease,
+              request,
+              executor.name,
+              control,
+            );
+            await this.trace(context, "agent.started", location, {
+              agent: agent.id,
+              security: {
+                preToolPolicy: this.agentToolPolicy !== undefined,
+                humanRequestQueue: this.bindings.agentSecurity?.approvalQueue !== undefined &&
+                  this.bindings.agentSecurity.approvalQueue !== false,
+                sandboxEnforcement: executor.capabilities.sandboxEnforcement,
+              },
+            });
             const result = await executor.execute(request, host);
             await externalLease.close();
             externalLease = undefined;
@@ -1176,24 +1210,42 @@ export class AflVm {
     location: Required<TraceLocation>,
     persistenceAttempt: MemoryPersistenceAttempt,
     externalLease: SuspendableSemaphoreLease,
+    executionRequest: AgentExecutionRequest,
+    backend: string,
     control?: FreedomRuntime,
   ): AgentExecutionHost {
+    const emit = async (event: Parameters<AgentExecutionHost["emit"]>[0]) => {
+      await this.trace(context, "agent.event", location, structuredClone(event) as ComputeValue);
+      await this.bindings.agentHost?.emit?.(event);
+    };
     return {
-      emit: async (event) => {
-        await this.trace(context, "agent.event", location, structuredClone(event) as ComputeValue);
-        await this.bindings.agentHost?.emit(event);
-      },
+      emit,
       persistContinuation: (delta) => context.persistence.appendContinuation(
         persistenceAttempt,
         delta,
         new AbortController().signal,
       ),
-      requestApproval: async (request) => {
-        if (this.bindings.agentHost === undefined) return "denied";
-        return this.bindings.agentHost.requestApproval(request);
-      },
+      authorizeTool: async (action) => this.authorizeAgentTool(
+        action,
+        executionRequest,
+        backend,
+        emit,
+      ),
+      requestElevation: async (request) => this.requestAgentElevation(
+        request,
+        executionRequest,
+        backend,
+        emit,
+        (operation) => externalLease.suspend(operation),
+      ),
+      requestTransaction: async (request) => externalLease.suspend(() => this.requestAgentTransaction(
+        request,
+        executionRequest,
+        backend,
+        emit,
+      )),
       requestInput: async (request) => {
-        if (this.bindings.agentHost === undefined) {
+        if (this.bindings.agentHost?.requestInput === undefined) {
           throw new AgentExecutorError(
             "AGENT_CAPABILITY_UNSUPPORTED",
             "Agent executor requested interactive input, but no Agent host is configured",
@@ -1214,6 +1266,275 @@ export class AflVm {
         });
       },
     };
+  }
+
+  private async authorizeAgentTool(
+    action: AgentToolAction,
+    executionRequest: AgentExecutionRequest,
+    backend: string,
+    emit: AgentExecutionHost["emit"],
+    elevation?: {
+      readonly reason: string;
+      readonly wait: <T>(operation: () => Promise<T>) => Promise<T>;
+    },
+  ): Promise<AgentToolAuthorization> {
+    let bound: AgentToolAction;
+    try {
+      bound = snapshotAgentToolAction({
+        ...action,
+        runId: executionRequest.runId,
+        node: executionRequest.node,
+        block: executionRequest.block,
+        agent: executionRequest.agent,
+        backend,
+        workspace: executionRequest.workspace,
+        signal: action.signal,
+      });
+    } catch {
+      const requestId = typeof action.requestId === "string" ? action.requestId : "invalid-tool-request";
+      const id = typeof action.toolCallId === "string" ? action.toolCallId : "invalid-tool-call";
+      const name = typeof action.toolName === "string" ? action.toolName : "invalid-tool";
+      await emit({
+        type: "tool.policy",
+        id,
+        name,
+        verdict: "deny",
+        covered: true,
+        code: "AGENT_TOOL_POLICY_FAILED",
+        reason: "Tool action could not be normalized for policy evaluation",
+      });
+      return {
+        status: "denied",
+        requestId,
+        code: "AGENT_TOOL_POLICY_FAILED",
+        reason: "Tool action could not be normalized for policy evaluation",
+      };
+    }
+    const evaluation = this.agentToolPolicy === undefined
+      ? { verdict: "allow" as const, covered: false, results: [] }
+      : await this.agentToolPolicy.evaluate(bound);
+    const publicReason = evaluation.verdict === "deny" || evaluation.verdict === "block"
+      ? redactAgentToolText(evaluation.reason)
+      : undefined;
+    await emit({
+      type: "tool.policy",
+      id: bound.toolCallId,
+      name: bound.toolName,
+      verdict: evaluation.verdict,
+      covered: evaluation.covered,
+      ...(evaluation.verdict === "deny" || evaluation.verdict === "block"
+        ? { policy: evaluation.policy, code: evaluation.code, reason: publicReason! }
+        : {}),
+    });
+    if (evaluation.verdict === "deny") {
+      return {
+        status: "denied",
+        requestId: bound.requestId,
+        code: evaluation.code,
+        reason: publicReason!,
+      };
+    }
+    if (evaluation.verdict === "block" && elevation === undefined) {
+      return {
+        status: "denied",
+        requestId: bound.requestId,
+        code: evaluation.code,
+        reason: publicReason!,
+        elevatable: true,
+      };
+    }
+    if (elevation === undefined) {
+      return { status: "allowed", requestId: bound.requestId };
+    }
+    const queue = this.bindings.agentSecurity?.approvalQueue;
+    if (queue === undefined || queue === false) {
+      return {
+        status: "denied",
+        requestId: bound.requestId,
+        code: "AGENT_ELEVATION_UNAVAILABLE",
+        reason: "Elevated tool execution requires approval, but no approval queue is configured",
+      };
+    }
+    try {
+      const digest = agentToolActionDigest(bound);
+      const decision = await elevation.wait(() => queue.enqueue({
+          kind: "tool-elevation",
+          subject: {
+            runId: bound.runId,
+            node: bound.node,
+            block: bound.block,
+            agent: bound.agent.name,
+            backend: bound.backend,
+            toolCallId: bound.toolCallId,
+            toolName: bound.toolName,
+            executionBoundary: bound.executionBoundary,
+            workspace: bound.display.details?.workspace ?? bound.workspace.primary.root,
+            display: bound.display,
+          },
+          reasons: [
+            ...(evaluation.verdict === "block" ? evaluation.blocks.map((blocked) => ({
+              policy: blocked.policy,
+              reason: redactAgentToolText(blocked.reason),
+            })) : []),
+            {
+              policy: "agent-elevation",
+              reason: redactAgentToolText(elevation.reason),
+            },
+          ],
+          actionDigest: digest,
+        }, bound.signal, async (event) => emit(elevationEvent(bound, event))));
+      return decision === "approved"
+        ? { status: "allowed", requestId: bound.requestId }
+        : {
+            status: "denied",
+            requestId: bound.requestId,
+            code: "AGENT_ELEVATION_DENIED",
+            reason: "Elevated tool execution was denied by the approver",
+          };
+    } catch (error) {
+      const code = error instanceof AgentApprovalError ? error.code : "AGENT_APPROVAL_UNAVAILABLE";
+      return {
+        status: "denied",
+        requestId: bound.requestId,
+        code,
+        reason: error instanceof AgentApprovalError ? error.message : "Tool approval failed",
+      };
+    }
+  }
+
+  private async requestAgentElevation(
+    request: AgentElevationRequest,
+    executionRequest: AgentExecutionRequest,
+    backend: string,
+    emit: AgentExecutionHost["emit"],
+    wait: <T>(operation: () => Promise<T>) => Promise<T>,
+  ): Promise<AgentToolAuthorization> {
+    if (typeof request.toolName !== "string" || request.toolName.trim().length === 0) {
+      throw new AgentExecutorError("AGENT_EXECUTION_FAILED", "Agent elevation toolName must be non-empty");
+    }
+    if (request.executionBoundary !== "sandbox" && request.executionBoundary !== "host") {
+      throw new AgentExecutorError(
+        "AGENT_EXECUTION_FAILED",
+        "Agent elevation executionBoundary must be 'sandbox' or 'host'",
+      );
+    }
+    const reason = requireNonEmptyTransactionText(request.reason, "elevation reason");
+    return this.authorizeAgentTool({
+      requestId: `${executionRequest.runId}:elevation:${request.id}`,
+      runId: executionRequest.runId,
+      node: executionRequest.node,
+      block: executionRequest.block,
+      agent: executionRequest.agent,
+      backend,
+      toolCallId: request.id,
+      toolName: request.toolName,
+      executionBoundary: request.executionBoundary,
+      workspace: executionRequest.workspace,
+      input: request.input,
+      effectiveInput: request.effectiveInput,
+      display: request.display,
+      signal: request.signal,
+    }, executionRequest, backend, emit, { reason, wait });
+  }
+
+  private async requestAgentTransaction(
+    request: AgentTransactionRequest,
+    executionRequest: AgentExecutionRequest,
+    backend: string,
+    emit: AgentExecutionHost["emit"],
+  ): Promise<AgentTransactionResult> {
+    const title = requireNonEmptyTransactionText(request.title, "title");
+    const requestedAction = requireNonEmptyTransactionText(request.request, "request");
+    const reason = requireNonEmptyTransactionText(request.reason, "reason");
+    const resumeWhen = request.resumeWhen === undefined
+      ? undefined
+      : requireNonEmptyTransactionText(request.resumeWhen, "resumeWhen");
+    const input = {
+      title,
+      request: requestedAction,
+      reason,
+      ...(resumeWhen === undefined ? {} : { resumeWhen }),
+    };
+    const display = createAgentToolActionDisplay(
+      "AFL transaction request",
+      input,
+      executionRequest.workspace.primary.root,
+    );
+    const action = snapshotAgentToolAction({
+      requestId: `${executionRequest.runId}:transaction:${request.id}`,
+      runId: executionRequest.runId,
+      node: executionRequest.node,
+      block: executionRequest.block,
+      agent: executionRequest.agent,
+      backend,
+      toolCallId: request.id,
+      toolName: "afl.transaction.request",
+      executionBoundary: "host-control",
+      workspace: executionRequest.workspace,
+      input,
+      effectiveInput: input,
+      display: {
+        ...display,
+        title: redactAgentToolText(title),
+        summary: redactAgentToolText(requestedAction),
+        details: {
+          reason: redactAgentToolText(reason),
+          ...(resumeWhen === undefined ? {} : { resumeWhen: redactAgentToolText(resumeWhen) }),
+          workspace: executionRequest.workspace.primary.root,
+        },
+      },
+      signal: request.signal,
+    });
+    const queue = this.bindings.agentSecurity?.approvalQueue;
+    if (queue === undefined || queue === false) {
+      await emit({
+        type: "transaction.state",
+        id: request.id,
+        title: action.display.title,
+        state: "unavailable",
+      });
+      return {
+        status: "unavailable",
+        code: "AGENT_APPROVAL_UNAVAILABLE",
+        message: "No human request queue is configured",
+      };
+    }
+    try {
+      const decision = await queue.enqueue({
+        kind: "transaction",
+        subject: {
+          runId: action.runId,
+          node: action.node,
+          block: action.block,
+          agent: action.agent.name,
+          backend: action.backend,
+          toolCallId: action.toolCallId,
+          toolName: action.toolName,
+          executionBoundary: action.executionBoundary,
+          workspace: action.workspace.primary.root,
+          display: action.display,
+        },
+        reasons: [{ policy: "agent-request", reason: redactAgentToolText(reason) }],
+        actionDigest: agentToolActionDigest(action),
+      }, request.signal, async (event) => emit(transactionEvent(action.display.title, event)));
+      return decision === "approved"
+        ? { status: "completed" }
+        : { status: "denied", message: "The user declined the requested action" };
+    } catch (error) {
+      if (request.signal.aborted) throw error;
+      const code = error instanceof AgentApprovalError ? error.code : "AGENT_APPROVAL_UNAVAILABLE";
+      await emit({
+        type: "transaction.state",
+        id: request.id,
+        title: action.display.title,
+        state: "unavailable",
+      });
+      return {
+        status: "unavailable",
+        code,
+        message: error instanceof AgentApprovalError ? error.message : "Human request queue failed",
+      };
+    }
   }
 
   private requireCompleted(reason: AgentExecutionStopReason): void {
@@ -2692,6 +3013,46 @@ function freedomWorkspaceConflict(
     }
   }
   return undefined;
+}
+
+function transactionEvent(
+  title: string,
+  event: AgentApprovalQueueEvent,
+): Parameters<AgentExecutionHost["emit"]>[0] {
+  const state = event.type === "resolved"
+    ? event.decision === "approved" ? "completed" : "denied"
+    : event.type;
+  return {
+    type: "transaction.state",
+    id: event.request.subject.toolCallId,
+    title,
+    state,
+    sequence: event.request.sequence,
+  };
+}
+
+function elevationEvent(
+  action: AgentToolAction,
+  event: AgentApprovalQueueEvent,
+): Parameters<AgentExecutionHost["emit"]>[0] {
+  const state = event.type === "resolved" ? event.decision : event.type;
+  return {
+    type: "elevation.state",
+    id: action.toolCallId,
+    name: action.toolName,
+    state,
+    sequence: event.request.sequence,
+  };
+}
+
+function requireNonEmptyTransactionText(value: string, field: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new AgentExecutorError(
+      "AGENT_EXECUTION_FAILED",
+      `Agent transaction ${field} must be a non-empty string`,
+    );
+  }
+  return value;
 }
 
 function createRunId(): string {

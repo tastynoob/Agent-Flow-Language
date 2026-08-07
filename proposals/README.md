@@ -6,6 +6,7 @@ Agent Flow Language（AFL）是项目正式名称。本目录保存尚未成为�
 - [候选语言形态](language-architecture.md)
 - [IR 设计提案](core-ir-design.md)
 - [Agent Executor Backend 提案](agent-executor-backend.md)
+- [Agent 工具安全、人工请求队列与 Sandbox 实施记录](agent-security.md)
 - [Freedom 内建工具与动态工作流设计](freedom.md)
 
 当前可执行行为以 [`docs/`](../docs/README.md) 中的规范和实际实现为准。

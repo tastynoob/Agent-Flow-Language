@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir, realpath, rm } from "node:fs/promises";
+import { access, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -15,6 +15,7 @@ import {
 import {
   AflVm,
   FileMemoryStateStore,
+  FifoAgentApprovalQueue,
   MemoryTraceSink,
   MockAgentAdapter,
   PiAgentExecutorBackend,
@@ -104,18 +105,22 @@ test("Pi scopes AFL control tools to one Freedom activation and restores binding
   faux.setResponses([
     (context) => {
       contexts.push({ tools: context.tools.map((tool) => tool.name), messages: context.messages.length });
-      assert.deepEqual(context.tools.map((tool) => tool.name), ["lookup"]);
+      assert.deepEqual(context.tools.map((tool) => tool.name), ["lookup", "afl_transaction_request"]);
       assert.equal(lastUserText(context.messages), "seed");
       assert.doesNotMatch(context.systemPrompt ?? "", /AFL Freedom Route activation/u);
       return fauxAssistantMessage("seed-complete");
     },
     (context) => {
       contexts.push({ tools: context.tools.map((tool) => tool.name), messages: context.messages.length });
-      assert.deepEqual(context.tools.map((tool) => tool.name), ["afl_environment_get", "afl_route_add"]);
-      assert.match(context.tools[0].description, /Canonical AFL name: afl\.environment\.get/u);
-      assert.match(context.tools[0].description, /every active AFL tool includes its own usage instructions/u);
-      assert.match(context.tools[1].description, /args are positional/u);
-      assert.match(context.tools[1].description, /never the child result/u);
+      assert.deepEqual(context.tools.map((tool) => tool.name), [
+        "afl_transaction_request",
+        "afl_environment_get",
+        "afl_route_add",
+      ]);
+      assert.match(context.tools[1].description, /Canonical AFL name: afl\.environment\.get/u);
+      assert.match(context.tools[1].description, /every active AFL tool includes its own usage instructions/u);
+      assert.match(context.tools[2].description, /args are positional/u);
+      assert.match(context.tools[2].description, /never the child result/u);
       assert.doesNotMatch(context.systemPrompt ?? "", /AFL Freedom Route activation/u);
       assert.equal(messageTexts(context.messages).includes("seed"), true);
       assert.equal(messageTexts(context.messages).includes("seed-complete"), true);
@@ -127,15 +132,19 @@ test("Pi scopes AFL control tools to one Freedom activation and restores binding
     (context) => {
       contexts.push({ tools: context.tools.map((tool) => tool.name), messages: context.messages.length });
       assert.equal(context.messages.some((message) => message.role === "toolResult"), true);
-      assert.deepEqual(context.tools.map((tool) => tool.name), ["afl_environment_get", "afl_route_add"]);
-      assert.match(context.tools[1].description, /Canonical AFL name: afl\.route\.add/u);
+      assert.deepEqual(context.tools.map((tool) => tool.name), [
+        "afl_transaction_request",
+        "afl_environment_get",
+        "afl_route_add",
+      ]);
+      assert.match(context.tools[2].description, /Canonical AFL name: afl\.route\.add/u);
       assert.doesNotMatch(context.systemPrompt ?? "", /AFL Freedom Route activation/u);
       assert.equal(messageTexts(context.messages).includes("seed-complete"), true);
       return fauxAssistantMessage("route-complete");
     },
     (context) => {
       contexts.push({ tools: context.tools.map((tool) => tool.name), messages: context.messages.length });
-      assert.deepEqual(context.tools.map((tool) => tool.name), ["lookup"]);
+      assert.deepEqual(context.tools.map((tool) => tool.name), ["lookup", "afl_transaction_request"]);
       assert.doesNotMatch(context.systemPrompt ?? "", /AFL Freedom Route activation/u);
       assert.equal(messageTexts(context.messages).includes("seed-complete"), true);
       assert.equal(context.messages.some((message) =>
@@ -576,7 +585,114 @@ main():
   assert.equal(faux.state.callCount, 2);
 });
 
-test("Pi tool interception blocks a host-denied call without executing the tool", async () => {
+test("Pi transaction tool pauses for queued user work and then resumes the Agent", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "afl-pi-transaction-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  let installed = false;
+  let presented;
+  faux.setResponses([
+    (context) => {
+      const tool = context.tools.find((candidate) => candidate.name === "afl_transaction_request");
+      assert.notEqual(tool, undefined);
+      assert.match(tool.description, /does not grant permissions/u);
+      return fauxAssistantMessage(fauxToolCall("afl_transaction_request", {
+        title: "Install qsort compiler",
+        request: "Install gcc in the execution environment",
+        reason: "The compiler command is unavailable",
+        resume_when: "gcc --version exits successfully",
+      }, { id: "transaction-1" }), { stopReason: "toolUse" });
+    },
+    (context) => {
+      assert.equal(installed, true);
+      assert.match(messageTexts(context.messages).join("\n"), /marked the requested action as completed/u);
+      return fauxAssistantMessage("verified-and-continued");
+    },
+  ]);
+  const queue = new FifoAgentApprovalQueue({
+    presenter: {
+      async present(request) {
+        presented = request;
+        installed = true;
+        return "approved";
+      },
+    },
+  });
+  t.after(() => queue.close());
+  const trace = new MemoryTraceSink();
+  const backend = new PiAgentExecutorBackend({
+    models,
+    defaultBinding: { model: faux.getModel() },
+  });
+  const vm = AflVm.fromSource(`
+main():
+    entry:
+        worker = agent @agent.worker
+        result = worker.do "compile the program"
+        ret result
+`, {
+    agentExecutor: backend,
+    agentSecurity: {
+      approvalQueue: queue,
+    },
+    trace,
+  });
+
+  const result = await vm.run("main", [], { executionRoot: root });
+  assert.equal(result.output.content, "verified-and-continued");
+  assert.equal(presented.kind, "transaction");
+  assert.equal(presented.subject.toolName, "afl.transaction.request");
+  assert.equal(presented.subject.display.title, "Install qsort compiler");
+  assert.equal(presented.subject.display.details.resumeWhen, "gcc --version exits successfully");
+  const states = trace.events
+    .filter((event) => event.type === "agent.event" && event.details?.type === "transaction.state")
+    .map((event) => event.details.state);
+  assert.deepEqual(states, ["queued", "presenting", "completed"]);
+});
+
+test("Pi transaction tool returns an unavailable fallback when no human queue exists", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "afl-pi-transaction-unavailable-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("afl_transaction_request", {
+      title: "Install compiler",
+      request: "Install gcc",
+      reason: "gcc is missing",
+    }, { id: "transaction-unavailable" }), { stopReason: "toolUse" }),
+    (context) => {
+      assert.match(
+        messageTexts(context.messages).join("\n"),
+        /transaction request could not be presented \[AGENT_APPROVAL_UNAVAILABLE\]/u,
+      );
+      return fauxAssistantMessage("reported-blocker");
+    },
+  ]);
+  const trace = new MemoryTraceSink();
+  const backend = new PiAgentExecutorBackend({
+    models,
+    defaultBinding: { model: faux.getModel() },
+  });
+  const vm = AflVm.fromSource(`
+main():
+    entry:
+        worker = agent @agent.worker
+        result = worker.do "compile"
+        ret result
+`, { agentExecutor: backend, trace });
+
+  const result = await vm.run("main", [], { executionRoot: root });
+  assert.equal(result.output.content, "reported-blocker");
+  assert.equal(trace.events.some((event) =>
+    event.type === "agent.event" && event.details?.type === "transaction.state" &&
+    event.details.state === "unavailable"), true);
+});
+
+test("Pi soft policy block returns to the model without opening the approval queue", async (t) => {
   const faux = fauxProvider();
   const models = createModels();
   models.setProvider(faux.provider);
@@ -592,10 +708,8 @@ test("Pi tool interception blocks a host-denied call without executing the tool"
     },
   ]);
   let executions = 0;
-  let approvals = 0;
   const backend = new PiAgentExecutorBackend({
     models,
-    approval: "always",
     defaultBinding: {
       model: faux.getModel(),
       tools: [{
@@ -618,12 +732,14 @@ main():
         ret result
 `, {
     agentExecutor: backend,
+    agentSecurity: {
+      preTool: { policies: [{
+        name: "soft-block",
+        evaluate: () => ({ verdict: "block", code: "TRY_SAFER", reason: "try another method" }),
+      }] },
+    },
     agentHost: {
       emit() {},
-      async requestApproval() {
-        approvals += 1;
-        return "denied";
-      },
       async requestInput() {
         throw new Error("unexpected input request");
       },
@@ -632,7 +748,66 @@ main():
 
   const result = await vm.run();
   assert.equal(result.output.content, "continued-without-tool");
-  assert.equal(approvals, 1);
+  assert.equal(executions, 0);
+});
+
+test("Pi policy receives prepared and schema-validated tool arguments", async () => {
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("prepared", { legacy: "normalized" }, { id: "prepared-1" }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage("continued"),
+  ]);
+  let executions = 0;
+  let captured;
+  const backend = new PiAgentExecutorBackend({
+    models,
+    defaultBinding: {
+      model: faux.getModel(),
+      tools: [{
+        name: "prepared",
+        label: "Prepared",
+        description: "Normalize a legacy argument",
+        parameters: Type.Object({ command: Type.String() }),
+        prepareArguments(input) {
+          return { command: input.legacy };
+        },
+        async execute() {
+          executions += 1;
+          return { content: [{ type: "text", text: "executed" }], details: undefined };
+        },
+      }],
+    },
+  });
+  const vm = AflVm.fromSource(`
+main():
+    entry:
+        worker = agent @agent.worker
+        result = worker.do "work"
+        ret result
+`, {
+    agentExecutor: backend,
+    agentSecurity: {
+      preTool: {
+        policies: [{
+          name: "capture",
+          evaluate(action) {
+            captured = action;
+            return { verdict: "deny", code: "TEST_BLOCK", reason: "blocked after prepare" };
+          },
+        }],
+      },
+    },
+  });
+
+  const result = await vm.run();
+  assert.equal(result.output.content, "continued");
+  assert.deepEqual(captured.effectiveInput, { command: "normalized" });
+  assert.equal(Object.isFrozen(captured.effectiveInput), true);
   assert.equal(executions, 0);
 });
 
@@ -692,6 +867,317 @@ main():
   const result = await vm.run("main", [], { executionRoot: root });
   assert.equal(result.output.content, "workspace-ok");
   assert.equal(observedWorkingDirectory, await realpath(join(root, "work")));
+});
+
+test("Pi coding binding executes write and GCC tools inside bubblewrap", async (t) => {
+  try {
+    await access("/usr/bin/bwrap");
+  } catch {
+    return t.skip("bubblewrap is unavailable");
+  }
+  const root = await mkdtemp(join(tmpdir(), "afl-pi-bwrap-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const source = [
+    "#include <stdio.h>",
+    "int main(void) { puts(\"sandbox-ok\"); return 0; }",
+    "",
+  ].join("\n");
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("write", { path: "main.c", content: source }, { id: "sandbox-write" }), {
+      stopReason: "toolUse",
+    }),
+    fauxAssistantMessage(fauxToolCall("bash", {
+      command: "gcc -std=c11 -Wall -Wextra -Werror main.c -o main && ./main",
+    }, { id: "sandbox-bash" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("sandbox-complete"),
+  ]);
+  const actions = [];
+  const binding = createPiCodingAgentBinding({
+    model: faux.getModel(),
+    sandbox: { backend: "bubblewrap", network: "host" },
+  });
+  const backend = new PiAgentExecutorBackend({ models, defaultBinding: binding });
+  assert.equal(backend.capabilities.sandboxEnforcement, true);
+  const vm = AflVm.fromSource(`
+main():
+    entry:
+        worker = agent @agent.worker, "work/"
+        result = worker.do "compile inside the sandbox"
+        ret result
+`, {
+    agentExecutor: backend,
+    agentSecurity: {
+      preTool: {
+        requireCoverage: true,
+        policies: [{
+          name: "capture-sandbox",
+          evaluate(action) {
+            actions.push(action);
+            return { verdict: "allow" };
+          },
+        }],
+      },
+    },
+  });
+
+  const result = await vm.run("main", [], { executionRoot: root });
+  assert.equal(result.output.content, "sandbox-complete");
+  assert.equal(await readFile(join(root, "work", "main.c"), "utf8"), source);
+  assert.deepEqual(actions.map((action) => [
+    action.toolName,
+    action.executionBoundary,
+    action.display.details.workspace,
+  ]), [
+    ["write", "sandbox", "/workspace"],
+    ["bash", "sandbox", "/workspace"],
+  ]);
+  assert.equal(actions[0].input.path, "main.c");
+  assert.equal(actions[0].effectiveInput.path, "/workspace/main.c");
+  assert.deepEqual(actions[1].effectiveInput, {
+    command: "gcc -std=c11 -Wall -Wextra -Werror main.c -o main && ./main",
+    cwd: "/workspace",
+    env: {},
+    inheritEnv: true,
+  });
+});
+
+test("Pi elevated tool retries a sandbox-blocked operation on the host after mandatory approval", async (t) => {
+  try {
+    await access("/usr/bin/bwrap");
+  } catch {
+    return t.skip("bubblewrap is unavailable");
+  }
+  const root = await mkdtemp(join(tmpdir(), "afl-pi-elevation-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const secretPath = join(root, "host-only.txt");
+  const command = `cat ${secretPath}`;
+  await writeFile(secretPath, "host-elevation-ok\n", "utf8");
+
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("bash", { command }, { id: "sandbox-attempt" }), {
+      stopReason: "toolUse",
+    }),
+    (context) => {
+      assert.match(messageTexts(context.messages).join("\n"), /Command exited with code 1/u);
+      return fauxAssistantMessage(fauxToolCall("afl_elevated_tool", {
+        tool: "bash",
+        arguments: { command },
+        reason: "The safe read is blocked because the host path is outside bubblewrap mounts",
+      }, { id: "elevated-attempt" }), { stopReason: "toolUse" });
+    },
+    (context) => {
+      assert.match(messageTexts(context.messages).join("\n"), /host-elevation-ok/u);
+      return fauxAssistantMessage("elevation-complete");
+    },
+  ]);
+
+  const actions = [];
+  const approvals = [];
+  const queue = new FifoAgentApprovalQueue({
+    presenter: {
+      async present(request) {
+        approvals.push(request);
+        return "approved";
+      },
+    },
+  });
+  t.after(() => queue.close());
+  const backend = new PiAgentExecutorBackend({
+    models,
+    defaultBinding: createPiCodingAgentBinding({
+      model: faux.getModel(),
+      sandbox: { backend: "bubblewrap", network: "host" },
+    }),
+  });
+  const vm = AflVm.fromSource(`
+main():
+    entry:
+        worker = agent @agent.worker, "work/"
+        result = worker.do "read a host-only file after the sandbox blocks it"
+        ret result
+`, {
+    agentExecutor: backend,
+    agentSecurity: {
+      preTool: {
+        requireCoverage: true,
+        policies: [{
+          name: "capture-elevation",
+          evaluate(action) {
+            actions.push(action);
+            return { verdict: "allow" };
+          },
+        }],
+      },
+      approvalQueue: queue,
+    },
+  });
+
+  const result = await vm.run("main", [], { executionRoot: root });
+  assert.equal(result.output.content, "elevation-complete");
+  assert.deepEqual(actions.map((action) => [action.toolName, action.executionBoundary]), [
+    ["bash", "sandbox"],
+    ["bash", "host"],
+  ]);
+  assert.equal(approvals.length, 1);
+  assert.equal(approvals[0].kind, "tool-elevation");
+  assert.equal(approvals[0].subject.toolName, "bash");
+  assert.equal(approvals[0].subject.executionBoundary, "host");
+  assert.match(approvals[0].reasons[0].reason, /outside bubblewrap mounts/u);
+});
+
+test("Pi soft policy block reaches approval only after the model actively requests elevation", async (t) => {
+  try {
+    await access("/usr/bin/bwrap");
+  } catch {
+    return t.skip("bubblewrap is unavailable");
+  }
+  const root = await mkdtemp(join(tmpdir(), "afl-pi-policy-elevation-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const command = "printf policy-elevation-ok";
+  const approvals = [];
+  const actions = [];
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("bash", { command }, { id: "policy-blocked" }), {
+      stopReason: "toolUse",
+    }),
+    (context) => {
+      assert.equal(approvals.length, 0);
+      assert.match(messageTexts(context.messages).join("\n"), /Try a safer alternative first/u);
+      return fauxAssistantMessage(fauxToolCall("afl_elevated_tool", {
+        tool: "bash",
+        arguments: { command },
+        reason: "The available safer alternative would require a disproportionate rewrite",
+      }, { id: "policy-elevation" }), { stopReason: "toolUse" });
+    },
+    (context) => {
+      assert.match(messageTexts(context.messages).join("\n"), /policy-elevation-ok/u);
+      return fauxAssistantMessage("policy-elevation-complete");
+    },
+  ]);
+  const queue = new FifoAgentApprovalQueue({
+    presenter: {
+      async present(request) {
+        approvals.push(request);
+        return "approved";
+      },
+    },
+  });
+  t.after(() => queue.close());
+  const backend = new PiAgentExecutorBackend({
+    models,
+    defaultBinding: createPiCodingAgentBinding({
+      model: faux.getModel(),
+      sandbox: { backend: "bubblewrap", network: "host" },
+    }),
+  });
+  const vm = AflVm.fromSource(`
+main():
+    entry:
+        worker = agent @agent.worker, "work/"
+        result = worker.do "retry a soft-blocked command only if alternatives are too costly"
+        ret result
+`, {
+    agentExecutor: backend,
+    agentSecurity: {
+      preTool: {
+        requireCoverage: true,
+        policies: [{
+          name: "review-command",
+          evaluate(action) {
+            actions.push(action);
+            return action.toolName === "bash" && action.input.command === command
+              ? { verdict: "block", code: "COMMAND_REVIEW", reason: "Prefer a safer alternative" }
+              : { verdict: "allow" };
+          },
+        }],
+      },
+      approvalQueue: queue,
+    },
+  });
+
+  const result = await vm.run("main", [], { executionRoot: root });
+  assert.equal(result.output.content, "policy-elevation-complete");
+  assert.deepEqual(actions.map((action) => [action.toolName, action.executionBoundary]), [
+    ["bash", "sandbox"],
+    ["bash", "sandbox"],
+  ]);
+  assert.equal(approvals.length, 1);
+  assert.equal(approvals[0].kind, "tool-elevation");
+  assert.equal(approvals[0].subject.executionBoundary, "sandbox");
+  assert.deepEqual(approvals[0].reasons.map((reason) => reason.policy), [
+    "review-command",
+    "agent-elevation",
+  ]);
+});
+
+test("Pi elevated tool rejects direct elevation without a matching sandbox failure", async (t) => {
+  try {
+    await access("/usr/bin/bwrap");
+  } catch {
+    return t.skip("bubblewrap is unavailable");
+  }
+  const root = await mkdtemp(join(tmpdir(), "afl-pi-direct-elevation-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("afl_elevated_tool", {
+      tool: "bash",
+      arguments: { command: "pwd" },
+      reason: "Skip the sandbox",
+    }, { id: "direct-elevation" }), { stopReason: "toolUse" }),
+    (context) => {
+      assert.match(
+        messageTexts(context.messages).join("\n"),
+        /must retry the same arguments from a soft policy block or failed sandbox execution/u,
+      );
+      return fauxAssistantMessage("direct-elevation-blocked");
+    },
+  ]);
+  let approvals = 0;
+  const queue = new FifoAgentApprovalQueue({
+    presenter: {
+      async present() {
+        approvals += 1;
+        return "approved";
+      },
+    },
+  });
+  t.after(() => queue.close());
+  const backend = new PiAgentExecutorBackend({
+    models,
+    defaultBinding: createPiCodingAgentBinding({
+      model: faux.getModel(),
+      sandbox: { backend: "bubblewrap", network: "host" },
+    }),
+  });
+  const vm = AflVm.fromSource(`
+main():
+    entry:
+        worker = agent @agent.worker, "work/"
+        result = worker.do "try to elevate directly"
+        ret result
+`, {
+    agentExecutor: backend,
+    agentSecurity: {
+      preTool: { policies: [{ name: "allow", evaluate: () => ({ verdict: "allow" }) }] },
+      approvalQueue: queue,
+    },
+  });
+
+  const result = await vm.run("main", [], { executionRoot: root });
+  assert.equal(result.output.content, "direct-elevation-blocked");
+  assert.equal(approvals, 0);
 });
 
 test("Pi Memory facet rejects unsupported AFL roles before model execution", async (t) => {

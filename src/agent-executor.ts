@@ -9,6 +9,11 @@ import {
   type Message,
 } from "./memory.js";
 import type { AgentWorkspaceSet } from "./workspace.js";
+import type {
+  AgentToolAction,
+  AgentToolActionDisplay,
+  AgentToolExecutionBoundary,
+} from "./agent-tool-policy.js";
 
 export interface AgentExecutorCapabilities {
   readonly nativeSession: boolean;
@@ -91,24 +96,36 @@ export interface AgentExecutionResult {
 
 export type AgentExecutionEvent =
   | { readonly type: "message.delta"; readonly text: string }
+  | { readonly type: "tool.requested"; readonly id: string; readonly name: string }
+  | {
+      readonly type: "tool.policy";
+      readonly id: string;
+      readonly name: string;
+      readonly verdict: "allow" | "block" | "deny";
+      readonly covered: boolean;
+      readonly policy?: string;
+      readonly code?: string;
+      readonly reason?: string;
+    }
+  | {
+      readonly type: "transaction.state";
+      readonly id: string;
+      readonly title: string;
+      readonly state: "queued" | "presenting" | "completed" | "denied" | "cancelled" | "unavailable";
+      readonly sequence?: number;
+    }
+  | {
+      readonly type: "elevation.state";
+      readonly id: string;
+      readonly name: string;
+      readonly state: "queued" | "presenting" | "approved" | "denied" | "cancelled" | "unavailable";
+      readonly sequence?: number;
+    }
   | { readonly type: "tool.started"; readonly id: string; readonly name: string }
   | { readonly type: "tool.updated"; readonly id: string; readonly name: string }
   | { readonly type: "tool.completed"; readonly id: string; readonly name: string; readonly ok: boolean }
   | { readonly type: "usage.updated"; readonly usage: Readonly<Record<string, number>> }
   | { readonly type: "warning"; readonly message: string };
-
-export interface AgentApprovalRequest {
-  readonly runId: string;
-  readonly node: string;
-  readonly block: string;
-  readonly agent: SymbolRef;
-  readonly action: "tool";
-  readonly id: string;
-  readonly name: string;
-  readonly input: Readonly<Record<string, unknown>>;
-}
-
-export type AgentApprovalDecision = "approved" | "denied";
 
 export interface AgentInputRequest {
   readonly runId: string;
@@ -118,12 +135,54 @@ export interface AgentInputRequest {
   readonly prompt: string;
 }
 
+export interface AgentTransactionRequest {
+  readonly id: string;
+  readonly title: string;
+  readonly request: string;
+  readonly reason: string;
+  readonly resumeWhen?: string;
+  readonly signal: AbortSignal;
+}
+
+export type AgentTransactionResult =
+  | { readonly status: "completed" }
+  | { readonly status: "denied"; readonly message: string }
+  | { readonly status: "unavailable"; readonly code: string; readonly message: string };
+
+export interface AgentElevationRequest {
+  readonly id: string;
+  readonly toolName: string;
+  readonly input: Readonly<Record<string, unknown>>;
+  readonly effectiveInput: Readonly<Record<string, unknown>>;
+  readonly executionBoundary: Exclude<AgentToolExecutionBoundary, "host-control">;
+  readonly reason: string;
+  readonly display: AgentToolActionDisplay;
+  readonly signal: AbortSignal;
+}
+
 export interface AgentExecutionHost {
   emit(event: AgentExecutionEvent): void | Promise<void>;
   persistContinuation(delta: BackendSessionJournalDelta): void | Promise<void>;
-  requestApproval(request: AgentApprovalRequest): Promise<AgentApprovalDecision>;
+  authorizeTool(action: AgentToolAction): Promise<AgentToolAuthorization>;
+  requestElevation(request: AgentElevationRequest): Promise<AgentToolAuthorization>;
+  requestTransaction(request: AgentTransactionRequest): Promise<AgentTransactionResult>;
   requestInput(request: AgentInputRequest): Promise<string>;
   executeControlTool(request: AgentControlToolRequest): Promise<AgentControlToolResult>;
+}
+
+export type AgentToolAuthorization =
+  | { readonly status: "allowed"; readonly requestId: string }
+  | {
+      readonly status: "denied";
+      readonly requestId: string;
+      readonly code: string;
+      readonly reason: string;
+      readonly elevatable?: boolean;
+    };
+
+export interface AgentInteractionHost {
+  emit?(event: AgentExecutionEvent): void | Promise<void>;
+  requestInput?(request: AgentInputRequest): Promise<string>;
 }
 
 export interface AgentExecutorBackend {
@@ -147,7 +206,17 @@ export type AgentExecutorErrorCode =
   | "AGENT_SESSION_INVALID"
   | "AGENT_MEMORY_REVISION_INVALID"
   | "AGENT_MEMORY_ROLE_UNSUPPORTED"
-  | "AGENT_APPROVAL_DENIED"
+  | "AGENT_TOOL_POLICY_DENIED"
+  | "AGENT_TOOL_POLICY_FAILED"
+  | "AGENT_TOOL_POLICY_UNCOVERED"
+  | "AGENT_APPROVAL_UNAVAILABLE"
+  | "AGENT_APPROVAL_QUEUE_FULL"
+  | "AGENT_APPROVAL_CANCELLED"
+  | "AGENT_ELEVATION_DENIED"
+  | "AGENT_ELEVATION_UNAVAILABLE"
+  | "AGENT_SANDBOX_UNAVAILABLE"
+  | "AGENT_SANDBOX_INIT_FAILED"
+  | "AGENT_SANDBOX_TERMINATED"
   | "AGENT_EXECUTION_FAILED";
 
 export class AgentExecutorError extends Error {

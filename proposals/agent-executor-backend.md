@@ -2,9 +2,9 @@
 
 ## 1. 状态与范围
 
-本文讨论 AFL 的 Agent 执行器后端。通用接口、无状态 adapter 兼容层和首个 Pi backend 已进入初始实现；持久化、安全隔离及其他 runtime 仍保留为后续设计范围。
+本文讨论 AFL 的 Agent 执行器后端。通用接口、无状态 adapter 兼容层、Pi backend、Memory continuation 和首个 Linux bubblewrap/policy 安全层已经进入 v0 实现；其他 runtime、跨平台隔离与资源治理仍保留为后续设计范围。
 
-AFL 继续负责描述和调度 flow。`agent.do` 是 flow 发起 Agent 工作的执行入口；模型调用、工具循环和原生会话由可替换的 Agent Executor Backend 完成。Sandbox、工具审批等安全能力由 Backend 与 host 按 capability 共同提供，不要求每一种 Backend 具有相同实现。
+AFL 继续负责描述和调度 flow。`agent.do` 是 flow 发起 Agent 工作的执行入口；模型调用、工具循环和原生会话由可替换的 Agent Executor Backend 完成。Sandbox、pre-tool policy、主动提权和人工请求等安全能力由 Backend 与 host 按 capability 共同提供，不要求每一种 Backend 具有相同实现。
 
 本提案希望达到以下效果：
 
@@ -16,7 +16,7 @@ AFL 继续负责描述和调度 flow。`agent.do` 是 flow 发起 Agent 工作�
 
 本提案不为 AFL IR 增加 provider、model、workspace 或 approval 指令。相关配置首先保留在 bindings 和 VM host 中。
 
-首个实现以 [Pi](https://github.com/earendil-works/pi) 为目标。当前阶段优先让 AFL 获得完整、可用的 Agent loop、工具调用和会话能力；面向大规模部署的强制 sandbox、细粒度权限和完整审批系统在接口稳定后继续建设。能力缺失仍必须由 capability 如实表达，不能把未实现的安全边界包装成已支持。
+首个实现以 [Pi](https://github.com/earendil-works/pi) 为目标。当前 Pi binding 已提供完整 Agent loop、工具调用、会话 continuation、pre-tool policy、人工请求队列和可选 bubblewrap；面向大规模部署的资源配额、跨平台 sandbox 和分布式审批仍待建设。能力缺失继续由 capability 如实表达，不能把未实现的安全边界包装成已支持。
 
 当前实现已经把 Agent 工作统一为 `agent.do`。Parser、Core IR、validator、VM 和 adapter API 均不再保留其他 Agent 工作指令或 mode。
 
@@ -35,7 +35,7 @@ AFL IR
 
 - AFL IR 描述 Agent 之间的数据依赖、控制流、并行、Memory 操作和 flow 组合；
 - AFL VM 管理 Agent、Memory、TaskGroup 等 handle，并调度已经 ready 的指令；
-- Agent Executor Backend 把一次 AFL Agent 工作映射为具体 runtime 的 session、turn、事件和审批；
+- Agent Executor Backend 把一次 AFL Agent 工作映射为具体 runtime 的 session、turn、事件和人工交互；
 - Agent runtime 管理模型与工具之间的内部循环；
 - Model provider 只提供具体模型协议和推理能力。
 
@@ -179,11 +179,15 @@ export interface AgentExecutorBackend {
 
 ## 5. Event 与宿主交互
 
-完整 Agent runtime 会在最终输出之前产生进度、工具和审批事件。Backend 不应把这些内容全部压缩进最终 Frag。不支持交互审批的 Backend 不会调用 `requestApproval`，并通过 capability 明确报告。
+完整 Agent runtime 会在最终输出之前产生进度、工具授权、主动提权和事务事件。Backend 不应把这些内容全部压缩进最终 Frag。支持动态工具的 Backend 应在副作用发生前调用 `authorizeTool`；只有实现了相应控制工具的 Backend 才调用 `requestElevation` 或 `requestTransaction`。是否支持人工交互由 capability 明确报告。
 
 ```ts
 export type AgentExecutionEvent =
   | { readonly type: "message.delta"; readonly text: string }
+  | { readonly type: "tool.requested"; readonly id: string; readonly name: string }
+  | { readonly type: "tool.policy"; readonly id: string; readonly name: string; /* ... */ }
+  | { readonly type: "elevation.state"; readonly id: string; readonly name: string; /* ... */ }
+  | { readonly type: "transaction.state"; readonly id: string; readonly title: string; /* ... */ }
   | { readonly type: "tool.started"; readonly id: string; readonly name: string }
   | { readonly type: "tool.completed"; readonly id: string; readonly ok: boolean }
   | { readonly type: "usage.updated"; readonly usage: Readonly<Record<string, number>> }
@@ -191,8 +195,10 @@ export type AgentExecutionEvent =
 
 export interface AgentExecutionHost {
   emit(event: AgentExecutionEvent): void | Promise<void>;
-  persistContinuation(record: BackendSessionMessageRecord): void | Promise<void>;
-  requestApproval(request: AgentApprovalRequest): Promise<AgentApprovalDecision>;
+  persistContinuation(delta: BackendSessionJournalDelta): void | Promise<void>;
+  authorizeTool(action: AgentToolAction): Promise<AgentToolAuthorization>;
+  requestElevation(request: AgentElevationRequest): Promise<AgentToolAuthorization>;
+  requestTransaction(request: AgentTransactionRequest): Promise<AgentTransactionResult>;
   requestInput(request: AgentInputRequest): Promise<string>;
 }
 ```
@@ -249,7 +255,9 @@ Memory 的语言可见内容仍是 Message 序列。实现可以附带一个不�
 
 Checkpoint 对应哪个 Memory revision 必须明确，避免 source Agent 在 copy 之后继续工作时把新增内容带入旧副本。
 
-## 7. 安全、审批与阶段边界
+## 7. 安全、人工请求与阶段边界
+
+工具调用授权、多 Agent 人工请求队列、bubblewrap sandbox 与 cc-safety-net 的分阶段实施以 [`agent-security.md`](agent-security.md) 为准。本节只保留 Backend 必须遵守的通用收紧关系。
 
 AFL host policy 与 backend policy 使用收紧关系：
 
@@ -258,14 +266,14 @@ effective permission = AFL host policy AND backend policy
 ```
 
 - AFL policy 可以在 Agent 启动前拒绝整个执行；
-- Backend 发起命令、文件、网络、MCP 或其他审批时，host 可以进一步拒绝；
+- Backend 发起命令、文件、网络或 MCP 调用时，host 可以进一步拒绝；
 - host 同意不代表 Backend 必须同意，Backend 仍可以根据 sandbox 或自身规则拒绝；
 - adapter 不得为了避免交互而自动切换到更宽松的 sandbox 或 approval mode；
 - backend 不支持某类隔离时，capability 和运行结果需要反映这一事实。
 
-首版保留现有 `VmPolicy.authorizeAgent` 作为启动级策略。运行中的 action approval 只在 Backend 支持工具调用拦截时启用；审批事件至少应携带 backend、Agent、动作类别、人类可读原因和后端可安全公开的参数摘要。
+首版保留现有 `VmPolicy.authorizeAgent` 作为启动级策略。普通工具的 pre-tool `block` 只返回模型，不打开人工请求队列；Backend 只有在记录了当前 `do` 的匹配候选后，才允许模型主动调用 `requestElevation`。提权请求至少携带 backend、Agent、动作类别、人类可读原因和后端可安全公开的参数摘要。
 
-Pi 不内置强制的文件、进程或网络权限系统，默认继承宿主进程权限。因此首个 Pi Backend 面向本地可信环境和开发试验，声明 `sandboxEnforcement: false`。这不阻挡 Agent loop、Memory、session 和 flow 调度先达到可用状态；在面向多人服务或大规模部署前，再增加容器、隔离 workspace 和更完整的权限策略。
+Pi 自身不内置强制的文件、进程或网络权限系统。AFL 的默认 Pi coding binding 仍使用宿主 `NodeExecutionEnv`；显式启用 bubblewrap 后，内建 coding tools 共享受控 ExecutionEnv，并只在 backend 所有已配置 binding 都声明该边界时报告 `sandboxEnforcement: true`。该 capability 不代表已有 seccomp、cgroup、域名网络策略或第三方 host tool 隔离。
 
 ## 8. 首个后端：Pi
 
@@ -316,7 +324,7 @@ Pi、Codex、Claude Code 等 coding Agent 会修改文件，因此 Agent Memory 
 
 Workspace 已作为 Agent declaration 的第二个 operand 进入 IR，而不是独立 handle 或指令。VM 将路径规范化后通过 `AgentExecutionRequest.workspace` 传给 Backend，并用层次化 read/write lock 控制重叠路径；省略时按稳定 allocation identity 使用 `.afl/tmpworkspace/<run-id>/` 下的独立目录。Pi binding 保留模型和稳定配置，`createExecutionContext(workspace)` 按 session 创建 `NodeExecutionEnv`、tools 和 tool context，因此不再固定全局 `cwd`。
 
-Workspace lock 只协调当前 VM 进程，read-only descriptor 也只是 executor 上下文，不是权限边界。Git worktree、容器、远程环境和 OS sandbox 仍由 host/backend 负责，不进入 AFL 文件系统编程语义。
+Workspace lock 只协调当前 VM 进程。默认 executor 中 read-only descriptor 只是上下文；bubblewrap binding 才会把它强制映射为只读 mount。Git worktree、容器、远程环境和其他 OS sandbox 仍由 host/backend 负责，不进入 AFL 文件系统编程语义。
 
 ## 10. 错误与兼容性
 
@@ -347,7 +355,7 @@ Agent 工作指令合并已经作为前置步骤完成，所有层只处理 `age
 - 基于 `pi-agent-core` 的 Backend，运行时使用 `AgentHarness` 与 `InMemorySessionRepo`；
 - Pi session 创建/恢复、完整 `do` 周期、事件转发、Memory 同步、消息级 checkpoint/fork、session tree export/import 和取消；
 - 显式配置 system prompt、model、tools、tool context 和工作目录，不默认导入项目 extensions；
-- 对 Pi 尚未提供的 structured output、强制 sandbox 和交互审批如实声明 capability；
+- 对 Pi 尚未提供的 structured output 以及未启用的 sandbox/人工请求能力如实声明 capability 或 trace 状态；
 - fake backend conformance tests，避免测试依赖真实模型或用户账户；
 - 单独的 live smoke，用于验证真实 Pi runtime 和模型 provider，不作为默认测试前置条件。
 
@@ -368,7 +376,7 @@ Canonical Memory 与 opaque executor continuation 的统一持久化、Agent Wor
 - AbortSignal、预算和错误转换保持有效，不支持的 schema 请求根据 capability 显式拒绝；
 - 启用 action interception 时，AFL 拒绝的 action 不会被 backend 执行；
 - Backend 自身具有安全策略时，其拒绝不会因 AFL host 同意而放行；
-- Pi Backend 明确报告没有强制 sandbox，不把工具 hook 表述为系统级隔离；
+- Pi Backend 区分未隔离的 NodeExecutionEnv、bubblewrap mount 边界和普通工具 hook，不把三者混为同一种安全能力；
 - trace、日志和错误不包含 API key、认证 token 或原生 session secret。
 
 ## 13. 外部接口参考

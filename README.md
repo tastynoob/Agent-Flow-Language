@@ -97,7 +97,9 @@ export default {
 
 完整 bindings 文件见 [`examples/pi-bindings.mjs`](examples/pi-bindings.mjs)。`defaultBinding` 可供所有 Agent symbol 使用；需要为 Coder、Reviewer 等选择不同模型或工具时，改用 `agents` map，以 `@agent.*` symbol 为 key。
 
-`createPiCodingAgentBinding` 显式启用 Pi core 的 `read`、`bash`、`edit` 和 `write` 工具，并为每个 Agent activation 按 AFL Workspace 创建执行上下文。工具的 `cwd` 是 Agent 主工作区；只读工作区作为上下文信息提供，目前尚无 OS 级只读 sandbox。默认也不加载 pi-coding-agent 的 CLI、extensions 或交互 UI。
+`createPiCodingAgentBinding` 显式启用 Pi core 的 `read`、`bash`、`edit` 和 `write` 工具，并为每个 Agent activation 按 AFL Workspace 创建执行上下文。默认使用宿主 `NodeExecutionEnv`；设置 `sandbox: { backend: "bubblewrap" }` 后，四个 coding tools 会共用强制 Workspace mount 边界，primary 映射为 `/workspace`，read-only Workspace 映射为 `/readonly/<index>`，AFL Memory 不暴露给工具进程。默认不加载 pi-coding-agent 的 CLI、extensions 或交互 UI。
+
+Agent 工具可以通过与 executor 无关的 pre-tool policy 做 `allow/block/deny/abstain` 决策；`block` 只把错误返回模型，不触发人工请求。`FifoAgentApprovalQueue` 会把模型主动发起的一次性提权和通用事务申请串行呈现。Pi sandbox binding 内建 `afl_elevated_tool`，只允许把当前 `do` 中被 `block` 或在 sandbox 内实际执行失败的同名同参数 action，经强制审批后重试一次：前者仍在 sandbox 内执行，后者才使用 host executor。`afl_transaction_request` 用于暂停并等待用户完成外部动作，不授予权限。`createCCSafetyNetPolicy()` 可对 Bash 做破坏性命令语义审查。完整配置、边界与当前限制见 [`docs/guides/agent-security.md`](docs/guides/agent-security.md)。这些组件默认关闭或不提供 presenter，显式启用失败时不会降级放行。
 
 Agent 省略 Workspace 时，VM 不再让所有 Agent 共享执行根目录，而是按稳定 allocation identity 分配 `.afl/tmpworkspace/<run-id>/<allocation>/`。`freedom.route` 和 `freedom.flow` 执行 child Node/IR 时禁止 child Agent 与 planner/writer 产生 Workspace 写/读冲突；双方共享同一个只读目录仍然允许。静态可见的冲突由 validator 警告，实际执行前由 VM 强制拒绝。
 

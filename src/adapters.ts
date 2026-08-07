@@ -1,5 +1,7 @@
 import type { AflModule, ComputeValue, Frag, FreedomMode, ScriptLanguage, SymbolRef } from "./ir.js";
-import type { AgentExecutionHost, AgentExecutorBackend } from "./agent-executor.js";
+import type { AgentExecutorBackend, AgentInteractionHost } from "./agent-executor.js";
+import type { AgentApprovalQueue } from "./approval-queue.js";
+import type { AgentPreToolPolicyConfig } from "./agent-tool-policy.js";
 import type { FreedomPolicyLimits } from "./freedom.js";
 import type { AgentMemoryContract, MemoryPersistenceBinding, Message } from "./memory.js";
 import type { AgentWorkspaceSet } from "./workspace.js";
@@ -185,7 +187,11 @@ export type VmArgument = Frag | ComputeValue | SymbolRef;
 export interface VmBindings {
   readonly agents?: AgentAdapter;
   readonly agentExecutor?: AgentExecutorBackend;
-  readonly agentHost?: AgentExecutionHost;
+  readonly agentHost?: AgentInteractionHost;
+  readonly agentSecurity?: {
+    readonly preTool?: false | AgentPreToolPolicyConfig;
+    readonly approvalQueue?: false | AgentApprovalQueue;
+  };
   readonly prompts?: PromptAdapter;
   readonly input?: InputAdapter;
   readonly scripts?: ScriptAdapter;
