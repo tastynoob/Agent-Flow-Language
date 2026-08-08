@@ -6,6 +6,7 @@
 
 - [Agent 参考技能](SKILL.md)：供 Agent 编写、审查和移植 AFL 工作流及 binding 的完整指南
 - [快速开始](guides/getting-started.md)：安装、验证和执行第一个工作流
+- [TypeScript IR Generator](guides/typescript-generator.md)：使用线性 builder 生成 AFL IR
 - [示例集](guides/examples.md)：常用指令与组合方式
 - [并行投票](guides/parallel-voting.md)：并行派发与结果汇合
 - [Agent 工具安全](guides/agent-security.md)：工具策略、人工请求与沙箱

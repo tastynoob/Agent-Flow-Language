@@ -6,6 +6,7 @@ export * from "./bubblewrap-execution-env.js";
 export * from "./cc-safety-net-policy.js";
 export * from "./errors.js";
 export * from "./freedom.js";
+export * from "./generator/index.js";
 export * from "./ir.js";
 export * from "./memory.js";
 export * from "./memory-store.js";

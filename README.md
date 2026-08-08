@@ -46,6 +46,7 @@ main(task):
 
 - [文档索引](docs/README.md)
 - [快速开始](docs/guides/getting-started.md)
+- [TypeScript IR Generator](docs/guides/typescript-generator.md)
 - [文本语法](docs/spec/syntax.md)
 - [执行语义](docs/spec/semantics.md)
 - [Memory 语义](docs/spec/memory.md)

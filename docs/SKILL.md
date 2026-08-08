@@ -1,6 +1,6 @@
 ---
 name: author-afl-workflows
-description: Create, review, debug, and port AFL v0 workflows and their runtime bindings. Use when an agent needs to author Agent Flow Language IR, choose or explain AFL instructions, reason about Agent, Memory, TaskGroup, workspace, concurrency, or Freedom semantics, implement portable host adapters or agent executors, validate binding contracts, or diagnose parser, validator, policy, persistence, and runtime failures across operating systems and model providers.
+description: Create, generate from TypeScript, review, debug, and port AFL v0 workflows and their runtime bindings. Use when an agent needs to author Agent Flow Language IR, use the TypeScript AFL IR builder, choose or explain AFL instructions, reason about Agent, Memory, TaskGroup, workspace, concurrency, or Freedom semantics, implement portable host adapters or agent executors, validate binding contracts, or diagnose parser, validator, policy, persistence, and runtime failures across operating systems and model providers.
 ---
 
 # Author AFL Workflows
@@ -11,11 +11,12 @@ description: Create, review, debug, and port AFL v0 workflows and their runtime 
 
 1. 先确认目标、输入、输出、可用 symbol、binding 能力和安全边界。
 2. 用普通 node、显式数据依赖和结构化控制流表达确定性部分。
-3. 只把确实需要模型判断的步骤交给 Agent；只在运行时确实需要动态决策时使用 Freedom。
-4. 明确 Agent、Memory 和 TaskGroup 的所有权与生命周期，避免隐式共享状态。
-5. 把外部系统访问放入 prompt、flow、capability、script 或 Agent executor binding，不假定宿主已经提供任何能力。
-6. 先 parse 和 validate，再使用最小 mock bindings 做确定性测试，最后连接真实模型和外部系统。
-7. 审查失败路径、取消传播、并发上限、workspace 隔离、schema 校验、持久化和 trace，再交付工作流。
+3. 使用 TypeScript generator 时，通过 `AflIrBuilder` 的线性 `node/when/while/end` API 直接生成 AFL；不要在 generator 中建立 HIR。完整用法见 [TypeScript IR Generator](guides/typescript-generator.md)。
+4. 只把确实需要模型判断的步骤交给 Agent；只在运行时确实需要动态决策时使用 Freedom。
+5. 明确 Agent、Memory 和 TaskGroup 的所有权与生命周期，避免隐式共享状态。
+6. 把外部系统访问放入 prompt、flow、capability、script 或 Agent executor binding，不假定宿主已经提供任何能力。
+7. 先 parse 和 validate，再使用最小 mock bindings 做确定性测试，最后连接真实模型和外部系统。
+8. 审查失败路径、取消传播、并发上限、workspace 隔离、schema 校验、持久化和 trace，再交付工作流。
 
 ## 保持跨平台
 

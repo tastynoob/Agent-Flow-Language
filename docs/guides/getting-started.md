@@ -80,4 +80,4 @@ npm pack
 npm install -g ./afl-lang-core-*.tgz
 ```
 
-生成的 npm 包包含 CLI、编译产物、正式文档和示例，不包含旧 Python HIR 实验。
+生成的 npm 包包含 CLI、编译产物、正式文档和示例。

@@ -2,7 +2,7 @@
   "name": "@afl-lang/core",
   "version": "0.1.0",
   "private": true,
-  "description": "Reference virtual machine for Agent Flow Language IR",
+  "description": "TypeScript toolkit and reference virtual machine for Agent Flow Language IR",
   "license": "Apache-2.0",
   "type": "module",
   "main": "./dist/src/index.js",
