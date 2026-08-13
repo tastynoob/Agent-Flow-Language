@@ -58,7 +58,7 @@ node_name(arg_a, arg_b):
 按以下类型推理：
 
 - `Frag`：`{ kind: "frag", content: string }`。它是无 role 的文本片段；role 只在写入 Memory 时产生。
-- compute value：`null`、布尔值、有限数字、字符串、list 或 record。它应可安全地跨进程序列化。
+- compute value：`null`、布尔值、有限数字、字符串、list 或 record。List 写作 `[value, ...]`，record 写作 `[key: value, ...]`，空 record 写作 `[:]`；它们应可安全地跨进程序列化。
 - symbol：形如 `@namespace.name` 的符号引用，由 binding 或 VM 解释。
 - handle：Agent、Memory 或 TaskGroup 的运行时句柄。不要把它传给 prompt binding、capability、external flow 或 script，也不要把它当成可序列化数据。
 
@@ -237,7 +237,7 @@ node_name(arg_a, arg_b):
 
 ### `freedom.route`
 
-形式：`routes = freedom.route planner, request, {min_routes: 1, max_routes: 3}, [inspect, test, summarize], {payload: input_value, policy: policy_record}`。
+形式：`routes = freedom.route planner, request, [min_routes: 1, max_routes: 3], [inspect, test, summarize], [payload: input_value, policy: policy_record]`。
 
 - 要求 planner executor 支持 `dynamicControlTools`。
 - 只暴露 `afl.environment.get` 和 `afl.route.add`。planner 可读取受控参数，并登记 allowlist 中的 local node 调用。
@@ -247,7 +247,7 @@ node_name(arg_a, arg_b):
 
 ### `freedom.flow`
 
-形式：`result = freedom.flow writer, request, {min_routes: 1, max_routes: 4}, [inspect, test, summarize], [@agent.coder, @agent.reviewer], {payload: input_value}`。
+形式：`result = freedom.flow writer, request, [min_routes: 1, max_routes: 4], [inspect, test, summarize], [@agent.coder, @agent.reviewer], [payload: input_value]`。
 
 - 只暴露 `afl.environment.get`、`afl.node.execute`、`afl.ir.validate` 和 `afl.ir.execute`。
 - 让 `node.execute` 立即执行 allowlist 中的 node；允许后续工具调用引用先前结果。

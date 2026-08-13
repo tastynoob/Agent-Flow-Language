@@ -271,6 +271,18 @@ export interface JumpTerminator extends InstructionBase {
   readonly falseTarget?: string;
 }
 
+export interface JumpTableCase {
+  readonly value: PrimitiveValue;
+  readonly target: string;
+}
+
+export interface JumpTableTerminator extends InstructionBase {
+  readonly op: "jump.table";
+  readonly selector: ValueExpr;
+  readonly cases: readonly JumpTableCase[];
+  readonly defaultTarget: string;
+}
+
 export interface ReturnTerminator extends InstructionBase {
   readonly op: "ret";
   readonly value?: ValueExpr;
@@ -281,7 +293,7 @@ export interface FailTerminator extends InstructionBase {
   readonly error: ValueExpr;
 }
 
-export type AflTerminator = JumpTerminator | ReturnTerminator | FailTerminator;
+export type AflTerminator = JumpTerminator | JumpTableTerminator | ReturnTerminator | FailTerminator;
 
 export interface AflBlock {
   readonly name: string;

@@ -288,13 +288,13 @@ test("module digests preserve user record data while ignoring IR source metadata
     const oldModule = parseAfl(`
 main():
     entry:
-        value = prompt {${field}: "old"}
+        value = prompt [${field}: "old"]
         ret value
 `, "old.afl");
     const newModule = parseAfl(`
 main():
     entry:
-        value = prompt {${field}: "new"}
+        value = prompt [${field}: "new"]
         ret value
 `, "new.afl");
     assert.notEqual(canonicalModuleDigest(oldModule), canonicalModuleDigest(newModule));

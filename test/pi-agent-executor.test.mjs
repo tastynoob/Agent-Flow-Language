@@ -178,7 +178,7 @@ main():
     entry:
         planner = agent @agent.planner
         seeded = planner.do "seed"
-        jobs = freedom.route planner, "route", {}, [], {}
+        jobs = freedom.route planner, "route", [], [], []
         reports = sync jobs
         ordinary = planner.do "ordinary"
         ret ordinary

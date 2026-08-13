@@ -60,7 +60,7 @@ main(message):
         assignment_prompt = prompt "Select departments and allocate the approved plan. Include enough context for each assigned department to work", execution_plan
         assignments = shangshu.do assignment_prompt
         route_prompt = prompt "Inspect the six department interfaces. Add every department that has an assignment to the route TaskGroup. Pass the approved plan and complete assignments by reference. Department execution and report collection happen after routing", execution_plan, assignments
-        department_jobs = freedom.route shangshu, route_prompt, {min_routes: 1, max_routes: 6}, [hubu, libu, bingbu, xingbu, gongbu, libu_hr], {plan: execution_plan, assignments: assignments}
+        department_jobs = freedom.route shangshu, route_prompt, [min_routes: 1, max_routes: 6], [hubu, libu, bingbu, xingbu, gongbu, libu_hr], [plan: execution_plan, assignments: assignments]
         department_reports = sync department_jobs
         summary_prompt = prompt "Summarize execution status and unresolved issues from these department reports", department_reports
         execution_summary = shangshu.do summary_prompt

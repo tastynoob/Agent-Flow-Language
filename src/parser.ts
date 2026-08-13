@@ -8,6 +8,7 @@ import type {
   FlowCallExpr,
   FlowTarget,
   ForkAction,
+  JumpTableCase,
   NameExpr,
   NodeDocumentation,
   OperExpr,
@@ -250,6 +251,17 @@ function parseStatement(line: SourceLine, sourceName?: string): AflInstruction |
       return { op: "jump", trueTarget: target, span: line.span };
     }
     if (operands.length === 3) {
+      if (operands[1]!.trim().startsWith("[")) {
+        const defaultTarget = operands[2]!.trim();
+        requireName(defaultTarget, line, sourceName, "jump table default target");
+        return {
+          op: "jump.table",
+          selector: parseValue(operands[0]!, line, sourceName),
+          cases: parseJumpTable(operands[1]!, line, sourceName),
+          defaultTarget,
+          span: line.span,
+        };
+      }
       const trueTarget = operands[1]!.trim();
       const falseTarget = operands[2]!.trim();
       requireName(trueTarget, line, sourceName, "jump target");
@@ -262,7 +274,12 @@ function parseStatement(line: SourceLine, sourceName?: string): AflInstruction |
         span: line.span,
       };
     }
-    throw parseError("PARSE_JUMP", "jump expects one target or condition, true target, false target", line, sourceName);
+    throw parseError(
+      "PARSE_JUMP",
+      "jump expects one target, condition with two targets, or selector with a jump table and default target",
+      line,
+      sourceName,
+    );
   }
 
   if (line.text.startsWith("memory.append ")) {
@@ -629,11 +646,60 @@ function parseRecord(
   sourceName: string | undefined,
   label: string,
 ): RecordExpr {
-  const value = parseValue(text, line, sourceName);
+  const source = text.trim();
+  if (source === "[]") return { kind: "record", entries: {}, span: line.span };
+  const value = parseValue(source, line, sourceName);
   if (value.kind !== "record") {
     throw parseError("PARSE_FREEDOM_RECORD", `${label} must be a record`, line, sourceName);
   }
   return value;
+}
+
+function parseJumpTable(
+  text: string,
+  line: SourceLine,
+  sourceName?: string,
+): JumpTableCase[] {
+  const value = text.trim();
+  if (!value.startsWith("[") || !value.endsWith("]")) {
+    throw parseError("PARSE_JUMP_TABLE", "jump table must be enclosed in '[' and ']'", line, sourceName);
+  }
+  const body = value.slice(1, -1).trim();
+  if (body === "") {
+    throw parseError("PARSE_JUMP_TABLE_EMPTY", "jump table requires at least one case", line, sourceName);
+  }
+  const cases: JumpTableCase[] = [];
+  for (const item of splitTopLevel(body)) {
+    const colon = findTopLevelCharacter(item, ":");
+    if (colon <= 0) {
+      throw parseError("PARSE_JUMP_TABLE_CASE", `invalid jump table case '${item.trim()}'`, line, sourceName);
+    }
+    const expression = parseValue(item.slice(0, colon), line, sourceName);
+    if (expression.kind !== "literal" || !isJumpTableScalar(expression.value)) {
+      throw parseError(
+        "PARSE_JUMP_TABLE_CASE",
+        "jump table case values must be null, boolean, number, or string literals",
+        line,
+        sourceName,
+      );
+    }
+    const target = item.slice(colon + 1).trim();
+    requireName(target, line, sourceName, "jump table target");
+    if (cases.some((entry) => entry.value === expression.value)) {
+      throw parseError(
+        "PARSE_JUMP_TABLE_CASE_DUPLICATE",
+        `jump table repeats case ${JSON.stringify(expression.value)}`,
+        line,
+        sourceName,
+      );
+    }
+    cases.push({ value: expression.value, target });
+  }
+  return cases;
+}
+
+function isJumpTableScalar(value: unknown): value is null | boolean | number | string {
+  return value === null || ["boolean", "number", "string"].includes(typeof value);
 }
 
 function parseSchema(text: string, line: SourceLine, sourceName?: string): SymbolExpr {
@@ -705,27 +771,39 @@ function parseValue(text: string, line: SourceLine, sourceName?: string): ValueE
     return parseSymbol(value, line, sourceName);
   }
   if (value.startsWith("[") && value.endsWith("]")) {
-    const body = value.slice(1, -1);
+    const body = value.slice(1, -1).trim();
+    if (body === ":") return { kind: "record", entries: {}, span: line.span };
+    const items = body === "" ? [] : splitTopLevel(body);
+    const record = items.length > 0 && items.every((item) => findTopLevelCharacter(item, ":") > 0);
+    const mixed = items.some((item) => findTopLevelCharacter(item, ":") > 0) && !record;
+    if (mixed) {
+      throw parseError("PARSE_COLLECTION_MIXED", "collection literal cannot mix list items and record entries", line, sourceName);
+    }
+    if (record) {
+      const entries: Record<string, ValueExpr> = {};
+      for (const item of items) {
+        const colon = findTopLevelCharacter(item, ":");
+        const rawKey = item.slice(0, colon).trim();
+        const quotedKey = rawKey.startsWith('"');
+        const key = quotedKey ? parseStringLiteral(rawKey, line, sourceName) : rawKey;
+        if (!quotedKey) requireName(key, line, sourceName, "record key");
+        if (Object.hasOwn(entries, key)) {
+          throw parseError("PARSE_RECORD_KEY_DUPLICATE", `record repeats key '${key}'`, line, sourceName);
+        }
+        Object.defineProperty(entries, key, {
+          value: parseValue(item.slice(colon + 1), line, sourceName),
+          enumerable: true,
+          configurable: true,
+          writable: true,
+        });
+      }
+      return { kind: "record", entries, span: line.span };
+    }
     return {
       kind: "list",
-      items: body.trim().length === 0 ? [] : splitTopLevel(body).map((item) => parseValue(item, line, sourceName)),
+      items: items.map((item) => parseValue(item, line, sourceName)),
       span: line.span,
     };
-  }
-  if (value.startsWith("{") && value.endsWith("}")) {
-    const body = value.slice(1, -1);
-    const entries: Record<string, ValueExpr> = {};
-    for (const item of body.trim().length === 0 ? [] : splitTopLevel(body)) {
-      const colon = findTopLevelCharacter(item, ":");
-      if (colon <= 0) {
-        throw parseError("PARSE_RECORD", `invalid record entry '${item.trim()}'`, line, sourceName);
-      }
-      const rawKey = item.slice(0, colon).trim();
-      const key = rawKey.startsWith('"') ? parseStringLiteral(rawKey, line, sourceName) : rawKey;
-      requireName(key, line, sourceName, "record key");
-      entries[key] = parseValue(item.slice(colon + 1), line, sourceName);
-    }
-    return { kind: "record", entries, span: line.span };
   }
   return parseName(value, line, sourceName);
 }
@@ -991,7 +1069,7 @@ function isRole(value: string): boolean {
 }
 
 function isTerminator(value: AflInstruction | AflTerminator): value is AflTerminator {
-  return value.op === "jump" || value.op === "ret" || value.op === "fail";
+  return value.op === "jump" || value.op === "jump.table" || value.op === "ret" || value.op === "fail";
 }
 
 function parseError(

@@ -128,6 +128,30 @@ main():
   await assert.rejects(vm.run(), { code: "DISPATCH_TASK_LIMIT_EXCEEDED" });
 });
 
+test("jump tables match precomputed scalar routes in declaration order and use default", async () => {
+  const vm = AflVm.fromSource(`
+main(route):
+    entry:
+        jump route, [1: number, "1": string, "rtl": rtl], fallback
+    number:
+        ret "number"
+    string:
+        ret "string"
+    rtl:
+        ret "rtl"
+    fallback:
+        ret "fallback"
+`, { agents });
+
+  assert.equal((await vm.run("main", [1])).output, "number");
+  assert.equal((await vm.run("main", ["1"])).output, "string");
+  assert.equal((await vm.run("main", ["rtl"])).output, "rtl");
+  assert.equal((await vm.run("main", [frag("rtl")])).output, "rtl");
+  assert.equal((await vm.run("main", ["unknown"])).output, "fallback");
+
+  await assert.rejects(vm.run("main", [["rtl"]]), { code: "JUMP_TABLE_SELECTOR_NOT_SCALAR" });
+});
+
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }

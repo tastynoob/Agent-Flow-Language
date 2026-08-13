@@ -361,6 +361,23 @@ export class AflVm {
           const value = evaluateValue(terminator.error, frame);
           throw new AflVmError("FLOW_FAILED", failureMessage(value), { span: terminator.span });
         }
+        if (terminator.op === "jump.table") {
+          const selector = asCompute(
+            evaluateValue(terminator.selector, frame),
+            terminator.span,
+            "jump table selector",
+          );
+          if (!isJumpTableScalar(selector)) {
+            throw new AflVmError(
+              "JUMP_TABLE_SELECTOR_NOT_SCALAR",
+              "jump table selector must be null, boolean, number, or string",
+              { span: terminator.span },
+            );
+          }
+          blockName = terminator.cases.find((entry) => entry.value === selector)?.target
+            ?? terminator.defaultTarget;
+          continue;
+        }
         if (terminator.condition === undefined) {
           blockName = terminator.trueTarget;
         } else {
@@ -2706,6 +2723,10 @@ export class AflVm {
     };
     await this.bindings.trace.emit(event);
   }
+}
+
+function isJumpTableScalar(value: ComputeValue): value is null | boolean | number | string {
+  return value === null || ["boolean", "number", "string"].includes(typeof value);
 }
 
 class SuspendableSemaphoreLease {

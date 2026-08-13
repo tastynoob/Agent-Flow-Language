@@ -160,7 +160,7 @@ department(task):
 main(task):
     entry:
         planner = agent @agent.planner
-        jobs = freedom.route planner, "choose", {min_routes: 1, max_routes: 1}, [department], {task: task}
+        jobs = freedom.route planner, "choose", [min_routes: 1, max_routes: 1], [department], [task: task]
         reports = sync jobs
         ret reports
 `, {
@@ -201,7 +201,7 @@ test("Freedom derives its control scope only from the instruction op", async (t)
 main():
     entry:
         planner = agent @agent.planner
-        jobs = freedom.route planner, "route", {}, [], {}
+        jobs = freedom.route planner, "route", [], [], []
         reports = sync jobs
         ret reports
 `);
@@ -288,7 +288,7 @@ second():
 main():
     entry:
         planner = agent @agent.planner
-        jobs = freedom.route planner, "route both", {min_routes: 2, max_routes: 2}, [first, second], {}
+        jobs = freedom.route planner, "route both", [min_routes: 2, max_routes: 2], [first, second], []
         reports = sync jobs
         ret reports
 `, {
@@ -323,7 +323,7 @@ failing():
 main():
     entry:
         planner = agent @agent.planner
-        jobs = freedom.route planner, "route", {min_routes: 1, max_routes: 1}, [failing], {}
+        jobs = freedom.route planner, "route", [min_routes: 1, max_routes: 1], [failing], []
         reports = sync jobs
         ret reports
 `, { agentExecutor: backend });
@@ -366,7 +366,7 @@ department(task):
 main():
     entry:
         writer = agent @agent.writer
-        summary = freedom.flow writer, "execute", {min_routes: 1, max_routes: 1}, [department], [], {task: "job"}
+        summary = freedom.flow writer, "execute", [min_routes: 1, max_routes: 1], [department], [], [task: "job"]
         ret summary
 `, { agentExecutor: backend });
   const result = await vm.run("main", [], { executionRoot: root, runId: "flow-node-execute" });
@@ -467,7 +467,7 @@ department(task):
 main(task):
     entry:
         writer = agent @agent.writer, "writer"
-        planned = freedom.flow writer, "plan", {min_routes: 1, max_routes: 1}, [department], [@agent.worker], {task: task}
+        planned = freedom.flow writer, "plan", [min_routes: 1, max_routes: 1], [department], [@agent.worker], [task: task]
         ordinary = writer.do "after"
         ret ordinary
 `, {
@@ -503,7 +503,7 @@ department(task):
 main():
     entry:
         planner = agent @agent.planner, ["planner", "shared"]
-        jobs = freedom.route planner, "plan", {}, [department], {}
+        jobs = freedom.route planner, "plan", [], [department], []
         reports = sync jobs
         ret reports
 `;
@@ -542,7 +542,7 @@ test("Freedom controlled params reject VM handles hidden behind unknown Node par
   const vm = AflVm.fromSource(`
 route(planner, leaked):
     entry:
-        jobs = freedom.route planner, "route", {}, [], {leaked: leaked}
+        jobs = freedom.route planner, "route", [], [], [leaked: leaked]
         reports = sync jobs
         ret reports
 main():
@@ -561,7 +561,7 @@ test("Freedom route constraints cannot expand VM policy limits", async (t) => {
 main():
     entry:
         planner = agent @agent.planner
-        jobs = freedom.route planner, "route", {max_routes: 3}, [], {}
+        jobs = freedom.route planner, "route", [max_routes: 3], [], []
         reports = sync jobs
         ret reports
 `, {
@@ -583,7 +583,7 @@ test("Freedom rejects VM scheduling fields in instruction constraints", () => {
 main():
     entry:
         planner = agent @agent.planner
-        jobs = freedom.route planner, "route", {max_parallel: 2}, [], {}
+        jobs = freedom.route planner, "route", [max_parallel: 2], [], []
         reports = sync jobs
         ret reports
 `, { agentExecutor: controlBackend(async () => completed("unexpected")) }), (error) =>
@@ -596,7 +596,7 @@ test("Freedom returns an empty TaskGroup for an empty Route and an empty Frag fo
 main():
     entry:
         planner = agent @agent.planner
-        jobs = freedom.route planner, "optional route", {min_routes: 0, max_routes: 1}, [], {}
+        jobs = freedom.route planner, "optional route", [min_routes: 0, max_routes: 1], [], []
         reports = sync jobs
         ret reports
 `, { agentExecutor: controlBackend(async () => completed("unexecuted route claim")) });
@@ -607,7 +607,7 @@ main():
 main():
     entry:
         writer = agent @agent.writer
-        result = freedom.flow writer, "validate only", {min_routes: 0, max_routes: 1}, [], [], {}
+        result = freedom.flow writer, "validate only", [min_routes: 0, max_routes: 1], [], [], []
         ret result
 `, {
     agentExecutor: controlBackend(async (request, host) => {
@@ -636,7 +636,7 @@ test("Freedom preserves the writer result after IR execution without a routed No
 main():
     entry:
         writer = agent @agent.writer
-        result = freedom.flow writer, "execute IR", {min_routes: 0, max_routes: 1}, [], [], {}
+        result = freedom.flow writer, "execute IR", [min_routes: 0, max_routes: 1], [], [], []
         ret result
 `, {
     agentExecutor: controlBackend(async (request, host) => {
@@ -670,7 +670,7 @@ available():
 main():
     entry:
         planner = agent @agent.planner
-        jobs = freedom.route planner, "route", {min_routes: 1, max_routes: 1}, [available], {}
+        jobs = freedom.route planner, "route", [min_routes: 1, max_routes: 1], [available], []
         reports = sync jobs
         ret reports
 `, { agentExecutor: controlBackend(async () => completed("too-early")) });

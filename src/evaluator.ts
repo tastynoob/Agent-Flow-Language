@@ -43,7 +43,12 @@ export function evaluateValue(expression: ValueExpr, environment: ValueEnvironme
         if (!isComputeValue(value)) {
           throw vmType("VALUE_RECORD_NOT_COMPUTE", "record values must contain compute values", item.span);
         }
-        result[key] = value;
+        Object.defineProperty(result, key, {
+          value,
+          enumerable: true,
+          configurable: true,
+          writable: true,
+        });
       }
       return result;
     }

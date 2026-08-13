@@ -52,7 +52,7 @@ Frag 不携带 role。Frag 进入 Agent 或 Memory 时才确定 role。Handle �
 | Capability | `invoke` |
 | Memory | `memory.append`、`memory.copy`、`memory.apply` |
 | 动态 Flow | `freedom.route`、`freedom.flow` |
-| 控制流 | `jump`、`ret`、`fail` |
+| 控制流 | `jump`（无条件、boolean 或有序跳转表）、`ret`、`fail` |
 
 完整操作数格式见[文本语法](syntax.md)，运行行为见[执行语义](semantics.md)。
 

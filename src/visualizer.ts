@@ -193,24 +193,45 @@ class VisualGraphBuilder {
 
     for (const [blockName, built] of blocks) {
       const terminator = built.block.terminator;
-      if (terminator.op !== "jump") continue;
-      const trueBlock = blocks.get(terminator.trueTarget);
-      if (trueBlock !== undefined) {
-        this.connectMany(
-          built.exits,
-          trueBlock.entries,
-          this.isBackEdge(blockName, terminator.trueTarget, blockIndexes) ? "loop" : terminator.condition === undefined ? "control" : "branch",
-          terminator.condition === undefined ? "" : "true",
-        );
-      }
-      if (terminator.falseTarget !== undefined) {
-        const falseBlock = blocks.get(terminator.falseTarget);
-        if (falseBlock !== undefined) {
+      if (terminator.op === "jump") {
+        const trueBlock = blocks.get(terminator.trueTarget);
+        if (trueBlock !== undefined) {
           this.connectMany(
             built.exits,
-            falseBlock.entries,
-            this.isBackEdge(blockName, terminator.falseTarget, blockIndexes) ? "loop" : "branch",
-            "false",
+            trueBlock.entries,
+            this.isBackEdge(blockName, terminator.trueTarget, blockIndexes) ? "loop" : terminator.condition === undefined ? "control" : "branch",
+            terminator.condition === undefined ? "" : "true",
+          );
+        }
+        if (terminator.falseTarget !== undefined) {
+          const falseBlock = blocks.get(terminator.falseTarget);
+          if (falseBlock !== undefined) {
+            this.connectMany(
+              built.exits,
+              falseBlock.entries,
+              this.isBackEdge(blockName, terminator.falseTarget, blockIndexes) ? "loop" : "branch",
+              "false",
+            );
+          }
+        }
+      } else if (terminator.op === "jump.table") {
+        for (const entry of terminator.cases) {
+          const target = blocks.get(entry.target);
+          if (target === undefined) continue;
+          this.connectMany(
+            built.exits,
+            target.entries,
+            this.isBackEdge(blockName, entry.target, blockIndexes) ? "loop" : "branch",
+            formatJumpCase(entry.value),
+          );
+        }
+        const fallback = blocks.get(terminator.defaultTarget);
+        if (fallback !== undefined) {
+          this.connectMany(
+            built.exits,
+            fallback.entries,
+            this.isBackEdge(blockName, terminator.defaultTarget, blockIndexes) ? "loop" : "branch",
+            "default",
           );
         }
       }
@@ -300,9 +321,9 @@ class VisualGraphBuilder {
     let decision: string | undefined;
     let returns: readonly string[] = [];
 
-    if (terminator.op === "jump" && terminator.condition !== undefined) {
+    if (terminator.op === "jump.table" || terminator.op === "jump" && terminator.condition !== undefined) {
       decision = this.addNode(scope, sourceNode.name, block.name, "decision", {
-        title: "Branch",
+        title: terminator.op === "jump.table" ? `Branch · ${terminator.cases.length + 1} paths` : "Branch",
         subtitle: this.sourceText(terminator.span),
         operations: [this.sourceText(terminator.span)],
         span: terminator.span,
@@ -674,6 +695,10 @@ class VisualGraphBuilder {
   ): boolean {
     return (indexes.get(to) ?? Number.MAX_SAFE_INTEGER) <= (indexes.get(from) ?? -1);
   }
+}
+
+function formatJumpCase(value: null | boolean | number | string): string {
+  return JSON.stringify(value);
 }
 
 function unit(index: number, id: string): InstructionUnit {

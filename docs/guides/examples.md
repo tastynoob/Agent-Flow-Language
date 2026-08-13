@@ -202,7 +202,7 @@ route_task(task):
     fallback:
         planner = agent @agent.planner
         freedom_prompt = prompt "Use an existing Node or construct and validate a small AFL flow for this unresolved task", task, route
-        result = freedom.flow planner, freedom_prompt, {min_routes: 0, max_routes: 2}, [known_worker], [@agent.worker], {task: task}
+        result = freedom.flow planner, freedom_prompt, [min_routes: 0, max_routes: 2], [known_worker], [@agent.worker], [task: task]
         ret result
 ```
 

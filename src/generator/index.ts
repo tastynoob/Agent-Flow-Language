@@ -1,4 +1,4 @@
-import type { ComputeValue } from "../ir.js";
+import type { ComputeValue, PrimitiveValue } from "../ir.js";
 import { isComputeValue } from "../ir.js";
 import { parseAfl } from "../parser.js";
 import { assertValidModule } from "../validation.js";
@@ -302,7 +302,19 @@ interface WhileControl {
   readonly endLabel: string;
 }
 
-type Control = WhenControl | WhileControl;
+interface MatchControl {
+  readonly kind: "match";
+  readonly id: number;
+  readonly dispatch: MutableBlock;
+  readonly selector: string;
+  readonly endLabel: string;
+  readonly cases: Array<{ readonly value: PrimitiveValue; readonly label: string }>;
+  defaultLabel?: string;
+  phase: "waiting" | "case" | "default";
+  fallsThrough: boolean;
+}
+
+type Control = WhenControl | WhileControl | MatchControl;
 
 /** Builds AFL source directly; it does not expose or retain a second IR. */
 export class AflIrBuilder {
@@ -395,7 +407,7 @@ export class AflIrBuilder {
   emit(instruction: string): this {
     const line = requireLine(instruction, "AFL instruction");
     if (/^(?:jump|ret|fail)(?:\s|$)/u.test(line)) {
-      throw new Error("use when/while/ret/fail instead of emitting an AFL terminator directly");
+      throw new Error("use structured control methods such as when/while/match/ret/fail instead of emitting an AFL terminator directly");
     }
     if (line.startsWith("#")) throw new Error("emit() expects an AFL instruction, not a comment");
     const destination = /^([A-Za-z_][A-Za-z0-9_]*)\s*=/u.exec(line)?.[1];
@@ -475,9 +487,71 @@ export class AflIrBuilder {
     return this;
   }
 
+  match(selector: AflOperand): this {
+    const dispatch = this.requireActive();
+    const id = this.nextControlId();
+    const selectorSource = this._operandSource(selector);
+    const endLabel = `${RESERVED_PREFIX}match_${id}_end`;
+    this.requireCurrent().active = undefined;
+    this.controls.push({
+      kind: "match",
+      id,
+      dispatch,
+      selector: selectorSource,
+      endLabel,
+      cases: [],
+      phase: "waiting",
+      fallsThrough: false,
+    });
+    return this;
+  }
+
+  case(value: PrimitiveValue): this {
+    const control = this.requireMatch("case()");
+    if (control.phase === "default") throw new Error("case() cannot follow default() in match()");
+    if (!isMatchScalar(value)) throw new TypeError("case() requires null, boolean, number, or string");
+    if (control.cases.some((entry) => entry.value === value)) {
+      throw new Error(`match() repeats case ${JSON.stringify(value)}`);
+    }
+    if (control.phase === "case") {
+      control.fallsThrough = this.closeFallthrough(control.endLabel) || control.fallsThrough;
+    }
+    const label = `${RESERVED_PREFIX}match_${control.id}_case_${control.cases.length + 1}`;
+    control.cases.push({ value, label });
+    control.phase = "case";
+    this.openBlock(label);
+    return this;
+  }
+
+  default(): this {
+    const control = this.requireMatch("default()");
+    if (control.defaultLabel !== undefined) throw new Error("match() can contain only one default()");
+    if (control.phase === "case") {
+      control.fallsThrough = this.closeFallthrough(control.endLabel) || control.fallsThrough;
+    }
+    const label = `${RESERVED_PREFIX}match_${control.id}_default`;
+    control.defaultLabel = label;
+    control.phase = "default";
+    this.openBlock(label);
+    return this;
+  }
+
   end(): this {
-    const control = this.controls.pop();
-    if (control === undefined) throw new Error("end() has no open when() or while() to close");
+    const control = this.controls.at(-1);
+    if (control === undefined) throw new Error("end() has no open when(), while(), or match() to close");
+    if (control.kind === "match") {
+      if (control.cases.length === 0) throw new Error("match() requires at least one case()");
+      if (control.defaultLabel === undefined) throw new Error("match() requires default()");
+      this.controls.pop();
+      if (control.phase !== "waiting") {
+        control.fallsThrough = this.closeFallthrough(control.endLabel) || control.fallsThrough;
+      }
+      const cases = control.cases.map((entry) => `${serializeCompute(entry.value)}: ${entry.label}`).join(", ");
+      control.dispatch.terminator = `jump ${control.selector}, [${cases}], ${control.defaultLabel}`;
+      if (control.fallsThrough) this.openBlock(control.endLabel);
+      return this;
+    }
+    this.controls.pop();
     if (control.kind === "while") {
       this.closeFallthrough(control.testLabel);
       this.openBlock(control.endLabel);
@@ -700,6 +774,12 @@ export class AflIrBuilder {
     throw new Error("break() and continue() require an open while()");
   }
 
+  private requireMatch(method: string): MatchControl {
+    const control = this.controls.at(-1);
+    if (control?.kind !== "match") throw new Error(`${method} must match the nearest open match()`);
+    return control;
+  }
+
   private allocateValue(hint: string): string {
     const state = this.requireCurrent();
     const base = sanitizeName(hint) || "value";
@@ -810,10 +890,25 @@ function sanitizeName(value: string): string {
   return sanitized.startsWith(RESERVED_PREFIX) ? `value_${sanitized}` : sanitized;
 }
 
+function isMatchScalar(value: ComputeValue): value is PrimitiveValue {
+  return value === null || typeof value === "boolean" || typeof value === "string" ||
+    typeof value === "number" && Number.isFinite(value);
+}
+
 function serializeCompute(value: ComputeValue): string {
-  const serialized = JSON.stringify(value);
-  if (serialized === undefined) throw new TypeError("AFL compute value is not serializable");
-  return serialized;
+  if (value === null || typeof value === "boolean" || typeof value === "number" || typeof value === "string") {
+    const serialized = JSON.stringify(value);
+    if (serialized === undefined) throw new TypeError("AFL compute value is not serializable");
+    return serialized;
+  }
+  if (Array.isArray(value)) return `[${value.map(serializeCompute).join(", ")}]`;
+  const entries = Object.entries(value);
+  if (entries.length === 0) return "[:]";
+  return `[${entries.map(([key, item]) => `${serializeRecordKey(key)}: ${serializeCompute(item)}`).join(", ")}]`;
+}
+
+function serializeRecordKey(key: string): string {
+  return NAME.test(key) ? key : JSON.stringify(key);
 }
 
 function quote(value: string): string {

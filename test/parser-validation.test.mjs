@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  AflVm,
   AflParseError,
   canonicalModuleDigest,
   parseAfl,
@@ -68,7 +69,7 @@ main(task):
         child = fork seed, child.do task
         memory = memory.copy child.memory
         applied = memory.apply child, memory
-        routed = freedom.route applied, reports, {min_routes: 1, max_routes: 8}, [worker], {reports: reports, batch: batch_reports}
+        routed = freedom.route applied, reports, [min_routes: 1, max_routes: 8], [worker], [reports: reports, batch: batch_reports]
         result = sync routed
         ret result
     failed:
@@ -78,6 +79,62 @@ main(task):
   assert.deepEqual(module.nodes.map((node) => node.name), ["worker", "main"]);
   assert.equal(module.nodes[1].blocks[0].instructions[2].op, "dispatch.list");
   assert.equal(module.nodes[1].blocks[1].instructions[1].op, "fork");
+});
+
+test("parser uses bracket literals for both lists and records", async () => {
+  const module = parseAfl(`
+main():
+    entry:
+        list = prompt [1, "two", [nested: true]]
+        record = prompt [alpha: 1, nested: [items: [1, 2]], "dash-key": "value", "__proto__": "data"]
+        empty_list = prompt []
+        empty_record = prompt [:]
+        planner = agent @agent.planner
+        jobs = freedom.route planner, "route", [], [], []
+        reports = sync jobs
+        ret record
+`);
+  const instructions = module.nodes[0].blocks[0].instructions;
+  assert.equal(instructions[0].source.kind, "list");
+  assert.equal(instructions[0].source.items[2].kind, "record");
+  assert.equal(instructions[1].source.kind, "record");
+  assert.equal(instructions[1].source.entries["dash-key"].value, "value");
+  assert.equal(instructions[1].source.entries.__proto__.value, "data");
+  assert.equal(instructions[2].source.kind, "list");
+  assert.deepEqual(instructions[2].source.items, []);
+  assert.equal(instructions[3].source.kind, "record");
+  assert.deepEqual(instructions[3].source.entries, {});
+  assert.equal(instructions[5].constraint.kind, "record");
+  assert.equal(instructions[5].params.kind, "record");
+  const result = await AflVm.fromSource(`
+main():
+    entry:
+        ret ["__proto__": "data"]
+`, {}).run("main");
+  assert.equal(Object.hasOwn(result.output, "__proto__"), true);
+  assert.equal(result.output.__proto__, "data");
+
+  assert.throws(() => parseAfl(`
+main():
+    entry:
+        value = prompt [1, key: 2]
+        ret value
+`), (error) => {
+    assert.equal(error instanceof AflParseError, true);
+    assert.equal(error.diagnostics[0].code, "PARSE_COLLECTION_MIXED");
+    return true;
+  });
+
+  assert.throws(() => parseAfl(`
+main():
+    entry:
+        value = prompt {key: "removed"}
+        ret value
+`), (error) => {
+    assert.equal(error instanceof AflParseError, true);
+    assert.equal(error.diagnostics[0].code, "PARSE_NAME");
+    return true;
+  });
 });
 
 test("parser rejects removed seqdo syntax", () => {
@@ -257,7 +314,7 @@ test("freedom.route produces a TaskGroup that must be synced", () => {
 main():
     entry:
         planner = agent @agent.planner
-        jobs = freedom.route planner, "route", {}, [], {}
+        jobs = freedom.route planner, "route", [], [], []
         ret "done"
 `));
   assert.equal(invalid.ok, false);
@@ -267,7 +324,7 @@ main():
 main():
     entry:
         planner = agent @agent.planner
-        jobs = freedom.route planner, "route", {}, [], {}
+        jobs = freedom.route planner, "route", [], [], []
         reports = sync jobs
         ret reports
 `));
@@ -325,4 +382,101 @@ main(task, choose_left):
 `));
   assert.equal(invalid.ok, false);
   assert.equal(invalid.diagnostics.some((item) => item.code === "TASK_GROUP_UNCONSUMED"), true);
+});
+
+test("jump tables preserve ordered scalar cases and validate every target", () => {
+  const module = parseAfl(`
+main(route):
+    entry:
+        jump route, ["research": research, "rtl": rtl, 3: numbered], fallback
+    research:
+        ret "research"
+    rtl:
+        ret "rtl"
+    numbered:
+        ret "numbered"
+    fallback:
+        ret "fallback"
+`);
+  const terminator = module.nodes[0].blocks[0].terminator;
+  assert.equal(terminator.op, "jump.table");
+  assert.deepEqual(terminator.cases, [
+    { value: "research", target: "research" },
+    { value: "rtl", target: "rtl" },
+    { value: 3, target: "numbered" },
+  ]);
+  assert.equal(validateModule(module).ok, true);
+
+  const fragSelector = validateModule(parseAfl(`
+main():
+    entry:
+        route = prompt "rtl"
+        jump route, ["rtl": rtl], fallback
+    rtl:
+        ret
+    fallback:
+        ret
+`));
+  assert.equal(fragSelector.ok, true);
+
+  const invalid = validateModule(parseAfl(`
+main(route):
+    entry:
+        jump route, ["known": missing], fallback
+    fallback:
+        ret "fallback"
+`));
+  assert.equal(invalid.ok, false);
+  assert.equal(invalid.diagnostics.some((item) => item.code === "JUMP_TARGET_UNKNOWN"), true);
+
+  const nonScalar = validateModule(parseAfl(`
+main():
+    entry:
+        jump ["rtl"], ["rtl": rtl], fallback
+    rtl:
+        ret
+    fallback:
+        ret
+`));
+  assert.equal(nonScalar.ok, false);
+  assert.equal(nonScalar.diagnostics.some((item) => item.code === "JUMP_TABLE_SELECTOR_NOT_SCALAR"), true);
+
+  const directNode = module.nodes[0];
+  const directEntry = directNode.blocks[0];
+  const directTerminator = directEntry.terminator;
+  const invalidDirectIr = {
+    ...module,
+    nodes: [{
+      ...directNode,
+      blocks: [{
+        ...directEntry,
+        terminator: {
+          ...directTerminator,
+          cases: [
+            { value: "same", target: "research" },
+            { value: "same", target: "rtl" },
+          ],
+        },
+      }, ...directNode.blocks.slice(1)],
+    }],
+  };
+  const directValidation = validateModule(invalidDirectIr);
+  assert.equal(directValidation.ok, false);
+  assert.equal(directValidation.diagnostics.some((item) => item.code === "JUMP_TABLE_CASE_DUPLICATE"), true);
+
+  assert.throws(() => parseAfl(`
+main(route):
+    entry:
+        jump route, ["same": first, "same": second], fallback
+    first:
+        ret
+    second:
+        ret
+    fallback:
+        ret
+`), (error) => {
+    assert.equal(error instanceof AflParseError, true);
+    assert.equal(error.diagnostics[0].code, "PARSE_JUMP_TABLE_CASE_DUPLICATE");
+    return true;
+  });
 });

@@ -35,7 +35,16 @@ bug_list_2
 @mcp.github.read_file
 ```
 
-String 使用双引号，转义规则沿用 JSON string。Boolean、number、list 和 record 字面量主要供 `oper`、script executor 和 VM option 使用。
+String 使用双引号，转义规则沿用 JSON string。Boolean、number、list 和 record 字面量主要供 `oper`、script executor 和 VM option 使用。List 与 record 统一使用方括号，是否包含顶层 `:` 决定集合类型：
+
+```text
+[value0, value1]            # list
+[key: value, "other-key": value]  # record
+[]                          # empty list
+[:]                         # empty record
+```
+
+同一层集合不能混写 list item 和 record entry。Record 的裸 key 必须是合法名称；其他字符串 key 使用双引号。
 
 Role operand 可以使用基础 role keyword，也可以引用 VM 定义的 role symbol：
 
@@ -90,10 +99,20 @@ block_name:
 ```text
 jump target
 jump condition, true_target, false_target
+jump selector, [case_value: target, ...], default_target
 ret
 ret value
 fail error
 ```
+
+跳转表的 case 按书写顺序匹配。`case_value` 必须是 `null`、boolean、number 或 string literal，目标必须是当前 node 内的 block 名；所有 case 均未匹配时进入显式的 `default_target`：
+
+```text
+route:
+    jump route_kind, ["research": research, "rtl": implement, "verify": verify], fallback
+```
+
+跳转表一次只激活一个目标。需要同时启动多个 flow 时使用 `dispatch`。
 
 循环通过回跳表达：
 
@@ -347,7 +366,7 @@ branch = memory.apply coder, branch_memory
 `freedom.route` 临时向普通 planner Agent 暴露环境查询和动态路由登记工具，并返回 TaskGroup：
 
 ```text
-jobs = freedom.route planner, prompt, {min_routes: 1, max_routes: 2}, [node0, node1], {task: task, spec: spec}
+jobs = freedom.route planner, prompt, [min_routes: 1, max_routes: 2], [node0, node1], [task: task, spec: spec]
 reports = sync jobs
 ```
 
@@ -356,12 +375,12 @@ Planner 通过 `afl.route.add` 登记 Node 调用；Node 在 planner activation 
 `freedom.flow` 暴露环境查询、既有 Node 执行以及 generated IR 的校验和执行工具：
 
 ```text
-result = freedom.flow writer, prompt, {min_routes: 0, max_routes: 4}, [node0, node1], [@agent.fast, @agent.strong], {task: task}
+result = freedom.flow writer, prompt, [min_routes: 0, max_routes: 4], [node0, node1], [@agent.fast, @agent.strong], [task: task]
 ```
 
-Node allowlist 只接受本 module 的 Node 名称；Flow 的 Agent allowlist 只接受 `@agent.*` symbol。`constraint` 是只含 `min_routes` 和 `max_routes` 的具名 record，两者分别要求本次 activation 至少和至多路由多少次；`min_routes` 可以为 0，`max_routes` 必须为正整数且不小于前者。并行度、超时和工具调用预算属于 VM policy，不进入 AFL 指令约束。
+Node allowlist 只接受本 module 的 Node 名称；Flow 的 Agent allowlist 只接受 `@agent.*` symbol。`constraint` 是只含 `min_routes` 和 `max_routes` 的具名 record，两者分别要求本次 activation 至少和至多路由多少次；`min_routes` 可以为 0，`max_routes` 必须为正整数且不小于前者。并行度、超时和工具调用预算属于 VM policy，不进入 AFL 指令约束。Freedom 的 constraint 和 controlled params 操作数已确定为 record，因此这两个位置允许用 `[]` 简写空 record；一般表达式中的 `[]` 仍是空 list，显式空 record 写作 `[:]`。
 
-受控参数也使用具名 record。Agent 可以通过 `{ref: "param:name"}` 选择显式参数，也可以通过 `{string: "..."}` 传入自由文本；Flow writer 还可以引用本次 activation 中先前工具产生的结果。Route planner 完成后，VM 检查已登记 route 是否满足 `min_routes` 并返回 TaskGroup；零 route 对应合法的空 TaskGroup。Flow 成功执行过 Node 或 generated IR 时返回 writer 的 final response Frag，未成功执行任何内容时返回空 Frag。临时工具都不会泄漏到该 Agent 后续的普通 `do`。
+受控参数也使用具名 record。Agent 可以通过 `{ref: "param:name"}` 选择显式参数，也可以通过 `{string: "..."}` 传入自由文本；这里的 `{...}` 是临时 tool 的 JSON 参数，不是 AFL record 语法。Flow writer 还可以引用本次 activation 中先前工具产生的结果。Route planner 完成后，VM 检查已登记 route 是否满足 `min_routes` 并返回 TaskGroup；零 route 对应合法的空 TaskGroup。Flow 成功执行过 Node 或 generated IR 时返回 writer 的 final response Frag，未成功执行任何内容时返回空 Frag。临时工具都不会泄漏到该 Agent 后续的普通 `do`。
 
 Freedom activation 延续该 Agent 已有的 Memory 和 executor session，指令的 `prompt` 作为普通 user message 加入同一份 Memory。`environment.get` 不返回 AFL 语法；当前调用方可以在 `prompt` 中直接给出必要的最小语法，后续再由 AFL skill 提供完整语言知识。
 
@@ -391,11 +410,12 @@ memory.append memory, role, frag
 dst = memory.copy memory
 dst = memory.apply source_agent, memory
 
-dst = freedom.route planner, prompt, constraint, [node ...], {param: value ...}
-dst = freedom.flow writer, prompt, constraint, [node ...], [agent_symbol ...], {param: value ...}
+dst = freedom.route planner, prompt, constraint, [node ...], [param: value ...]
+dst = freedom.flow writer, prompt, constraint, [node ...], [agent_symbol ...], [param: value ...]
 
 jump target
 jump condition, true_target, false_target
+jump selector, [case_value: target, ...], default_target
 ret [value]
 fail error
 ```

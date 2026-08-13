@@ -239,9 +239,12 @@ Live checkpoint 的 backend、Agent symbol、system prompt 和 Workspace 都兼�
 ```text
 jump target
 jump condition, true_target, false_target
+jump selector, [case_value: target, ...], default_target
 ```
 
 无条件形式激活目标 block。条件形式读取 boolean compute value，只激活一个目标。
+
+跳转表形式先对 `selector` 求值一次，然后按 case 的书写顺序做类型敏感的精确匹配，激活首个匹配目标；没有 case 匹配时激活 `default_target`。Selector 必须是 `null`、boolean、number、string 或内容被视为 string 的 Frag。跳转表不计算 case 条件，也不产生并行分支。
 
 ### 10.2 `ret`
 

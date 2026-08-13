@@ -35,6 +35,53 @@ test("linear while/when control flow executes without callback nesting", async (
   assert.equal(result.output, 4);
 });
 
+test("linear match control generates and executes an ordered jump table", async () => {
+  const builder = new AflIrBuilder({ sourceName: "match.generated.afl" });
+  const main = builder.node("main", ["route"]);
+
+  builder.match(main.params.route);
+  builder.case("research");
+  builder.ret("research-result");
+  builder.case("rtl");
+  builder.ret("rtl-result");
+  builder.default();
+  builder.ret("fallback-result");
+  builder.end();
+
+  const source = builder.build();
+  assert.match(
+    source,
+    /jump route, \["research": __afl_match_1_case_1, "rtl": __afl_match_1_case_2\], __afl_match_1_default/u,
+  );
+  const vm = AflVm.fromSource(source, {});
+  assert.equal((await vm.run("main", ["rtl"])).output, "rtl-result");
+  assert.equal((await vm.run("main", ["other"])).output, "fallback-result");
+});
+
+test("generator serializes arrays and records with bracket literals", () => {
+  const builder = new AflIrBuilder({ sourceName: "collections.generated.afl" });
+  builder.node("main");
+  const result = builder.typescript("return args[0]", [{
+    alpha: 1,
+    nested: [true, { beta: "value" }],
+    "dash-key": "quoted",
+    empty: {},
+  }], "result");
+  builder.ret(result);
+
+  const source = builder.build();
+  assert.match(
+    source,
+    /result = typescript "return args\[0\]", \[alpha: 1, nested: \[true, \[beta: "value"\]\], "dash-key": "quoted", empty: \[:\]\]/u,
+  );
+  const argument = parseAfl(source).nodes[0].blocks[0].instructions[0].args[0];
+  assert.equal(argument.kind, "record");
+  assert.equal(argument.entries.nested.kind, "list");
+  assert.equal(argument.entries.nested.items[1].kind, "record");
+  assert.equal(argument.entries["dash-key"].value, "quoted");
+  assert.equal(argument.entries.empty.kind, "record");
+});
+
 test("Agent values expose lazy text conditions for when/otherwise", () => {
   const builder = new AflIrBuilder({ sourceName: "agent.generated.afl" });
   const main = builder.node("main", ["task"], {
@@ -121,6 +168,19 @@ test("builder rejects malformed structure and lets the AFL validator check data 
   outsideLoop.node("main");
   assert.throws(() => outsideLoop.break(), /require an open while/u);
   assert.throws(() => outsideLoop.emit("jump done"), /instead of emitting an AFL terminator/u);
+
+  const missingDefault = new AflIrBuilder();
+  const routed = missingDefault.node("main", ["route"]);
+  missingDefault.match(routed.params.route);
+  missingDefault.case("rtl");
+  missingDefault.ret("done");
+  assert.throws(() => missingDefault.end(), /requires default/u);
+  assert.throws(() => missingDefault.build(), /unclosed match/u);
+
+  const invalidCase = new AflIrBuilder();
+  const invalidRoute = invalidCase.node("main", ["route"]);
+  invalidCase.match(invalidRoute.params.route);
+  assert.throws(() => invalidCase.case(Number.NaN), /requires null, boolean, number, or string/u);
 
   const unavailable = new AflIrBuilder({ sourceName: "invalid.generated.afl" });
   const main = unavailable.node("main", ["flag"]);

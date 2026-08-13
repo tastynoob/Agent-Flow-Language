@@ -188,9 +188,7 @@ function buildPredecessors(
 ): Map<string, Set<string>> {
   const predecessors = new Map(node.blocks.map((block) => [block.name, new Set<string>()]));
   for (const block of node.blocks) {
-    if (block.terminator.op !== "jump") continue;
-    for (const target of [block.terminator.trueTarget, block.terminator.falseTarget]) {
-      if (target === undefined) continue;
+    for (const target of terminatorTargets(block.terminator)) {
       if (!blocks.has(target)) {
         add(
           diagnostics,
@@ -255,10 +253,9 @@ function reachableBlocks(blocks: ReadonlyMap<string, AflBlock>): Set<string> {
     if (reachable.has(name)) continue;
     reachable.add(name);
     const terminator = blocks.get(name)?.terminator;
-    if (terminator?.op === "jump") {
-      if (blocks.has(terminator.trueTarget)) pending.push(terminator.trueTarget);
-      if (terminator.falseTarget !== undefined && blocks.has(terminator.falseTarget)) {
-        pending.push(terminator.falseTarget);
+    if (terminator !== undefined) {
+      for (const target of terminatorTargets(terminator)) {
+        if (blocks.has(target)) pending.push(target);
       }
     }
   }
@@ -309,7 +306,54 @@ function validateBlock(
   }
   if (block.terminator.op === "jump" && block.terminator.condition !== undefined) {
     expectKind(module, block.terminator.condition, kinds, ["compute", "unknown"], "jump condition", diagnostics);
+  } else if (block.terminator.op === "jump.table") {
+    expectKind(module, block.terminator.selector, kinds, ["compute", "frag", "unknown"], "jump table selector", diagnostics);
+    if (block.terminator.selector.kind === "list" || block.terminator.selector.kind === "record") {
+      add(
+        diagnostics,
+        module,
+        block.terminator.selector.span,
+        "JUMP_TABLE_SELECTOR_NOT_SCALAR",
+        "jump table selector must be null, boolean, number, string, Frag, or an unknown compute value",
+      );
+    }
+    if (block.terminator.cases.length === 0) {
+      add(
+        diagnostics,
+        module,
+        block.terminator.span,
+        "JUMP_TABLE_EMPTY",
+        "jump table requires at least one case",
+      );
+    }
+    const caseValues: Array<null | boolean | number | string> = [];
+    for (const entry of block.terminator.cases) {
+      if (!isJumpTableCaseValue(entry.value)) {
+        add(
+          diagnostics,
+          module,
+          block.terminator.span,
+          "JUMP_TABLE_CASE_INVALID",
+          "jump table case values must be finite null, boolean, number, or string literals",
+        );
+      } else if (caseValues.some((value) => value === entry.value)) {
+        add(
+          diagnostics,
+          module,
+          block.terminator.span,
+          "JUMP_TABLE_CASE_DUPLICATE",
+          `jump table repeats case ${JSON.stringify(entry.value)}`,
+        );
+      } else {
+        caseValues.push(entry.value);
+      }
+    }
   }
+}
+
+function isJumpTableCaseValue(value: unknown): value is null | boolean | number | string {
+  return value === null || typeof value === "boolean" || typeof value === "string" ||
+    typeof value === "number" && Number.isFinite(value);
 }
 
 function validateReference(
@@ -731,7 +775,8 @@ function validateTaskGroupPaths(
       }
       outstanding = false;
     }
-    if (block.terminator.op !== "jump") {
+    const targets = terminatorTargets(block.terminator);
+    if (targets.length === 0) {
       if (outstanding) {
         reportOnce(
           reported,
@@ -745,10 +790,7 @@ function validateTaskGroupPaths(
       }
       continue;
     }
-    pending.push({ block: block.terminator.trueTarget, outstanding });
-    if (block.terminator.falseTarget !== undefined) {
-      pending.push({ block: block.terminator.falseTarget, outstanding });
-    }
+    for (const target of targets) pending.push({ block: target, outstanding });
   }
   if (!observedSync) {
     reportOnce(
@@ -851,10 +893,23 @@ function terminatorReferences(terminator: AflTerminator): NameExpr[] {
   if (terminator.op === "jump") {
     return terminator.condition === undefined ? [] : valueReferences(terminator.condition);
   }
+  if (terminator.op === "jump.table") return valueReferences(terminator.selector);
   if (terminator.op === "ret") {
     return terminator.value === undefined ? [] : valueReferences(terminator.value);
   }
   return valueReferences(terminator.error);
+}
+
+function terminatorTargets(terminator: AflTerminator): readonly string[] {
+  if (terminator.op === "jump") {
+    return terminator.falseTarget === undefined
+      ? [terminator.trueTarget]
+      : [terminator.trueTarget, terminator.falseTarget];
+  }
+  if (terminator.op === "jump.table") {
+    return [...terminator.cases.map((entry) => entry.target), terminator.defaultTarget];
+  }
+  return [];
 }
 
 function expectKind(

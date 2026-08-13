@@ -76,7 +76,7 @@ test("visual graph expands Freedom candidates as optional scopes", () => {
 route(task):
     entry:
         planner = agent @agent.planner
-        jobs = freedom.route planner, task, {min_routes: 1, max_routes: 2}, [worker, classify], {task: task}
+        jobs = freedom.route planner, task, [min_routes: 1, max_routes: 2], [worker, classify], [task: task]
         reports = sync jobs
         ret reports
 `;
@@ -145,12 +145,36 @@ loop(value):
   assert.equal(loopGraph.edges.some((edge) => edge.kind === "loop"), true);
 });
 
+test("visual graph renders one branch node for a multi-way jump table", () => {
+  const source = `
+main(route):
+    entry:
+        jump route, ["research": research, "rtl": rtl, "verify": verify], fallback
+    research:
+        ret "research"
+    rtl:
+        ret "rtl"
+    verify:
+        ret "verify"
+    fallback:
+        ret "fallback"
+`;
+  const graph = buildAflVisualGraph(parseAfl(source), source);
+  const branches = graph.nodes.filter((node) => node.kind === "decision");
+  assert.equal(branches.length, 1);
+  assert.equal(branches[0].title, "Branch · 4 paths");
+  assert.deepEqual(
+    graph.edges.filter((edge) => edge.from === branches[0].id).map((edge) => edge.label),
+    ['"research"', '"rtl"', '"verify"', "default"],
+  );
+});
+
 test("ELK layout covers graph nodes, edges, scopes, and dynamic variants", async () => {
   const source = WORKFLOW + `
 route(task):
     entry:
         planner = agent @agent.planner
-        jobs = freedom.route planner, task, {min_routes: 1, max_routes: 2}, [worker, classify], {task: task}
+        jobs = freedom.route planner, task, [min_routes: 1, max_routes: 2], [worker, classify], [task: task]
         reports = sync jobs
         ret reports
 `;
