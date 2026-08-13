@@ -30,7 +30,7 @@
     "clean": "node scripts/clean.mjs",
     "build": "tsc -p tsconfig.json",
     "test:ts": "npm run build && node --test test/*.test.mjs",
-    "test:cli": "node bin/afl.mjs validate test/fixtures/echo.afl && node bin/afl-vm.mjs test/fixtures/noop-bindings.mjs test/fixtures/minimal.afl",
+    "test:cli": "node bin/afl.mjs validate test/fixtures/echo.afl && node bin/afl.mjs visualize examples/coder-reviewer.afl --output /tmp/afl-cli-visualizer-smoke.html && node bin/afl-vm.mjs test/fixtures/noop-bindings.mjs test/fixtures/minimal.afl",
     "test:package": "node scripts/test-vm-package.mjs",
     "smoke:deepseek": "npm run build && node bin/afl-vm.mjs examples/deepseek-bindings.mjs examples/live-smoke.afl",
     "smoke:pi": "npm run build && node scripts/live-pi-smoke.mjs",
@@ -46,6 +46,7 @@
   "dependencies": {
     "@earendil-works/pi-agent-core": "^0.82.1",
     "@earendil-works/pi-ai": "^0.82.1",
-    "cc-safety-net": "1.0.6"
+    "cc-safety-net": "1.0.6",
+    "elkjs": "^0.12.0"
   }
 }

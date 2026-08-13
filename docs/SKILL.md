@@ -477,6 +477,7 @@ endMemoryDo(...)
 
 ```text
 afl validate workflow.afl
+afl visualize workflow.afl --output workflow.graph.html
 afl-vm bindings-module workflow.afl
 ```
 

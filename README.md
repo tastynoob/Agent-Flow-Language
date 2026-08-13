@@ -42,10 +42,21 @@ main(task):
 
 完整示例见 [`examples/coder-reviewer.afl`](examples/coder-reviewer.afl)。
 
+## 可视化
+
+较长的 AFL 可以生成一份直接打开的交互式静态图：
+
+```bash
+afl visualize examples/coder-reviewer.afl
+```
+
+图只把模型调用和分支显示为节点，其余运算与控制行为折叠到连线上；本地 Node 调用、循环、并发关系和 Freedom 动态候选仍然保留。ELK 分层布局负责减少交叉并生成正交连线。默认输出 `examples/coder-reviewer.graph.html`；更多选项见[工作流可视化](docs/guides/visualization.md)。
+
 ## 文档
 
 - [文档索引](docs/README.md)
 - [快速开始](docs/guides/getting-started.md)
+- [工作流可视化](docs/guides/visualization.md)
 - [TypeScript IR Generator](docs/guides/typescript-generator.md)
 - [文本语法](docs/spec/syntax.md)
 - [执行语义](docs/spec/semantics.md)

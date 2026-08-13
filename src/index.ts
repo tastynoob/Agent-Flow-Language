@@ -17,4 +17,8 @@ export * from "./vm-values.js";
 export * from "./vm.js";
 export * from "./testing.js";
 export * from "./validation.js";
+export * from "./visualizer.js";
+export * from "./visualizer-layout.js";
+export * from "./visualizer-projection.js";
+export * from "./visualizer-html.js";
 export * from "./workspace.js";

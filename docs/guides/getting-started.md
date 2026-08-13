@@ -22,6 +22,16 @@ npm run build
 
 诊断信息包含稳定的错误代码和源码位置。验证会检查结构、名称、操作数类别、控制流、依赖环和 TaskGroup 生命周期，不会执行 Agent 或外部能力。
 
+## 查看工作流图
+
+工作流变长后，可以生成一份直接在浏览器打开的单文件交互图：
+
+```bash
+afl visualize examples/coder-reviewer.afl
+```
+
+图中只保留模型调用和分支节点，普通运算与其他控制行为折叠到连线上，本地 Node 调用会原地展开。详细选项和图语义见[工作流可视化](visualization.md)。
+
 ## 执行 AFL 文件
 
 `afl-vm` 接收一个 `bindings` 模块和一个 AFL 文件，默认执行 `main()`：
@@ -41,6 +51,7 @@ npm run build
 
 ```bash
 afl validate ./flow.afl
+afl visualize ./flow.afl
 afl-vm ./bindings.mjs ./flow.afl
 ```
 

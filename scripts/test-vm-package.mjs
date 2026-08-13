@@ -39,10 +39,31 @@ try {
   const installedPackage = join(install, "node_modules", "@afl-lang", "core");
   await access(join(installedPackage, "docs", "README.md"));
   await assertMissing(join(installedPackage, "proposals"));
-  const executable = process.platform === "win32"
+  const vmExecutable = process.platform === "win32"
     ? join(install, "node_modules", ".bin", "afl-vm.cmd")
     : join(install, "node_modules", ".bin", "afl-vm");
-  await access(executable);
+  const aflExecutable = process.platform === "win32"
+    ? join(install, "node_modules", ".bin", "afl.cmd")
+    : join(install, "node_modules", ".bin", "afl");
+  await access(vmExecutable);
+  await access(aflExecutable);
+  const graphOutput = join(temporary, "package-visualization.html");
+  const visualizeOutput = await run(
+    aflExecutable,
+    [
+      "visualize",
+      join(root, "examples", "coder-reviewer.afl"),
+      "--output",
+      graphOutput,
+    ],
+    root,
+    cache,
+  );
+  const visualization = JSON.parse(visualizeOutput);
+  if (visualization.visualized !== true || visualization.display?.main?.nodes < 1) {
+    throw new Error(`installed afl returned an unexpected visualization result: ${visualizeOutput}`);
+  }
+  await access(graphOutput);
   const commandModule = join(
     installedPackage,
     "bin",
@@ -66,7 +87,7 @@ try {
   if (result.output?.kind !== "frag" || result.output.content !== "afl-vm-ok") {
     throw new Error(`installed afl-vm returned an unexpected result: ${output}`);
   }
-  process.stdout.write(`installed ${basename(filename)}: afl-vm-ok\n`);
+  process.stdout.write(`installed ${basename(filename)}: afl-vm-ok, visualize-ok\n`);
 } finally {
   await rm(temporary, { recursive: true, force: true });
 }
