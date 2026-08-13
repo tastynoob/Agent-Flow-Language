@@ -224,6 +224,7 @@ export class AflVm {
   constructor(module: AflModule, bindings: VmBindings) {
     this.module = assertValidModule(module);
     this.bindings = bindings;
+    validateVmPolicy(bindings, module.nodes[0]?.span ?? { line: 1, column: 1, endColumn: 1 });
     this.agentExecutor = bindings.agentExecutor ?? (
       bindings.agents === undefined ? undefined : new AgentAdapterExecutorBackend(bindings.agents)
     );
@@ -2722,6 +2723,23 @@ export class AflVm {
     };
     await this.bindings.trace.emit(event);
   }
+}
+
+function validateVmPolicy(bindings: VmBindings, span: SourceSpan): void {
+  const policy = bindings.policy;
+  if (policy === undefined) return;
+  if (policy.maxConcurrency !== undefined && (!Number.isInteger(policy.maxConcurrency) || policy.maxConcurrency <= 0)) {
+    throw new AflVmError("VM_POLICY_INVALID", "maxConcurrency must be a positive integer");
+  }
+  if (policy.maxDispatchWorkers !== undefined &&
+      (!Number.isInteger(policy.maxDispatchWorkers) || policy.maxDispatchWorkers <= 0)) {
+    throw new AflVmError("VM_POLICY_INVALID", "maxDispatchWorkers must be a positive integer");
+  }
+  if (policy.maxDispatchTasks !== undefined &&
+      (!Number.isInteger(policy.maxDispatchTasks) || policy.maxDispatchTasks < 0)) {
+    throw new AflVmError("VM_POLICY_INVALID", "maxDispatchTasks must be a non-negative integer");
+  }
+  parseFreedomLimits({}, span, policy.freedomLimits);
 }
 
 function isMatchScalar(value: ComputeValue): value is null | boolean | number | string {

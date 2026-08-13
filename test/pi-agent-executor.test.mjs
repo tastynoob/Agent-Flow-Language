@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -942,6 +942,60 @@ main():
     env: {},
     inheritEnv: true,
   });
+});
+
+test("Pi sandbox can expose read-only listing without exposing elevation", async (t) => {
+  try {
+    await access("/usr/bin/bwrap");
+  } catch {
+    return t.skip("bubblewrap is unavailable");
+  }
+  const root = await mkdtemp(join(tmpdir(), "afl-pi-readonly-list-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const contextRoot = join(root, "context");
+  await mkdir(contextRoot);
+  await writeFile(join(contextRoot, "brief.txt"), "bounded context\n", "utf8");
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  faux.setResponses([
+    (context) => {
+      assert.deepEqual(context.tools.map((tool) => tool.name), [
+        "read",
+        "list",
+        "write",
+        "afl_transaction_request",
+      ]);
+      assert.doesNotMatch(context.systemPrompt ?? "", /afl_elevated_tool/u);
+      assert.equal((context.systemPrompt ?? "").includes(`${contextRoot} -> /readonly/0`), true);
+      return fauxAssistantMessage(fauxToolCall("list", { path: "/readonly/0" }, { id: "readonly-list" }), {
+        stopReason: "toolUse",
+      });
+    },
+    (context) => {
+      assert.match(messageTexts(context.messages).join("\n"), /brief\.txt/u);
+      return fauxAssistantMessage("listed");
+    },
+  ]);
+  const backend = new PiAgentExecutorBackend({
+    models,
+    defaultBinding: createPiCodingAgentBinding({
+      model: faux.getModel(),
+      activeToolNames: ["read", "list", "write"],
+      elevation: false,
+      sandbox: { backend: "bubblewrap", network: "host" },
+    }),
+  });
+  const vm = AflVm.fromSource(`
+main():
+    entry:
+        worker = agent @agent.worker, [workspace: ["work/", "context/"]]
+        result = worker.do "list context"
+        ret result
+`, { agentExecutor: backend });
+
+  const result = await vm.run("main", [], { executionRoot: root });
+  assert.equal(result.output.content, "listed");
 });
 
 test("Pi elevated tool retries a sandbox-blocked operation on the host after mandatory approval", async (t) => {

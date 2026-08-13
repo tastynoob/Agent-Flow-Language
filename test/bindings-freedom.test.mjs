@@ -6,12 +6,28 @@ import test from "node:test";
 
 import {
   AflVm,
+  AflVmError,
   AFL_MESSAGE_ROLE_SCHEMA,
   MockAgentAdapter,
   frag,
   parseAfl,
   validateModule,
 } from "../dist/src/index.js";
+
+test("VM rejects invalid Freedom policy before starting a run", () => {
+  assert.throws(
+    () => AflVm.fromSource(`
+main():
+    entry:
+        ret "unused"
+`, {
+      policy: { freedomLimits: { maxActivationMs: 1 } },
+    }),
+    (error) => error instanceof AflVmError &&
+      error.code === "VM_POLICY_INVALID" &&
+      /maxActivationMs/u.test(error.message),
+  );
+});
 
 test("prompt, input, script, capability, schema, formatter, and external flow bindings compose", async () => {
   const seen = { schemas: [], capability: false, flow: false, formatter: false };

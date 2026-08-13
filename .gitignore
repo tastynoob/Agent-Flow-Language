@@ -6,3 +6,4 @@ __pycache__/
 *.aflir.trace.json
 .env
 .afl/
+/projects/ic-design-workflow/

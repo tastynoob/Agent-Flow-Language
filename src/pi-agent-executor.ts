@@ -129,6 +129,7 @@ export interface PiCodingAgentBindingOptions {
   readonly thinkingReplay?: "include" | "exclude";
   readonly streamOptions?: AgentHarnessStreamOptions;
   readonly activeToolNames?: readonly string[];
+  readonly elevation?: boolean;
   readonly sandbox?: false | PiBubblewrapSandboxOptions;
 }
 
@@ -213,19 +214,24 @@ export function createPiCodingAgentBinding(options: PiCodingAgentBindingOptions)
       }
       const env = await BubblewrapExecutionEnv.create({ ...sandbox, workspace });
       const hostEnv = new NodeExecutionEnv({ cwd: workspace.primary.root });
+      const elevationAvailable = options.elevation !== false;
       return {
         tools: codingTools(),
         toolContext: { env },
-        contextPrompt: sandboxWorkspaceContextPrompt(env.readOnlyRoots, true),
+        contextPrompt: sandboxWorkspaceContextPrompt(workspace, elevationAvailable),
         toolWorkspace: env.cwd,
         toolBoundaries: codingToolBoundaries("sandbox"),
         normalizeToolAction: createCodingToolActionNormalizer(env),
-        elevation: {
-          tools: codingTools(),
-          toolContext: { env: hostEnv },
-          toolWorkspace: workspace.primary.root,
-          normalizeToolAction: createCodingToolActionNormalizer(hostEnv),
-        },
+        ...(elevationAvailable
+          ? {
+              elevation: {
+                tools: codingTools(),
+                toolContext: { env: hostEnv },
+                toolWorkspace: workspace.primary.root,
+                normalizeToolAction: createCodingToolActionNormalizer(hostEnv),
+              },
+            }
+          : {}),
         dispose: () => env.cleanup(),
       };
     },
@@ -1703,7 +1709,7 @@ function workspaceContextPrompt(workspace: AgentWorkspaceSet): string {
   return lines.join("\n");
 }
 
-function sandboxWorkspaceContextPrompt(readOnlyRoots: readonly string[], elevationAvailable: boolean): string {
+function sandboxWorkspaceContextPrompt(workspace: AgentWorkspaceSet, elevationAvailable: boolean): string {
   const lines = [
     "Primary workspace: /workspace",
     "Use /workspace as the working directory for file and command operations.",
@@ -1716,23 +1722,49 @@ function sandboxWorkspaceContextPrompt(readOnlyRoots: readonly string[], elevati
       "Hard policy denials must not be retried through elevation. Use afl_transaction_request only when the user must perform an external action.",
     );
   }
-  if (readOnlyRoots.length > 0) {
+  if (workspace.readOnly.length > 0) {
     lines.push(
       "Read-only workspaces (context only; do not modify them):",
-      ...readOnlyRoots.map((root, index) => `- ${root} (workspace ${index})`),
+      ...workspace.readOnly.map((item, index) => `- ${item.root} -> /readonly/${index}`),
     );
   }
   return lines.join("\n");
 }
 
 function codingTools(): AgentHarnessTool<ExecutionToolContext>[] {
-  return [createReadTool(), createBashTool(), createEditTool(), createWriteTool()];
+  return [createReadTool(), createListTool(), createBashTool(), createEditTool(), createWriteTool()];
+}
+
+const LIST_TOOL_SCHEMA = Type.Object({
+  path: Type.Optional(Type.String({
+    description: "Directory to list, relative to the primary workspace or an absolute sandbox path",
+  })),
+});
+
+function createListTool(): AgentHarnessTool<ExecutionToolContext, typeof LIST_TOOL_SCHEMA> {
+  return {
+    name: "list",
+    label: "list",
+    description: "List the direct children of a directory without modifying it.",
+    parameters: LIST_TOOL_SCHEMA,
+    async execute(_toolCallId, params, signal, _onUpdate, { env }) {
+      const result = await env.listDir(params.path ?? ".", signal);
+      if (!result.ok) throw result.error;
+      const entries = [...result.value]
+        .sort((left, right) => left.name.localeCompare(right.name))
+        .map((entry) => `${entry.kind === "directory" ? "d" : entry.kind === "symlink" ? "l" : "f"}\t${entry.name}\t${entry.size}`);
+      return {
+        content: [{ type: "text", text: entries.length === 0 ? "[empty directory]" : entries.join("\n") }],
+        details: undefined,
+      };
+    },
+  };
 }
 
 function codingToolBoundaries(
   boundary: AgentToolExecutionBoundary,
 ): Readonly<Record<string, AgentToolExecutionBoundary>> {
-  return { read: boundary, bash: boundary, edit: boundary, write: boundary };
+  return { read: boundary, list: boundary, bash: boundary, edit: boundary, write: boundary };
 }
 
 function createCodingToolActionNormalizer(env: ExecutionToolContext["env"]): (
@@ -1742,7 +1774,7 @@ function createCodingToolActionNormalizer(env: ExecutionToolContext["env"]): (
 ) => Promise<Readonly<Record<string, unknown>>> {
   return async (toolName, input, signal) => {
     if (toolName === "bash") return { ...input, cwd: env.cwd, env: {}, inheritEnv: true };
-    if (toolName !== "read" && toolName !== "edit" && toolName !== "write") return input;
+    if (toolName !== "read" && toolName !== "list" && toolName !== "edit" && toolName !== "write") return input;
     if (typeof input.path !== "string") return input;
     const resolved = await env.absolutePath(input.path, signal);
     if (!resolved.ok) throw resolved.error;
