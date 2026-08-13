@@ -1,6 +1,6 @@
 import type { AgentControlToolDescriptor } from "./agent-executor.js";
 import { AflVmError } from "./errors.js";
-import type { ComputeValue, FreedomMode, SourceSpan } from "./ir.js";
+import type { ComputeValue, AgentControlMode, SourceSpan } from "./ir.js";
 
 export interface FreedomPolicyLimits {
   readonly maxControlCalls: number;
@@ -78,7 +78,7 @@ export function parseFreedomLimits(
   return Object.freeze({ ...maximum, minRoutes, maxRoutes });
 }
 
-export function freedomControlTools(mode: FreedomMode): readonly AgentControlToolDescriptor[] {
+export function freedomControlTools(mode: AgentControlMode): readonly AgentControlToolDescriptor[] {
   const tools: AgentControlToolDescriptor[] = [environmentTool()];
   if (mode === "route") tools.push(routeAddTool());
   else tools.push(nodeExecuteTool(), irValidateTool(), irExecuteTool());
@@ -109,7 +109,7 @@ function routeAddTool(): AgentControlToolDescriptor {
   return {
     name: "afl.route.add",
     label: "Add AFL route",
-    description: "Queue one allowed existing Node call in freedom.route. Set node to an allowed Node name; args are positional and must exactly match its signature. Pass a controlled value with {\"ref\":\"param:<name>\"}, using an exact ref supplied by the user or discovered from the environment, or pass arbitrary text with {\"string\":\"...\"}. When the user already supplies the exact Node and refs, call this tool directly without afl.environment.get. A successful call counts toward min_routes/max_routes but starts only after the planner finishes: it returns registration metadata, never the child result. Call once for each desired TaskGroup job; AFL code outside the planner collects results with sync.",
+    description: "Queue one allowed existing Node call in agent.route. Set node to an allowed Node name; args are positional and must exactly match its signature. Pass a controlled value with {\"ref\":\"param:<name>\"}, using an exact ref supplied by the user or discovered from the environment, or pass arbitrary text with {\"string\":\"...\"}. When the user already supplies the exact Node and refs, call this tool directly without afl.environment.get. A successful call counts toward min_routes/max_routes but starts only after the agent finishes: it returns registration metadata, never the child result. Call once for each desired TaskGroup job; AFL code outside the agent collects results with sync.",
     inputSchema: nodeCallSchema(),
   };
 }
@@ -118,7 +118,7 @@ function nodeExecuteTool(): AgentControlToolDescriptor {
   return {
     name: "afl.node.execute",
     label: "Execute AFL Node",
-    description: "Immediately execute one allowed existing Node in freedom.flow and wait for its result. Set node to an allowed Node name; args are positional and must exactly match its signature. Pass a controlled or prior-result value with {\"ref\":\"<exact environment or tool-result ref>\"}, or arbitrary text with {\"string\":\"...\"}. Success returns {ok:true, ref, value}; the returned ref may be used by later control calls. The call counts toward min_routes/max_routes, and child Agent workspaces must not overlap the writer workspace.",
+    description: "Immediately execute one allowed existing Node in agent.flow and wait for its result. Set node to an allowed Node name; args are positional and must exactly match its signature. Pass a controlled or prior-result value with {\"ref\":\"<exact environment or tool-result ref>\"}, or arbitrary text with {\"string\":\"...\"}. Success returns {ok:true, ref, value}; the returned ref may be used by later control calls. The call counts toward min_routes/max_routes, and child Agent workspaces must not overlap the writer workspace.",
     inputSchema: nodeCallSchema(),
   };
 }

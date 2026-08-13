@@ -1,17 +1,17 @@
 main(task):
     entry:
         coder = agent @agent.coder
-        coder.sysprompt "Implement the requested change and return the current complete result."
+        coder.system_prompt "Implement the requested change and return the current complete result."
         code = coder.do task
         jump review
 
     review:
-        review_memory = memory.copy coder.memory
-        reviewer = agent @agent.reviewer,, review_memory
-        reviewer.sysprompt "Review the current result. The first line must be VERDICT: FINISH when it is correct or VERDICT: REVISE when defects remain. After VERDICT: REVISE, return a concrete defect list."
+        review_memory = coder.memory.copy
+        reviewer = agent @agent.reviewer, [memory: review_memory]
+        reviewer.system_prompt "Review the current result. The first line must be VERDICT: FINISH when it is correct or VERDICT: REVISE when defects remain. After VERDICT: REVISE, return a concrete defect list."
         review_result = reviewer.do "Review the latest implementation."
         finish = typescript "const lines = String(args[0]).replaceAll('*', '').replaceAll('_', '').toLowerCase().split(String.fromCharCode(10)).map(line => line.trim()); return lines.some(line => ['finish', 'approved', 'pass'].some(verdict => line === verdict || line.includes('verdict: ' + verdict) || line.includes('status: ' + verdict)))", review_result
-        jump finish, done, revise
+        branch finish, done, revise
 
     revise:
         fix_prompt = prompt "Fix every listed defect", review_result

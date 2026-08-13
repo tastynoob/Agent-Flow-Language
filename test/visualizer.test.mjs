@@ -17,7 +17,7 @@ worker(task):
     # @returns Work report.
     entry:
         worker = agent @agent.worker
-        worker.sysprompt "Execute the task."
+        worker.system_prompt "Execute the task."
         request = prompt "Work request", task
         result = worker.do request
         ret result
@@ -28,7 +28,7 @@ classify(task):
     # @returns Classification report.
     entry:
         accepted = oper task != ""
-        jump accepted, accepted, rejected
+        branch accepted, accepted, rejected
     accepted:
         report = prompt "accepted", task
         ret report
@@ -38,7 +38,7 @@ classify(task):
 main(task):
     entry:
         prepared = prompt "Prepare", task
-        first = call worker, prepared
+        first = call worker(prepared)
         jobs = dispatch [worker(first), classify(first)]
         reports = sync jobs
         ret reports
@@ -76,7 +76,7 @@ test("visual graph expands Freedom candidates as optional scopes", () => {
 route(task):
     entry:
         planner = agent @agent.planner
-        jobs = freedom.route planner, task, [min_routes: 1, max_routes: 2], [worker, classify], [task: task]
+        jobs = planner.route task, [nodes: [worker, classify], params: [task: task], min_routes: 1, max_routes: 2]
         reports = sync jobs
         ret reports
 `;
@@ -101,7 +101,7 @@ test("visual graph stops recursive expansion at a call reference", () => {
   const source = `
 recursive(value):
     entry:
-        next = call recursive, value
+        next = call recursive(value)
         ret next
 `;
   const graph = buildAflVisualGraph(parseAfl(source), source, { entry: "recursive" });
@@ -122,7 +122,7 @@ dependency(task):
 loop(value):
     entry:
         again = oper value != "done"
-        jump again, repeat, done
+        branch again, repeat, done
     repeat:
         value = prompt "Next value", value
         jump entry
@@ -145,11 +145,11 @@ loop(value):
   assert.equal(loopGraph.edges.some((edge) => edge.kind === "loop"), true);
 });
 
-test("visual graph renders one branch node for a multi-way jump table", () => {
+test("visual graph renders one branch node for a multi-way match", () => {
   const source = `
 main(route):
     entry:
-        jump route, ["research": research, "rtl": rtl, "verify": verify], fallback
+        match route, ["research": research, "rtl": rtl, "verify": verify], fallback
     research:
         ret "research"
     rtl:
@@ -174,7 +174,7 @@ test("ELK layout covers graph nodes, edges, scopes, and dynamic variants", async
 route(task):
     entry:
         planner = agent @agent.planner
-        jobs = freedom.route planner, task, [min_routes: 1, max_routes: 2], [worker, classify], [task: task]
+        jobs = planner.route task, [nodes: [worker, classify], params: [task: task], min_routes: 1, max_routes: 2]
         reports = sync jobs
         ret reports
 `;

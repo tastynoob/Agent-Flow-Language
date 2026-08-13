@@ -11,7 +11,7 @@ import {
 
 const agents = new MockAgentAdapter();
 
-test("list dispatch preserves declaration order and batch dispatch uses dynamic count", async () => {
+test("list dispatch preserves declaration order and repeat uses a dynamic count", async () => {
   const started = [];
   const flows = {
     async invoke(request) {
@@ -37,7 +37,7 @@ main():
 main(task):
     entry:
         count = typescript "return Number(args[0])", "3"
-        jobs = dispatch count, @flow.worker, task
+        jobs = repeat count, @flow.worker(task)
         results = sync jobs
         ret results
 `, {
@@ -58,6 +58,29 @@ main(task):
   const batchResult = await batch.run("main", [frag("work")]);
   assert.equal(calls, 3);
   assert.deepEqual(JSON.parse(batchResult.output.content), ["work:1", "work:2", "work:3"]);
+});
+
+test("repeat passes every flow-call argument to each child", async () => {
+  const calls = [];
+  const vm = AflVm.fromSource(`
+main(left, right):
+    entry:
+        jobs = repeat 2, @flow.pair(left, right)
+        results = sync jobs
+        ret results
+`, {
+    agents,
+    flows: {
+      invoke(request) {
+        const values = request.args.map(argumentText);
+        calls.push(values);
+        return frag(values.join(":"));
+      },
+    },
+  });
+  const result = await vm.run("main", [frag("left"), frag("right")]);
+  assert.deepEqual(calls, [["left", "right"], ["left", "right"]]);
+  assert.equal(result.output.content, '["left:right","left:right"]');
 });
 
 test("dispatch child failure aborts unfinished siblings", async () => {
@@ -106,7 +129,7 @@ double(value):
         ret result
 main():
     entry:
-        result = call double, 21
+        result = call double(21)
         ret result
 `, { agents });
   const result = await vm.run();
@@ -117,7 +140,7 @@ test("dispatch enforces the configured total task limit", async () => {
   const vm = AflVm.fromSource(`
 main():
     entry:
-        jobs = dispatch 3, @flow.worker, "task"
+        jobs = repeat 3, @flow.worker("task")
         results = sync jobs
         ret results
 `, {
@@ -128,11 +151,11 @@ main():
   await assert.rejects(vm.run(), { code: "DISPATCH_TASK_LIMIT_EXCEEDED" });
 });
 
-test("jump tables match precomputed scalar routes in declaration order and use default", async () => {
+test("match selects precomputed scalar routes in declaration order and uses default", async () => {
   const vm = AflVm.fromSource(`
 main(route):
     entry:
-        jump route, [1: number, "1": string, "rtl": rtl], fallback
+        match route, [1: number, "1": string, "rtl": rtl], fallback
     number:
         ret "number"
     string:
@@ -149,7 +172,7 @@ main(route):
   assert.equal((await vm.run("main", [frag("rtl")])).output, "rtl");
   assert.equal((await vm.run("main", ["unknown"])).output, "fallback");
 
-  await assert.rejects(vm.run("main", [["rtl"]]), { code: "JUMP_TABLE_SELECTOR_NOT_SCALAR" });
+  await assert.rejects(vm.run("main", [["rtl"]]), { code: "MATCH_SELECTOR_NOT_SCALAR" });
 });
 
 function delay(milliseconds) {

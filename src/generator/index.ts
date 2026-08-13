@@ -256,7 +256,7 @@ export class Agent {
     this.value = owner._declareAgent(symbol, options);
   }
 
-  sysprompt(prompt: AflOperand): this {
+  systemPrompt(prompt: AflOperand): this {
     this.owner._agentSystemPrompt(this, prompt);
     return this;
   }
@@ -406,7 +406,7 @@ export class AflIrBuilder {
 
   emit(instruction: string): this {
     const line = requireLine(instruction, "AFL instruction");
-    if (/^(?:jump|ret|fail)(?:\s|$)/u.test(line)) {
+    if (/^(?:jump|branch|match|ret|fail)(?:\s|$)/u.test(line)) {
       throw new Error("use structured control methods such as when/while/match/ret/fail instead of emitting an AFL terminator directly");
     }
     if (line.startsWith("#")) throw new Error("emit() expects an AFL instruction, not a comment");
@@ -449,7 +449,7 @@ export class AflIrBuilder {
     const thenLabel = `${RESERVED_PREFIX}when_${id}_then`;
     const elseLabel = `${RESERVED_PREFIX}when_${id}_else`;
     const endLabel = `${RESERVED_PREFIX}when_${id}_end`;
-    this.closeActive(`jump ${conditionSource}, ${thenLabel}, ${elseLabel}`);
+    this.closeActive(`branch ${conditionSource}, ${thenLabel}, ${elseLabel}`);
     this.openBlock(thenLabel);
     this.controls.push({
       kind: "when",
@@ -481,7 +481,7 @@ export class AflIrBuilder {
     this.closeActive(`jump ${testLabel}`);
     this.openBlock(testLabel);
     const conditionSource = this._conditionSource(condition);
-    this.closeActive(`jump ${conditionSource}, ${bodyLabel}, ${endLabel}`);
+    this.closeActive(`branch ${conditionSource}, ${bodyLabel}, ${endLabel}`);
     this.openBlock(bodyLabel);
     this.controls.push({ kind: "while", testLabel, endLabel });
     return this;
@@ -547,7 +547,7 @@ export class AflIrBuilder {
         control.fallsThrough = this.closeFallthrough(control.endLabel) || control.fallsThrough;
       }
       const cases = control.cases.map((entry) => `${serializeCompute(entry.value)}: ${entry.label}`).join(", ");
-      control.dispatch.terminator = `jump ${control.selector}, [${cases}], ${control.defaultLabel}`;
+      control.dispatch.terminator = `match ${control.selector}, [${cases}], ${control.defaultLabel}`;
       if (control.fallsThrough) this.openBlock(control.endLabel);
       return this;
     }
@@ -664,7 +664,7 @@ export class AflIrBuilder {
     const operands = args.map((argument) => this._operandSource(argument));
     this._emitAssignment(
       destination,
-      `call ${node.name}${operands.length === 0 ? "" : `, ${operands.join(", ")}`}`,
+      `call ${node.name}(${operands.join(", ")})`,
     );
     return new AflValue(this, this._currentScope(), destination);
   }
@@ -680,18 +680,21 @@ export class AflIrBuilder {
         ? options.workspace._toAfl(this, this._currentScope())
         : serializeCompute(typeof options.workspace === "string" ? options.workspace : [...options.workspace]);
     const memory = options.memory?._toAfl(this, this._currentScope());
-    let operands = symbol;
-    if (workspace !== undefined) operands += `, ${workspace}`;
-    else if (memory !== undefined) operands += ",";
-    if (memory !== undefined) operands += `, ${memory}`;
-    this._emitAssignment(destination, `agent ${operands}`);
+    const optionEntries = [
+      ...(workspace === undefined ? [] : [`workspace: ${workspace}`]),
+      ...(memory === undefined ? [] : [`memory: ${memory}`]),
+    ];
+    this._emitAssignment(
+      destination,
+      `agent ${symbol}${optionEntries.length === 0 ? "" : `, [${optionEntries.join(", ")}]`}`,
+    );
     return new AflValue(this, this._currentScope(), destination);
   }
 
   /** @internal */
   _agentSystemPrompt(agent: Agent, prompt: AflOperand): void {
     const handle = agent.value._toAfl(this, this._currentScope());
-    this.appendInstruction(`${handle}.sysprompt ${this._operandSource(prompt)}`);
+    this.appendInstruction(`${handle}.system_prompt ${this._operandSource(prompt)}`);
   }
 
   /** @internal */
@@ -702,12 +705,14 @@ export class AflIrBuilder {
     }
     if (options.schema !== undefined) requireSchemaSymbol(options.schema, "Agent schema");
     const destination = options.name === undefined ? this.allocateValue("result") : this.claimName(options.name);
-    const operands = [
-      ...(options.role === undefined ? [] : [options.role]),
-      this._operandSource(input),
-      ...(options.schema === undefined ? [] : [options.schema]),
+    const optionEntries = [
+      ...(options.role === undefined ? [] : [`role: ${options.role}`]),
+      ...(options.schema === undefined ? [] : [`schema: ${options.schema}`]),
     ];
-    this._emitAssignment(destination, `${handle}.do ${operands.join(", ")}`);
+    this._emitAssignment(
+      destination,
+      `${handle}.do ${this._operandSource(input)}${optionEntries.length === 0 ? "" : `, [${optionEntries.join(", ")}]`}`,
+    );
     return new AflValue(this, this._currentScope(), destination);
   }
 

@@ -14,7 +14,7 @@ afl visualize workflow.afl --entry main --output artifacts/workflow.html
 
 ## 图节点如何划分
 
-- 每次 `agent.do`、`fork`、`freedom.route` 或 `freedom.flow` 的 Agent activation 单独显示为一个模型调用节点。
+- 每次 `agent.do`、`fork`、`agent.route` 或 `agent.flow` 的 Agent activation 单独显示为一个模型调用节点。
 - 带条件的 `jump` 显示为分支节点，保留 `true`、`false` 和循环方向；有序跳转表也只显示为一个分支节点，各 case 与 `default` 标在对应路径上。
 - 普通计算、Prompt、Agent 配置、Memory、capability、dispatch、sync、输入、返回和失败不占用图节点，而是压缩到模型或分支之间的计算路径上。
 - 本地 `call`、本地 dispatch target 以及 Freedom 候选 Node 默认原地展开，并用 scope 边框保留调用边界。递归调用或超过展开深度时在计算路径中保留调用引用，避免生成无限图。

@@ -108,12 +108,12 @@ const SINGULAR_OPERATIONS = new Set<AflInstruction["op"]>([
   "agent.do",
   "input",
   "call",
-  "dispatch.list",
-  "dispatch.batch",
+  "dispatch",
+  "repeat",
   "sync",
   "fork",
-  "freedom.route",
-  "freedom.flow",
+  "agent.route",
+  "agent.flow",
 ]);
 
 export function buildAflVisualGraph(
@@ -194,27 +194,35 @@ class VisualGraphBuilder {
     for (const [blockName, built] of blocks) {
       const terminator = built.block.terminator;
       if (terminator.op === "jump") {
+        const target = blocks.get(terminator.target);
+        if (target !== undefined) {
+          this.connectMany(
+            built.exits,
+            target.entries,
+            this.isBackEdge(blockName, terminator.target, blockIndexes) ? "loop" : "control",
+            "",
+          );
+        }
+      } else if (terminator.op === "branch") {
         const trueBlock = blocks.get(terminator.trueTarget);
         if (trueBlock !== undefined) {
           this.connectMany(
             built.exits,
             trueBlock.entries,
-            this.isBackEdge(blockName, terminator.trueTarget, blockIndexes) ? "loop" : terminator.condition === undefined ? "control" : "branch",
-            terminator.condition === undefined ? "" : "true",
+            this.isBackEdge(blockName, terminator.trueTarget, blockIndexes) ? "loop" : "branch",
+            "true",
           );
         }
-        if (terminator.falseTarget !== undefined) {
-          const falseBlock = blocks.get(terminator.falseTarget);
-          if (falseBlock !== undefined) {
-            this.connectMany(
-              built.exits,
-              falseBlock.entries,
-              this.isBackEdge(blockName, terminator.falseTarget, blockIndexes) ? "loop" : "branch",
-              "false",
-            );
-          }
+        const falseBlock = blocks.get(terminator.falseTarget);
+        if (falseBlock !== undefined) {
+          this.connectMany(
+            built.exits,
+            falseBlock.entries,
+            this.isBackEdge(blockName, terminator.falseTarget, blockIndexes) ? "loop" : "branch",
+            "false",
+          );
         }
-      } else if (terminator.op === "jump.table") {
+      } else if (terminator.op === "match") {
         for (const entry of terminator.cases) {
           const target = blocks.get(entry.target);
           if (target === undefined) continue;
@@ -321,9 +329,9 @@ class VisualGraphBuilder {
     let decision: string | undefined;
     let returns: readonly string[] = [];
 
-    if (terminator.op === "jump.table" || terminator.op === "jump" && terminator.condition !== undefined) {
+    if (terminator.op === "match" || terminator.op === "branch") {
       decision = this.addNode(scope, sourceNode.name, block.name, "decision", {
-        title: terminator.op === "jump.table" ? `Branch · ${terminator.cases.length + 1} paths` : "Branch",
+        title: terminator.op === "match" ? `Branch · ${terminator.cases.length + 1} paths` : "Branch",
         subtitle: this.sourceText(terminator.span),
         operations: [this.sourceText(terminator.span)],
         span: terminator.span,
@@ -403,10 +411,10 @@ class VisualGraphBuilder {
       }
       case "call":
         return this.buildCall(sourceNode, block, instruction.target.name, instruction.target.kind, instruction.span, index, scope, depth, callStack, "call");
-      case "dispatch.list":
+      case "dispatch":
         return this.buildDispatch(sourceNode, block, instruction.calls, instruction.span, index, scope, depth, callStack, instruction.dst);
-      case "dispatch.batch":
-        return this.buildBatchDispatch(sourceNode, block, instruction, index, scope, depth, callStack);
+      case "repeat":
+        return this.buildRepeat(sourceNode, block, instruction, index, scope, depth, callStack);
       case "sync": {
         const id = this.addNode(scope, sourceNode.name, block.name, "join", {
           title: `Join · ${instruction.taskGroup.name}`,
@@ -416,11 +424,11 @@ class VisualGraphBuilder {
         });
         return unit(index, id);
       }
-      case "freedom.route":
-      case "freedom.flow": {
-        const mode = instruction.op === "freedom.route" ? "dynamic route" : "dynamic flow";
+      case "agent.route":
+      case "agent.flow": {
+        const mode = instruction.op === "agent.route" ? "dynamic route" : "dynamic flow";
         const id = this.addNode(scope, sourceNode.name, block.name, "model", {
-          title: `${instruction.planner.name} · ${mode}`,
+          title: `${instruction.agent.name} · ${mode}`,
           subtitle: `${instruction.nodes.length} candidate Nodes`,
           operations: [this.sourceText(instruction.span)],
           span: instruction.span,
@@ -434,7 +442,7 @@ class VisualGraphBuilder {
               scope,
               depth,
               callStack,
-              `candidate of ${instruction.planner.name}`,
+              `candidate of ${instruction.agent.name}`,
               true,
             );
             this.connectMany([id], expansion.entries, "dynamic", "may route");
@@ -446,7 +454,7 @@ class VisualGraphBuilder {
           indexes: [index],
           entries: [id],
           exits: [id],
-          ...(instruction.op === "freedom.route" ? { taskChildren: childReturns } : {}),
+          ...(instruction.op === "agent.route" ? { taskChildren: childReturns } : {}),
         };
       }
       default:
@@ -471,7 +479,7 @@ class VisualGraphBuilder {
     } else if (only?.op === "agent") {
       title = `Prepare · ${only.dst}`;
       subtitle = only.agent.name;
-    } else if (instructions.every((instruction) => instruction.op === "agent" || instruction.op === "agent.sysprompt")) {
+    } else if (instructions.every((instruction) => instruction.op === "agent" || instruction.op === "agent.system_prompt")) {
       title = "Agent setup";
       subtitle = `${instructions.length} operations`;
     }
@@ -542,23 +550,23 @@ class VisualGraphBuilder {
     return { indexes: [index], entries: [split], exits: [split], taskChildren: returns };
   }
 
-  private buildBatchDispatch(
+  private buildRepeat(
     sourceNode: AflNode,
     block: AflBlock,
-    instruction: Extract<AflInstruction, { readonly op: "dispatch.batch" }>,
+    instruction: Extract<AflInstruction, { readonly op: "repeat" }>,
     index: number,
     scope: AflVisualScope,
     depth: number,
     callStack: readonly string[],
   ): InstructionUnit {
     const split = this.addNode(scope, sourceNode.name, block.name, "parallel", {
-      title: "Parallel batch",
+      title: "Parallel repeat",
       subtitle: `${instruction.target.name} · runtime count`,
       operations: [this.sourceText(instruction.span)],
       span: instruction.span,
     });
     const child = instruction.target.kind === "local"
-      ? this.expandCallTarget(instruction.target.name, scope, depth, callStack, "batch template", scope.optional)
+      ? this.expandCallTarget(instruction.target.name, scope, depth, callStack, "repeat template", scope.optional)
       : this.externalExpansion(sourceNode, block, instruction.target.name, instruction.span, scope);
     this.connectMany([split], child.entries, "parallel", "0..N");
     return { indexes: [index], entries: [split], exits: [split], taskChildren: child.returns };

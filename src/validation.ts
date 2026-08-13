@@ -17,7 +17,6 @@ import type {
   FlowCallExpr,
   NameExpr,
   OperExpr,
-  RecordExpr,
   SourceSpan,
   ValueExpr,
 } from "./ir.js";
@@ -280,15 +279,6 @@ function validateBlock(
     }
     validateInstructionKinds(module, instruction, kinds, diagnostics);
     validateCall(module, instruction, node, nodes, diagnostics);
-    if (instruction.op === "fork" && instruction.actionReceiver !== instruction.dst) {
-      add(
-        diagnostics,
-        module,
-        instruction.span,
-        "FORK_RECEIVER_MISMATCH",
-        `fork startup receiver '${instruction.actionReceiver}' must match destination '${instruction.dst}'`,
-      );
-    }
   });
 
   if (hasDependencyCycle(buildInstructionDependencies(block))) {
@@ -304,17 +294,17 @@ function validateBlock(
   for (const reference of terminatorReferences(block.terminator)) {
     validateReference(module, reference, available, kinds, diagnostics);
   }
-  if (block.terminator.op === "jump" && block.terminator.condition !== undefined) {
-    expectKind(module, block.terminator.condition, kinds, ["compute", "unknown"], "jump condition", diagnostics);
-  } else if (block.terminator.op === "jump.table") {
-    expectKind(module, block.terminator.selector, kinds, ["compute", "frag", "unknown"], "jump table selector", diagnostics);
+  if (block.terminator.op === "branch") {
+    expectKind(module, block.terminator.condition, kinds, ["compute", "unknown"], "branch condition", diagnostics);
+  } else if (block.terminator.op === "match") {
+    expectKind(module, block.terminator.selector, kinds, ["compute", "frag", "unknown"], "match selector", diagnostics);
     if (block.terminator.selector.kind === "list" || block.terminator.selector.kind === "record") {
       add(
         diagnostics,
         module,
         block.terminator.selector.span,
-        "JUMP_TABLE_SELECTOR_NOT_SCALAR",
-        "jump table selector must be null, boolean, number, string, Frag, or an unknown compute value",
+        "MATCH_SELECTOR_NOT_SCALAR",
+        "match selector must be null, boolean, number, string, Frag, or an unknown compute value",
       );
     }
     if (block.terminator.cases.length === 0) {
@@ -322,27 +312,27 @@ function validateBlock(
         diagnostics,
         module,
         block.terminator.span,
-        "JUMP_TABLE_EMPTY",
-        "jump table requires at least one case",
+        "MATCH_EMPTY",
+        "match requires at least one case",
       );
     }
     const caseValues: Array<null | boolean | number | string> = [];
     for (const entry of block.terminator.cases) {
-      if (!isJumpTableCaseValue(entry.value)) {
+      if (!isMatchCaseValue(entry.value)) {
         add(
           diagnostics,
           module,
           block.terminator.span,
-          "JUMP_TABLE_CASE_INVALID",
-          "jump table case values must be finite null, boolean, number, or string literals",
+          "MATCH_CASE_INVALID",
+          "match case values must be finite null, boolean, number, or string literals",
         );
       } else if (caseValues.some((value) => value === entry.value)) {
         add(
           diagnostics,
           module,
           block.terminator.span,
-          "JUMP_TABLE_CASE_DUPLICATE",
-          `jump table repeats case ${JSON.stringify(entry.value)}`,
+          "MATCH_CASE_DUPLICATE",
+          `match repeats case ${JSON.stringify(entry.value)}`,
         );
       } else {
         caseValues.push(entry.value);
@@ -351,7 +341,7 @@ function validateBlock(
   }
 }
 
-function isJumpTableCaseValue(value: unknown): value is null | boolean | number | string {
+function isMatchCaseValue(value: unknown): value is null | boolean | number | string {
   return value === null || typeof value === "boolean" || typeof value === "string" ||
     typeof value === "number" && Number.isFinite(value);
 }
@@ -389,14 +379,14 @@ function validateInstructionKinds(
       }
       if (instruction.memory !== undefined) expectNameKind(module, instruction.memory, kinds, ["memory", "unknown"], "Agent Memory", diagnostics);
       break;
-    case "agent.sysprompt":
+    case "agent.system_prompt":
       expectNameKind(module, instruction.agent, kinds, ["agent", "unknown"], "system prompt receiver", diagnostics);
       break;
     case "agent.do":
       expectNameKind(module, instruction.agent, kinds, ["agent", "unknown"], "Agent work receiver", diagnostics);
       break;
-    case "dispatch.batch":
-      expectKind(module, instruction.count, kinds, ["compute", "unknown"], "dispatch count", diagnostics);
+    case "repeat":
+      expectKind(module, instruction.count, kinds, ["compute", "unknown"], "repeat count", diagnostics);
       break;
     case "sync":
       expectNameKind(module, instruction.taskGroup, kinds, ["taskGroup", "unknown"], "sync operand", diagnostics);
@@ -410,19 +400,22 @@ function validateInstructionKinds(
     case "memory.copy":
       expectNameKind(module, instruction.memory, kinds, ["memory", "unknown"], "memory.copy source", diagnostics);
       break;
-    case "memory.apply":
-      expectNameKind(module, instruction.sourceAgent, kinds, ["agent", "unknown"], "memory.apply source", diagnostics);
-      expectNameKind(module, instruction.memory, kinds, ["memory", "unknown"], "memory.apply Memory", diagnostics);
+    case "agent.with_memory":
+      expectNameKind(module, instruction.agent, kinds, ["agent", "unknown"], "with_memory receiver", diagnostics);
+      expectNameKind(module, instruction.memory, kinds, ["memory", "unknown"], "with_memory Memory", diagnostics);
       break;
-    case "freedom.route":
-    case "freedom.flow":
-      expectNameKind(module, instruction.planner, kinds, ["agent", "unknown"], "freedom planner", diagnostics);
-      validateFreedomConstraint(module, instruction.constraint, diagnostics);
-      for (const value of Object.values(instruction.constraint.entries)) {
-        expectKind(module, value, kinds, ["compute", "unknown"], "Freedom constraint", diagnostics);
+    case "agent.route":
+    case "agent.flow":
+      expectNameKind(module, instruction.agent, kinds, ["agent", "unknown"], "Agent control receiver", diagnostics);
+      validateAgentControlLimits(module, instruction.minRoutes, instruction.maxRoutes, instruction.span, diagnostics);
+      if (instruction.minRoutes !== undefined) {
+        expectKind(module, instruction.minRoutes, kinds, ["compute", "unknown"], "min_routes", diagnostics);
+      }
+      if (instruction.maxRoutes !== undefined) {
+        expectKind(module, instruction.maxRoutes, kinds, ["compute", "unknown"], "max_routes", diagnostics);
       }
       for (const value of Object.values(instruction.params.entries)) {
-        expectKind(module, value, kinds, ["frag", "compute", "unknown"], "Freedom controlled param", diagnostics);
+        expectKind(module, value, kinds, ["frag", "compute", "unknown"], "Agent controlled param", diagnostics);
       }
       break;
     default:
@@ -430,25 +423,13 @@ function validateInstructionKinds(
   }
 }
 
-function validateFreedomConstraint(
+function validateAgentControlLimits(
   module: AflModule,
-  constraint: RecordExpr,
+  minimum: ValueExpr | undefined,
+  maximum: ValueExpr | undefined,
+  span: SourceSpan,
   diagnostics: AflDiagnostic[],
 ): void {
-  const allowed = new Set(["min_routes", "max_routes"]);
-  for (const field of Object.keys(constraint.entries)) {
-    if (!allowed.has(field)) {
-      add(
-        diagnostics,
-        module,
-        constraint.entries[field]!.span,
-        "FREEDOM_CONSTRAINT_INVALID",
-        `unknown Freedom constraint '${field}'`,
-      );
-    }
-  }
-  const minimum = constraint.entries.min_routes;
-  const maximum = constraint.entries.max_routes;
   if (minimum?.kind === "literal" &&
       (typeof minimum.value !== "number" || !Number.isSafeInteger(minimum.value) || minimum.value < 0)) {
     add(
@@ -456,7 +437,7 @@ function validateFreedomConstraint(
       module,
       minimum.span,
       "FREEDOM_CONSTRAINT_INVALID",
-      "Freedom constraint 'min_routes' must be a non-negative integer",
+      "min_routes must be a non-negative integer",
     );
   }
   if (maximum?.kind === "literal" &&
@@ -466,7 +447,7 @@ function validateFreedomConstraint(
       module,
       maximum.span,
       "FREEDOM_CONSTRAINT_INVALID",
-      "Freedom constraint 'max_routes' must be a positive integer",
+      "max_routes must be a positive integer",
     );
   }
   if (minimum?.kind === "literal" && typeof minimum.value === "number" &&
@@ -476,9 +457,9 @@ function validateFreedomConstraint(
     add(
       diagnostics,
       module,
-      constraint.span,
+      span,
       "FREEDOM_CONSTRAINT_INVALID",
-      `Freedom constraint min_routes=${minimum.value} cannot exceed max_routes=${maximum.value}`,
+      `min_routes=${minimum.value} cannot exceed max_routes=${maximum.value}`,
     );
   }
 }
@@ -526,10 +507,10 @@ function validateCall(
   const calls: FlowCallExpr[] = [];
   if (instruction.op === "call") {
     calls.push({ target: instruction.target, args: instruction.args, span: instruction.span });
-  } else if (instruction.op === "dispatch.list") {
+  } else if (instruction.op === "dispatch") {
     calls.push(...instruction.calls);
-  } else if (instruction.op === "dispatch.batch") {
-    calls.push({ target: instruction.target, args: [instruction.task], span: instruction.span });
+  } else if (instruction.op === "repeat") {
+    calls.push({ target: instruction.target, args: instruction.args, span: instruction.span });
   }
   for (const call of calls) {
     if (call.target.kind === "external") continue;
@@ -549,7 +530,7 @@ function validateCall(
       add(diagnostics, module, call.span, "CALL_INVALID", "recursive call target has no blocks");
     }
   }
-  if (instruction.op === "freedom.route" || instruction.op === "freedom.flow") {
+  if (instruction.op === "agent.route" || instruction.op === "agent.flow") {
     const seen = new Set<string>();
     for (const candidate of instruction.nodes) {
       if (seen.has(candidate.name)) {
@@ -573,7 +554,7 @@ function validateCall(
         );
       }
     }
-    if (instruction.op === "freedom.flow") {
+    if (instruction.op === "agent.flow") {
       const agents = new Set<string>();
       for (const candidate of instruction.agents) {
         if (agents.has(candidate.name)) {
@@ -607,21 +588,21 @@ function validateFreedomWorkspaceWarnings(
   }
   for (const block of currentNode.blocks) {
     for (const instruction of block.instructions) {
-      if (instruction.op !== "freedom.route" && instruction.op !== "freedom.flow") continue;
-      const plannerWorkspace = plannerWorkspaces.get(instruction.planner.name);
-      if (plannerWorkspace === undefined) continue;
+      if (instruction.op !== "agent.route" && instruction.op !== "agent.flow") continue;
+      const agentWorkspace = plannerWorkspaces.get(instruction.agent.name);
+      if (agentWorkspace === undefined) continue;
       for (const candidate of instruction.nodes) {
         const target = nodes.get(candidate.name);
         if (target === undefined) continue;
         const overlaps = collectStaticAgentWorkspaces(target, nodes, new Set())
-          .find((workspace) => staticWorkspaceConflict(workspace, plannerWorkspace));
+          .find((workspace) => staticWorkspaceConflict(workspace, agentWorkspace));
         if (overlaps === undefined) continue;
         addWarning(
           diagnostics,
           module,
           instruction.span,
           "FREEDOM_WORKSPACE_OVERLAP",
-          `Freedom Node '${candidate.name}' contains an Agent Workspace that may overlap planner '${instruction.planner.name}'`,
+          `Agent control Node '${candidate.name}' contains an Agent Workspace that may overlap receiver '${instruction.agent.name}'`,
         );
       }
     }
@@ -655,10 +636,10 @@ function localInstructionTargets(instruction: AflInstruction): string[] {
   if (instruction.op === "call") {
     return instruction.target.kind === "local" ? [instruction.target.name] : [];
   }
-  if (instruction.op === "dispatch.list") {
+  if (instruction.op === "dispatch") {
     return instruction.calls.filter((call) => call.target.kind === "local").map((call) => call.target.name);
   }
-  if (instruction.op === "dispatch.batch") {
+  if (instruction.op === "repeat") {
     return instruction.target.kind === "local" ? [instruction.target.name] : [];
   }
   return [];
@@ -829,7 +810,7 @@ function validateMemoryBindings(
     for (const instruction of block.instructions) {
       const memory = instruction.op === "agent"
         ? instruction.memory
-        : instruction.op === "memory.apply"
+        : instruction.op === "agent.with_memory"
           ? instruction.memory
           : undefined;
       if (memory === undefined) continue;
@@ -865,14 +846,14 @@ function validateMemoryBindings(
 function instructionResultKind(instruction: AflInstruction): ValueKind {
   switch (instruction.op) {
     case "agent":
-    case "memory.apply":
+    case "agent.with_memory":
     case "fork":
       return "agent";
     case "memory.copy":
       return "memory";
-    case "dispatch.list":
-    case "dispatch.batch":
-    case "freedom.route":
+    case "dispatch":
+    case "repeat":
+    case "agent.route":
       return "taskGroup";
     case "oper":
     case "script":
@@ -884,16 +865,15 @@ function instructionResultKind(instruction: AflInstruction): ValueKind {
 
 function isTaskGroupProducer(
   instruction: AflInstruction,
-): instruction is Extract<AflInstruction, { readonly op: "dispatch.list" | "dispatch.batch" | "freedom.route" }> {
-  return instruction.op === "dispatch.list" || instruction.op === "dispatch.batch" ||
-    instruction.op === "freedom.route";
+): instruction is Extract<AflInstruction, { readonly op: "dispatch" | "repeat" | "agent.route" }> {
+  return instruction.op === "dispatch" || instruction.op === "repeat" ||
+    instruction.op === "agent.route";
 }
 
 function terminatorReferences(terminator: AflTerminator): NameExpr[] {
-  if (terminator.op === "jump") {
-    return terminator.condition === undefined ? [] : valueReferences(terminator.condition);
-  }
-  if (terminator.op === "jump.table") return valueReferences(terminator.selector);
+  if (terminator.op === "jump") return [];
+  if (terminator.op === "branch") return valueReferences(terminator.condition);
+  if (terminator.op === "match") return valueReferences(terminator.selector);
   if (terminator.op === "ret") {
     return terminator.value === undefined ? [] : valueReferences(terminator.value);
   }
@@ -901,12 +881,9 @@ function terminatorReferences(terminator: AflTerminator): NameExpr[] {
 }
 
 function terminatorTargets(terminator: AflTerminator): readonly string[] {
-  if (terminator.op === "jump") {
-    return terminator.falseTarget === undefined
-      ? [terminator.trueTarget]
-      : [terminator.trueTarget, terminator.falseTarget];
-  }
-  if (terminator.op === "jump.table") {
+  if (terminator.op === "jump") return [terminator.target];
+  if (terminator.op === "branch") return [terminator.trueTarget, terminator.falseTarget];
+  if (terminator.op === "match") {
     return [...terminator.cases.map((entry) => entry.target), terminator.defaultTarget];
   }
   return [];

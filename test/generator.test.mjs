@@ -35,7 +35,7 @@ test("linear while/when control flow executes without callback nesting", async (
   assert.equal(result.output, 4);
 });
 
-test("linear match control generates and executes an ordered jump table", async () => {
+test("linear match control generates and executes ordered cases", async () => {
   const builder = new AflIrBuilder({ sourceName: "match.generated.afl" });
   const main = builder.node("main", ["route"]);
 
@@ -51,7 +51,7 @@ test("linear match control generates and executes an ordered jump table", async 
   const source = builder.build();
   assert.match(
     source,
-    /jump route, \["research": __afl_match_1_case_1, "rtl": __afl_match_1_case_2\], __afl_match_1_default/u,
+    /match route, \["research": __afl_match_1_case_1, "rtl": __afl_match_1_case_2\], __afl_match_1_default/u,
   );
   const vm = AflVm.fromSource(source, {});
   assert.equal((await vm.run("main", ["rtl"])).output, "rtl-result");
@@ -90,7 +90,7 @@ test("Agent values expose lazy text conditions for when/otherwise", () => {
     returns: "The completed result.",
   });
   const coder = builder.agent("@agent.coder", { name: "coder", workspace: "work/coder" });
-  coder.sysprompt("Implement the task carefully.");
+  coder.systemPrompt("Implement the task carefully.");
   const result = coder.do(main.params.task, { name: "result" });
 
   builder.when(result.startsWith("DONE:"));
@@ -104,7 +104,7 @@ test("Agent values expose lazy text conditions for when/otherwise", () => {
     source,
     /condition_1 = typescript "return String\(args\[0\]\)\.startsWith\(String\(args\[1\]\)\)", result, "DONE:"/u,
   );
-  assert.match(source, /coder = agent @agent\.coder, "work\/coder"/u);
+  assert.match(source, /coder = agent @agent\.coder, \[workspace: "work\/coder"\]/u);
   assert.match(source, /result = coder\.do task/u);
   assert.deepEqual(parseAfl(source).nodes[0].documentation, {
     description: "Run one coding task.",
@@ -123,7 +123,7 @@ test("node references generate validated local calls", async () => {
   builder.ret(result);
 
   const source = builder.build();
-  assert.match(source, /result_1 = call echo, input/u);
+  assert.match(source, /result_1 = call echo\(input\)/u);
   const execution = await AflVm.fromSource(source, {}).run("main", [frag("hello")]);
   assert.deepEqual(execution.output, frag("hello"));
 });
@@ -132,7 +132,7 @@ test("Agent options preserve role, schema, and an explicit Memory", () => {
   const builder = new AflIrBuilder();
   builder.node("main", ["task"]);
   const seed = builder.agent("@agent.seed", { name: "seed" });
-  const memory = builder.assign("review_memory", "memory.copy seed.memory");
+  const memory = builder.assign("review_memory", "seed.memory.copy");
   const reviewer = new Agent(builder, "@agent.reviewer", {
     name: "reviewer",
     memory,
@@ -145,8 +145,8 @@ test("Agent options preserve role, schema, and an explicit Memory", () => {
   builder.ret(result);
 
   const source = builder.build();
-  assert.match(source, /reviewer = agent @agent\.reviewer,, review_memory/u);
-  assert.match(source, /result = reviewer\.do @role\.review, task, @schema\.Review/u);
+  assert.match(source, /reviewer = agent @agent\.reviewer, \[memory: review_memory\]/u);
+  assert.match(source, /result = reviewer\.do task, \[role: @role\.review, schema: @schema\.Review\]/u);
 
   const invalid = new AflIrBuilder();
   invalid.node("main");

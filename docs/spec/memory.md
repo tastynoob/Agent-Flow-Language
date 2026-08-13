@@ -50,10 +50,10 @@ result = coder.do prompt
 3. 把 Coder 输出以 `assistant` role append 到 `coder.memory`；
 4. 返回包装相同输出字符串的 role-free Frag `result`。
 
-显式 role 写在输入 Frag 前：
+显式 role 写在 `do` options 中：
 
 ```text
-result = coder.do tool, tool_result
+result = coder.do tool_result, [role: tool]
 ```
 
 Agent 输出在来源 Memory 中是 assistant Message，但返回 Frag 不带 `assistant`。因此它进入另一个 Agent 时可以重新解释为 `user`、`tool` 或其他 role。
@@ -63,7 +63,7 @@ Agent 输出在来源 Memory 中是 assistant Message，但返回 Frag 不带 `a
 ## 4. `memory.append`
 
 ```text
-memory.append target_memory, role, frag
+target_memory.append role, frag
 ```
 
 该指令把以下 Message 加到目标 Memory 尾部：
@@ -80,9 +80,9 @@ Role 是必需的，因为 Frag 自身没有 role。
 同一个 Frag 可以进入多个 Memory，并使用不同 role：
 
 ```text
-memory.append coder.memory, user, review_result
-memory.append analyst.memory, tool, review_result
-memory.append archive.memory, assistant, review_result
+coder.memory.append user, review_result
+analyst.memory.append tool, review_result
+archive.memory.append assistant, review_result
 ```
 
 这些操作不会修改原 Frag。
@@ -90,7 +90,7 @@ memory.append archive.memory, assistant, review_result
 ## 5. `memory.copy`
 
 ```text
-review_memory = memory.copy coder.memory
+review_memory = coder.memory.copy
 ```
 
 `memory.copy` 创建一份独立 Memory，并按顺序复制 source 中已经完成的 Message：
@@ -104,17 +104,17 @@ Copy 不需要 role operand。它处理的是已经带 role 的完整 Message �
 
 执行器支持 session export 时，copy 还会携带一份 flow 不可读取的 continuation。Continuation 与复制时的 Message revision 绑定；source 后续执行不会改变既有 copy 所指向的位置。它不是 Message，也不影响 Memory 的可移植内容。
 
-## 6. `memory.apply`
+## 6. `with_memory`
 
 ```text
-branch = memory.apply source_agent, branch_memory
+branch = source_agent.with_memory branch_memory
 ```
 
-`memory.apply` 使用 source Agent 的 symbol 与 system prompt 创建新的 Agent，并把指定 Memory 绑定为它的 working Memory。它不修改 source Agent，也不隐式复制 Memory。传入的 Memory 已有 owner 时，VM 报告 `MEMORY_ALREADY_BOUND`。需要隔离时先执行 `memory.copy`：
+`with_memory` 使用 source Agent 的 symbol 与 system prompt 创建新的 Agent，并把指定 Memory 绑定为它的 working Memory。它不修改 source Agent，也不隐式复制 Memory。传入的 Memory 已有 owner 时，VM 报告 `MEMORY_ALREADY_BOUND`。需要隔离时先执行 Memory `copy`：
 
 ```text
-branch_memory = memory.copy source_agent.memory
-branch = memory.apply source_agent, branch_memory
+branch_memory = source_agent.memory.copy
+branch = source_agent.with_memory branch_memory
 ```
 
 如果 Memory 的 live checkpoint 与 source Agent 配置兼容，新 Agent 首次执行时直接 fork 原生 session；否则由同名 executor 从持久化 continuation 为目标 Agent binding 重建独立 session。只有不存在 continuation 时才从 canonical Message 重建；continuation 属于其他 executor 时显式失败。
@@ -122,19 +122,19 @@ branch = memory.apply source_agent, branch_memory
 ## 7. System Prompt
 
 ```text
-coder.sysprompt @prompt.coder
+coder.system_prompt @prompt.coder
 ```
 
-`sysprompt` 设置 Agent handle 上单独保存的 system prompt，不会向 `messages` 追加 Message。后续 Agent 工作通过 `AgentExecutionRequest.systemPrompt` 接收该值。
+`system_prompt` 设置 Agent handle 上单独保存的 system prompt，不会向 `messages` 追加 Message。后续 Agent 工作通过 `AgentExecutionRequest.systemPrompt` 接收该值。
 
 设置 Reviewer system prompt 不会修改被复制的 Coder Memory，也不会反向影响 Coder 配置。
 
 ## 8. Contextual Review
 
 ```text
-review_memory = memory.copy coder.memory
-reviewer = agent @agent.reviewer,, review_memory
-reviewer.sysprompt @prompt.reviewer
+review_memory = coder.memory.copy
+reviewer = agent @agent.reviewer, [memory: review_memory]
+reviewer.system_prompt @prompt.reviewer
 review_result = reviewer.do review_prompt
 ```
 
@@ -160,7 +160,7 @@ fixed = coder.do fix_prompt
 也可以先显式写入 Memory：
 
 ```text
-memory.append coder.memory, user, review_result
+coder.memory.append user, review_result
 fix_command = prompt @prompt.fix_current_defects
 fixed = coder.do fix_command
 ```
@@ -184,10 +184,10 @@ Reviewer 只接收显式 Frag，不继承 Coder Memory。这可以减少历史�
 不同 Agent 默认拥有不同 Memory；省略 Workspace 时，每次 Agent allocation 也会在 `.afl/tmpworkspace/<run-id>/` 下获得独立主工作区，因此互不依赖的 Agent 可以并行。需要固定目录或共享只读代码时，可以显式指定互不重叠的主工作区和公共只读工作区；要分发相同上下文时可以分别 copy：
 
 ```text
-security_memory = memory.copy coder.memory
-quality_memory = memory.copy coder.memory
-security = agent @agent.security, "workers/security/", security_memory
-quality = agent @agent.quality, "workers/quality/", quality_memory
+security_memory = coder.memory.copy
+quality_memory = coder.memory.copy
+security = agent @agent.security, [workspace: "workers/security/", memory: security_memory]
+quality = agent @agent.quality, [workspace: "workers/quality/", memory: quality_memory]
 ```
 
 两个 Reviewer 从相同 Message 序列开始，但各自写入独立 Memory。
@@ -197,11 +197,11 @@ quality = agent @agent.quality, "workers/quality/", quality_memory
 需要从同一个 Agent 上下文派生并立即启动新分支时，可以使用 `fork`：
 
 ```text
-security = fork coder, security.do security_prompt
-quality = fork coder, quality.do quality_prompt
+security = coder.fork security_prompt
+quality = coder.fork quality_prompt
 ```
 
-每条指令依次完成 `memory.copy`、`memory.apply` 和右侧启动动作。左侧名称可以在同一条指令的启动动作中引用，因此不需要逐个声明临时 Memory 与 Agent。Fork 继承 source Agent 的 Workspace；多个 branch 因而仍可能被同一可写 Workspace 串行化。
+每条指令依次完成 Memory copy、`with_memory` 和首次 `do`，不需要逐个声明临时 Memory 与 Agent。Fork 继承 source Agent 的 Workspace；多个 branch 因而仍可能被同一可写 Workspace 串行化。
 
 Fork 完成后：
 
@@ -215,9 +215,9 @@ Fork 完成后：
 
 ## 13. 当前限制
 
-当前 parser 和 VM 只实现 `memory.append`、`memory.copy`、`memory.apply` 以及 Agent 的 `.memory` 引用。没有 `memory.format`、`memory.select`、`memory.merge` 或 shared Memory 指令；持久化是 VM 内部行为，不增加 AFL 指令。
+当前 parser 和 VM 只实现 Memory 的 `append`、`copy`、Agent 的 `with_memory` 以及 `.memory` 引用。没有 `format`、`select`、`merge` 或 shared Memory 指令；持久化是 VM 内部行为，不增加 AFL 指令。
 
-实验格式固定使用 `version: 0`。默认文件布局为 `.afl/memory/afl-<YYYYMMDD-HHmmss>-<short-id>/program.jsons` 加同目录下的 `<memory-label>.jsons`。文件不是 JSONL，也不是单个 JSON array，而是两空格缩进、对象间空行分隔的顶层 JSON object stream。每个真正进入过 `agent.do` 的稳定 Memory slot 使用一份文件；仅声明 Agent、`memory.copy`、`fork`、`memory.apply` 或首次使用前的 `memory.append` 都不会单独物化文件。
+实验格式固定使用 `version: 0`。默认文件布局为 `.afl/memory/afl-<YYYYMMDD-HHmmss>-<short-id>/program.jsons` 加同目录下的 `<memory-label>.jsons`。文件不是 JSONL，也不是单个 JSON array，而是两空格缩进、对象间空行分隔的顶层 JSON object stream。每个真正进入过 `agent.do` 的稳定 Memory slot 使用一份文件；仅声明 Agent、Memory `copy`、`fork`、`with_memory` 或首次使用前的 `append` 都不会单独物化文件。
 
 Memory 文件依次保存 `memory` header、`do.begin`、连续的 `user`/`assistant`/`tool.result` 等浅层 records，以及正常结束或可控错误时的可选 `do.end`；错误 tail 使用浅层 `error_code`/`error_message`。Pi 在每个完整语义消息形成后 append 并 sync，因此 thinking、tool call 和 tool result 不必等整次 `do` 完成才落盘。每个完整 JSON object 本身就是可恢复状态；缺少 `do.end` 表示进程可能直接中断，但不撤销此前完整 records。EOF 处不完整的最后一个 object 会截断到上一个完整 object 的结束字节，文件中部损坏则显式失败。
 

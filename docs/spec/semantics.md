@@ -80,7 +80,7 @@ Memory handle 还记录 VM 内部 identity 和可选 owner，用于资源依赖�
 
 - 数据结果：`do`、`prompt`、`input`、`invoke`、`call`、`sync` 等返回 Frag；
 - 计算结果：`oper` 与 script executor 返回 bool、number、string 或宿主结构等本地 compute value；
-- 资源结果：`agent`、`memory.copy`、`memory.apply`、`dispatch`、`fork` 返回 VM handle。
+- 资源结果：`agent`、Memory `copy`、`with_memory`、`dispatch`、`repeat`、`fork` 返回 VM handle。
 
 资源 handle 不会包装成 Frag，也不能作为 Agent message、Prompt 参数、Capability 参数或外部 Flow 参数发送。
 
@@ -127,16 +127,16 @@ Agent 调用和 `memory.append` 会读写绑定 Memory。同一 Agent 或同一 
 
 ```text
 coder = agent @agent.coder
-worker = agent @agent.worker, "workers/worker/"
-reviewer = agent @agent.reviewer, ["workers/reviewer/", "docs/"]
-reviewer = agent @agent.reviewer,, review_memory
+worker = agent @agent.worker, [workspace: "workers/worker/"]
+reviewer = agent @agent.reviewer, [workspace: ["workers/reviewer/", "docs/"]]
+reviewer = agent @agent.reviewer, [memory: review_memory]
 ```
 
-`agent` 创建 Agent instance。第二个 operand 是可选 Workspace，第三个 operand 是可选 Memory。Workspace 省略时，VM 根据 run id 和稳定 allocation identity 在执行根目录的 `.afl/tmpworkspace/` 下分配独立主工作区；没有 Memory operand 时创建默认 working Memory，有 Memory operand 时绑定该 Memory。显式路径在 Agent 创建时规范化，主工作区会按需创建，只读工作区必须已经存在。主工作区与只读工作区相同或互为祖先时创建失败。
+`agent` 创建 Agent instance。第一个 operand 是 Agent symbol，第二个 operand 是可选的 typed options record，其中 `workspace` 和 `memory` 分别声明 Workspace 与已有 Memory。Workspace 省略时，VM 根据 run id 和稳定 allocation identity 在执行根目录的 `.afl/tmpworkspace/` 下分配独立主工作区；没有 `memory` option 时创建默认 working Memory，有该 option 时绑定指定 Memory。显式路径在 Agent 创建时规范化，主工作区会按需创建，只读工作区必须已经存在。主工作区与只读工作区相同或互为祖先时创建失败。
 
-### 7.2 `agent.sysprompt`
+### 7.2 `agent.system_prompt`
 
-`agent.sysprompt` 设置或替换 Agent handle 上单独保存的 system prompt。后续 `AgentExecutionRequest` 通过 `systemPrompt` 字段携带该值；它不会作为普通 Message 写入 Memory。已经建立的原生 backend session 会失效，下一次 `do` 使用当前 Memory 和新 prompt 建立 session。
+`agent.system_prompt` 设置或替换 Agent handle 上单独保存的 system prompt。后续 `AgentExecutionRequest` 通过 `systemPrompt` 字段携带该值；它不会作为普通 Message 写入 Memory。已经建立的原生 backend session 会失效，下一次 `do` 使用当前 Memory 和新 prompt 建立 session。
 
 ### 7.3 `prompt`
 
@@ -168,7 +168,7 @@ Backend 只返回最终 `output`，VM 将其追加一次 `assistant` Message。�
 Agent 调用可以带 schema symbol：
 
 ```text
-report = reviewer.do prompt, @schema.Report
+report = reviewer.do prompt, [schema: @schema.Report]
 ```
 
 存在 schema operand 时，VM 要求 Schema binding 存在，并用它校验 Agent 输出字符串。校验后的 `report` 仍是 Frag，不会自动变成 Core IR record。
@@ -205,7 +205,7 @@ Script 不能隐式读取 node 中的其他工作值。需要把脚本结果传�
 ### 9.1 `memory.append`
 
 ```text
-memory.append target_memory, role, frag
+target_memory.append role, frag
 ```
 
 `memory.append` 在目标 Memory 尾部加入 `{role, frag.content}`。Role 是必需 operand，因为 Frag 本身没有 role。
@@ -213,22 +213,22 @@ memory.append target_memory, role, frag
 ### 9.2 `memory.copy`
 
 ```text
-copied = memory.copy source_memory
+copied = source_memory.copy
 ```
 
 `memory.copy` 创建独立 Memory，并按原顺序复制 source 中的 Message。每条 Message 保留原 role；copy 之后双方更新互不自动传播。
 
-当 backend 支持 checkpoint/session export 时，VM 还会复制一份 flow 不可读取的 continuation，并绑定复制时的 Memory revision。该元数据只用于兼容的 `memory.apply` 或 `fork`，不改变 Message 序列。
+当 backend 支持 checkpoint/session export 时，VM 还会复制一份 flow 不可读取的 continuation，并绑定复制时的 Memory revision。该元数据只用于兼容的 `with_memory` 或 `fork`，不改变 Message 序列。
 
 `memory.copy` 不接收新 role，因为它复制的是已经带 role 的 Message，而不是把一个 role-free Frag 加入 Memory。
 
-### 9.3 `memory.apply`
+### 9.3 `with_memory`
 
 ```text
-new_agent = memory.apply source_agent, memory
+new_agent = source_agent.with_memory memory
 ```
 
-`memory.apply` 使用 source Agent 的 symbol 与 system prompt 创建新的 Agent handle，并把给定 Memory 作为其 working Memory。它不修改 source Agent，也不再次复制 Memory。Memory 已有 owner 时，VM 报告 `MEMORY_ALREADY_BOUND`；调用方需要独立副本时先执行 `memory.copy`。
+`with_memory` 使用 source Agent 的 symbol 与 system prompt 创建新的 Agent handle，并把给定 Memory 作为其 working Memory。它不修改 source Agent，也不再次复制 Memory。Memory 已有 owner 时，VM 报告 `MEMORY_ALREADY_BOUND`；调用方需要独立副本时先执行 Memory `copy`。
 
 Live checkpoint 的 backend、Agent symbol、system prompt 和 Workspace 都兼容时，首次执行优先 fork 原生 session；否则同名 backend 从持久化 continuation 为目标 Agent binding 重建 session。不存在 continuation 时才根据 canonical Message 重建；continuation 属于其他 backend 时显式失败。
 
@@ -238,8 +238,8 @@ Live checkpoint 的 backend、Agent symbol、system prompt 和 Workspace 都兼�
 
 ```text
 jump target
-jump condition, true_target, false_target
-jump selector, [case_value: target, ...], default_target
+branch condition, true_target, false_target
+match selector, [case_value: target, ...], default_target
 ```
 
 无条件形式激活目标 block。条件形式读取 boolean compute value，只激活一个目标。
@@ -272,13 +272,13 @@ dispatch [flow_a(...), flow_b(...), ...]
 
 VM 为每个 list item 创建一次 child invocation。不同 item 可以调用不同 flow，也可以传入不同 task。
 
-Batch 形式批量启动同一个 flow：
+`repeat` 批量启动同一个 flow：
 
 ```text
-dispatch count, flow, task
+repeat count, flow(task)
 ```
 
-`count` 必须求值为非负整数 compute value。Agent 输出是 Frag，需要先由 script binding 转换为 number。VM 创建 `count` 次 `flow(task)`；每个 child 拥有独立 node invocation，并接收 task 值的副本。
+`count` 必须求值为非负整数 compute value。Agent 输出是 Frag，需要先由 script binding 转换为 number。VM 创建 `count` 次相同的 flow call；每个 child 拥有独立 node invocation，并接收各参数值的副本。
 
 VM 默认允许一次 dispatch 创建最多 10,000 个 task，并最多同时运行 16 个 worker。`VmPolicy.maxDispatchTasks` 和 `maxDispatchWorkers` 可以修改这两个限制，但不会改变声明的 `count`。
 
@@ -289,28 +289,28 @@ VM 默认允许一次 dispatch 创建最多 10,000 个 task，并最多同时运
 `fork` 从 source Agent 派生一个带上下文的并行分支，并立即在新 Agent 上启动一次工作：
 
 ```text
-new_agent = fork source_agent, new_agent.do prompt
+new_agent = source_agent.fork prompt
 ```
 
-左侧 `dst` 在该条指令的第二个 operand 中是合法的 branch Agent 绑定，在其他 operand 或定义前的普通指令中仍不可引用。`fork` 执行以下概念操作：
+`fork` 执行以下概念操作：
 
 ```text
-new_memory = memory.copy source_agent.memory
-new_agent = memory.apply source_agent, new_memory
+new_memory = source_agent.memory.copy
+new_agent = source_agent.with_memory new_memory
 new_agent.do prompt
 ```
 
 Branch Agent 沿用 source Agent 的 binding 和配置，并绑定独立复制的 Memory。Source Agent 和 branch Agent 在 fork 后的消息写入互不传播。
 
-`fork` 返回 branch Agent handle。启动动作的输出已经以 `assistant` role 写入 branch Memory，但这条快捷形式不额外返回 Frag。后续对 branch Agent 的 `do`、`sysprompt` 或 Memory 写入，与启动动作形成同一 Agent 的资源依赖。
+`fork` 返回 branch Agent handle。启动动作的输出已经以 `assistant` role 写入 branch Memory，但这条快捷形式不额外返回 Frag。后续对 branch Agent 的 `do`、`system_prompt` 或 Memory 写入，与启动动作形成同一 Agent 的资源依赖。
 
-多条互不依赖的 `fork` 指令可以同时进入 ready 状态，但 branch 继承 source Workspace，重叠的可写路径仍受 Workspace lock 约束。需要 list 或 batch child flow、独立结果集合和 `sync` 时使用 `dispatch`。Trace 记录 `fork.started`、内部 Agent 事件和 `fork.completed`。
+多条互不依赖的 `fork` 指令可以同时进入 ready 状态，但 branch 继承 source Workspace，重叠的可写路径仍受 Workspace lock 约束。需要 list 或 repeated child flow、独立结果集合和 `sync` 时使用 `dispatch` 或 `repeat`。Trace 记录 `fork.started`、内部 Agent 事件和 `fork.completed`。
 
 ### 11.4 `sync`
 
-`sync` 等待 TaskGroup，并按 list 声明顺序或 batch ordinal 收集 child Frag。省略 formatter 时，VM 把各 Frag 的 content 编码为 JSON string array。指定 formatter 时，VM 调用 Formatter binding。任一 child 失败会取消同组其他 child，`sync` 抛出该失败；同一个 TaskGroup 只能 sync 一次。
+`sync` 等待 TaskGroup，并按 list 声明顺序或 repeat ordinal 收集 child Frag。省略 formatter 时，VM 把各 Frag 的 content 编码为 JSON string array。指定 formatter 时，VM 调用 Formatter binding。任一 child 失败会取消同组其他 child，`sync` 抛出该失败；同一个 TaskGroup 只能 sync 一次。
 
-Validator 要求每个 `dispatch` 或 `freedom.route` 产生的 TaskGroup 在 node 退出前恰好 sync 一次。VM 也会拒绝未消费或重复消费的 TaskGroup。
+Validator 要求每个 `dispatch`、`repeat` 或 `agent.route` 产生的 TaskGroup 在 node 退出前恰好 sync 一次。VM 也会拒绝未消费或重复消费的 TaskGroup。
 
 Basic block 中互不依赖且 Workspace 不冲突的普通 Agent 指令可以并行；`dispatch` 表达独立 child flow 的生命周期，`fork` 表达从 source Agent 复制上下文并立即工作的分支关系。
 
@@ -322,7 +322,7 @@ Agent 在 `do` 内部自行使用 tool，与 flow 显式执行 `invoke` 是两�
 
 ## 13. `freedom`
 
-`freedom.route` 和 `freedom.flow` 都包含一次原子的 Agent activation。Route 临时注入 `afl.environment.get` 与 `afl.route.add`；Flow 注入 `afl.environment.get`、`afl.node.execute`、`afl.ir.validate` 与 `afl.ir.execute`。Planner/writer 仍是普通 Agent：activation 继续使用该 handle 已有的 Memory、system prompt 和 executor session，Freedom prompt 也作为普通 user message 进入同一份 Memory。VM 不注入另一份隐藏的 Freedom prompt；同一 handle 后续进入普通 `do` 时只移除临时工具，连续上下文不变。
+`agent.route` 和 `agent.flow` 都包含一次原子的 Agent activation。Route 临时注入 `afl.environment.get` 与 `afl.route.add`；Flow 注入 `afl.environment.get`、`afl.node.execute`、`afl.ir.validate` 与 `afl.ir.execute`。Planner/writer 仍是普通 Agent：activation 继续使用该 handle 已有的 Memory、system prompt 和 executor session，Freedom prompt 也作为普通 user message 进入同一份 Memory。VM 不注入另一份隐藏的 Freedom prompt；同一 handle 后续进入普通 `do` 时只移除临时工具，连续上下文不变。
 
 候选 Node、Flow 可用的 Agent symbol 和具名受控参数由当前指令显式给出。Node 工具只能调用 allowlist 中的 writer-origin Node，参数只能选择 activation 内的 ref 或自由字符串。Flow 生成的 IR 必须重新 parse 和 validate，不能覆盖 origin Node，也不能隐式捕获 writer frame；v0 还拒绝 generated IR 中的外部 Flow、Capability、Input、Script、递归 Freedom 和未授权 Agent。
 
@@ -332,7 +332,7 @@ Constraint 只描述 flow 语义上的路由基数：`min_routes` 与 `max_route
 
 并行度、超时、控制工具预算、IR 大小和 activation 深度都是 VM 执行策略，不进入指令 constraint。`VmPolicy.maxConcurrency` 和 executor capability 决定多个同时到达的控制调用如何调度；`VmPolicy.freedomLimits` 设置运行资源上限及 `maxRoutes` 的全局上界。Policy 还可以分别批准 Freedom activation、Node 调用和 IR 执行。
 
-`freedom.route` 在 planner 完成后启动已登记调用并返回 TaskGroup，planner 的 final response 只保留在 Memory 和 trace 中。空路由返回空 TaskGroup；child failure 由 `sync` 传播。`freedom.flow` 成功执行过至少一个 Node 或 generated IR 时返回 writer 的 final response role-free Frag，Node/IR 调用和结果保留在 writer continuation 中；如果没有任何成功执行，则返回空 Frag，不采信 writer 对未执行工作的文本声明。两种指令都先检查 `min_routes`，不满足时报告 `FREEDOM_ROUTE_MIN_NOT_REACHED`。
+`agent.route` 在 planner 完成后启动已登记调用并返回 TaskGroup，planner 的 final response 只保留在 Memory 和 trace 中。空路由返回空 TaskGroup；child failure 由 `sync` 传播。`agent.flow` 成功执行过至少一个 Node 或 generated IR 时返回 writer 的 final response role-free Frag，Node/IR 调用和结果保留在 writer continuation 中；如果没有任何成功执行，则返回空 Frag，不采信 writer 对未执行工作的文本声明。两种指令都先检查 `min_routes`，不满足时报告 `FREEDOM_ROUTE_MIN_NOT_REACHED`。
 
 控制工具输入使用以下稳定形状：
 

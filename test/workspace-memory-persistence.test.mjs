@@ -167,7 +167,7 @@ test("memory.copy remains lazy when neither source nor copy enters agent.do", as
 main():
     entry:
         worker = agent @agent.worker
-        copied = memory.copy worker.memory
+        copied = worker.memory.copy
         ret "done"
 `, {});
 
@@ -184,9 +184,9 @@ main():
     entry:
         worker = agent @agent.worker
         result = worker.do "turn"
-        copied = memory.copy worker.memory
+        copied = worker.memory.copy
         reviewer = agent @agent.worker
-        branch = memory.apply reviewer, copied
+        branch = reviewer.with_memory copied
         reviewed = branch.do "review"
         ret reviewed
 `, { agents });
@@ -217,11 +217,11 @@ test("using a nested lazy copy materializes its base chain without duplicating h
 main():
     entry:
         source = agent @agent.worker
-        memory.append source.memory, user, "seed"
-        first = memory.copy source.memory
-        second = memory.copy first
+        source.memory.append user, "seed"
+        first = source.memory.copy
+        second = first.copy
         reviewer = agent @agent.worker
-        branch = memory.apply reviewer, second
+        branch = reviewer.with_memory second
         result = branch.do "turn"
         ret result
 `, { agents });
@@ -453,8 +453,8 @@ test("Workspace paths are canonical and hierarchical write conflicts are seriali
   const overlapping = AflVm.fromSource(`
 main():
     entry:
-        left = agent @agent.left, "workers/"
-        right = agent @agent.right, "workers/child/"
+        left = agent @agent.left, [workspace: "workers/"]
+        right = agent @agent.right, [workspace: "workers/child/"]
         left_result = left.do "left"
         right_result = right.do "right"
         ret right_result
@@ -468,8 +468,8 @@ main():
   const siblings = AflVm.fromSource(`
 main():
     entry:
-        left = agent @agent.left, ["left/", "docs/"]
-        right = agent @agent.right, ["right/", "docs/"]
+        left = agent @agent.left, [workspace: ["left/", "docs/"]]
+        right = agent @agent.right, [workspace: ["right/", "docs/"]]
         left_result = left.do "left"
         right_result = right.do "right"
         ret right_result
@@ -498,7 +498,7 @@ test("generated numbered Workspaces flow through dispatch parameters and run in 
   const vm = AflVm.fromSource(`
 review(task, main_workspace):
     entry:
-        reviewer = agent @agent.reviewer, [main_workspace, "docs/"]
+        reviewer = agent @agent.reviewer, [workspace: [main_workspace, "docs/"]]
         result = reviewer.do task
         ret result
 main():
@@ -530,7 +530,7 @@ test("Workspace rejects primary/read-only overlap after canonicalization", async
   const vm = AflVm.fromSource(`
 main():
     entry:
-        worker = agent @agent.worker, ["work/", "work/docs/"]
+        worker = agent @agent.worker, [workspace: ["work/", "work/docs/"]]
         ret "done"
 `, {});
   await assert.rejects(
@@ -545,7 +545,7 @@ test("an adapter cannot silently ignore an explicit Workspace", async (t) => {
   const vm = AflVm.fromSource(`
 main():
     entry:
-        worker = agent @agent.worker, "work/"
+        worker = agent @agent.worker, [workspace: "work/"]
         result = worker.do "work"
         ret result
 `, {

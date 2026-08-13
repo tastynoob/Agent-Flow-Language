@@ -73,7 +73,7 @@ export function instructionReferences(instruction: AflInstruction): NameExpr[] {
         ...(instruction.workspace === undefined ? [] : valueReferences(instruction.workspace)),
         ...(instruction.memory === undefined ? [] : [instruction.memory]),
       ];
-    case "agent.sysprompt":
+    case "agent.system_prompt":
       return [instruction.agent, ...valueReferences(instruction.prompt)];
     case "agent.do":
       return [instruction.agent, ...valueReferences(instruction.input)];
@@ -87,10 +87,10 @@ export function instructionReferences(instruction: AflInstruction): NameExpr[] {
       return instruction.args.flatMap(valueReferences);
     case "call":
       return instruction.args.flatMap(valueReferences);
-    case "dispatch.list":
+    case "dispatch":
       return instruction.calls.flatMap((call) => call.args.flatMap(valueReferences));
-    case "dispatch.batch":
-      return [...valueReferences(instruction.count), ...valueReferences(instruction.task)];
+    case "repeat":
+      return [...valueReferences(instruction.count), ...instruction.args.flatMap(valueReferences)];
     case "sync":
       return [instruction.taskGroup];
     case "fork":
@@ -101,14 +101,15 @@ export function instructionReferences(instruction: AflInstruction): NameExpr[] {
       return [instruction.memory, ...valueReferences(instruction.frag)];
     case "memory.copy":
       return [instruction.memory];
-    case "memory.apply":
-      return [instruction.sourceAgent, instruction.memory];
-    case "freedom.route":
-    case "freedom.flow":
+    case "agent.with_memory":
+      return [instruction.agent, instruction.memory];
+    case "agent.route":
+    case "agent.flow":
       return [
-        instruction.planner,
+        instruction.agent,
         ...valueReferences(instruction.prompt),
-        ...valueReferences(instruction.constraint),
+        ...(instruction.minRoutes === undefined ? [] : valueReferences(instruction.minRoutes)),
+        ...(instruction.maxRoutes === undefined ? [] : valueReferences(instruction.maxRoutes)),
         ...valueReferences(instruction.params),
       ];
   }
@@ -135,7 +136,7 @@ function resourceAccesses(instruction: AflInstruction): ResourceAccess[] {
   switch (instruction.op) {
     case "agent":
       return instruction.memory === undefined ? [] : [{ key: memoryResource(instruction.memory.name), mode: "write" }];
-    case "agent.sysprompt":
+    case "agent.system_prompt":
       return [{ key: agentResource(instruction.agent.name), mode: "write" }];
     case "agent.do":
       return [
@@ -153,16 +154,16 @@ function resourceAccesses(instruction: AflInstruction): ResourceAccess[] {
       return [{ key: memoryResource(instruction.memory.name), mode: "write" }];
     case "memory.copy":
       return [{ key: memoryResource(instruction.memory.name), mode: "read" }];
-    case "memory.apply":
+    case "agent.with_memory":
       return [
-        { key: agentResource(instruction.sourceAgent.name), mode: "read" },
+        { key: agentResource(instruction.agent.name), mode: "read" },
         { key: memoryResource(instruction.memory.name), mode: "write" },
       ];
-    case "freedom.route":
-    case "freedom.flow":
+    case "agent.route":
+    case "agent.flow":
       return [
-        { key: agentResource(instruction.planner.name), mode: "write" },
-        { key: memoryResource(instruction.planner.name), mode: "write" },
+        { key: agentResource(instruction.agent.name), mode: "write" },
+        { key: memoryResource(instruction.agent.name), mode: "write" },
       ];
     default:
       return [];

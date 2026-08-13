@@ -268,8 +268,8 @@ test("VM serializes active elevation requests from concurrent Agents without ser
   const vm = AflVm.fromSource(`
 main():
     entry:
-        left = agent @agent.left, "left/"
-        right = agent @agent.right, "right/"
+        left = agent @agent.left, [workspace: "left/"]
+        right = agent @agent.right, [workspace: "right/"]
         left_result = left.do "left"
         right_result = right.do "right"
         result = prompt "joined", left_result, right_result

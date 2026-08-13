@@ -69,8 +69,8 @@ import {
   type ComputeValue,
   type FlowCallExpr,
   type FlowTarget,
-  type FreedomInstruction,
-  type FreedomMode,
+  type AgentControlInstruction,
+  type AgentControlMode,
   type Frag,
   type SourceSpan,
   type SymbolExpr,
@@ -157,7 +157,7 @@ interface FreedomRuntime {
 }
 
 interface FreedomScope {
-  readonly instruction: FreedomInstruction;
+  readonly instruction: AgentControlInstruction;
   readonly planner: AgentHandle;
   readonly origin: AgentOrigin;
   readonly context: VmRunContext;
@@ -361,16 +361,20 @@ export class AflVm {
           const value = evaluateValue(terminator.error, frame);
           throw new AflVmError("FLOW_FAILED", failureMessage(value), { span: terminator.span });
         }
-        if (terminator.op === "jump.table") {
+        if (terminator.op === "jump") {
+          blockName = terminator.target;
+          continue;
+        }
+        if (terminator.op === "match") {
           const selector = asCompute(
             evaluateValue(terminator.selector, frame),
             terminator.span,
-            "jump table selector",
+            "match selector",
           );
-          if (!isJumpTableScalar(selector)) {
+          if (!isMatchScalar(selector)) {
             throw new AflVmError(
-              "JUMP_TABLE_SELECTOR_NOT_SCALAR",
-              "jump table selector must be null, boolean, number, or string",
+              "MATCH_SELECTOR_NOT_SCALAR",
+              "match selector must be null, boolean, number, or string",
               { span: terminator.span },
             );
           }
@@ -378,17 +382,13 @@ export class AflVm {
             ?? terminator.defaultTarget;
           continue;
         }
-        if (terminator.condition === undefined) {
-          blockName = terminator.trueTarget;
-        } else {
-          const condition = asCompute(evaluateValue(terminator.condition, frame), terminator.span, "jump condition");
-          if (typeof condition !== "boolean") {
-            throw new AflVmError("JUMP_CONDITION_NOT_BOOLEAN", "jump condition must be boolean", {
-              span: terminator.span,
-            });
-          }
-          blockName = condition ? terminator.trueTarget : terminator.falseTarget!;
+        const condition = asCompute(evaluateValue(terminator.condition, frame), terminator.span, "branch condition");
+        if (typeof condition !== "boolean") {
+          throw new AflVmError("BRANCH_CONDITION_NOT_BOOLEAN", "branch condition must be boolean", {
+            span: terminator.span,
+          });
         }
+        blockName = condition ? terminator.trueTarget : terminator.falseTarget;
       }
     } catch (error) {
       for (const group of frame.taskGroups) group.controller.abort(error);
@@ -570,7 +570,7 @@ export class AflVm {
           return agent;
         });
       }
-      case "agent.sysprompt": {
+      case "agent.system_prompt": {
         const agent = asAgent(evaluateValue(instruction.agent, frame), instruction.agent.span);
         const prompt = await this.renderPrompt(instruction.prompt, [], frame, signal);
         const retiredSession = await context.locks.use([
@@ -685,7 +685,7 @@ export class AflVm {
           instruction.span,
         );
       }
-      case "dispatch.list": {
+      case "dispatch": {
         const calls = instruction.calls.map((call) => ({
           target: call.target,
           args: call.args.map((argument) => evaluateValue(argument, frame)),
@@ -693,17 +693,17 @@ export class AflVm {
         }));
         return this.startDispatch(frame, calls, context, activation, blockVisit, location, signal);
       }
-      case "dispatch.batch": {
-        const count = asCompute(evaluateValue(instruction.count, frame), instruction.count.span, "dispatch count");
+      case "repeat": {
+        const count = asCompute(evaluateValue(instruction.count, frame), instruction.count.span, "repeat count");
         if (!Number.isInteger(count) || typeof count !== "number" || count < 0) {
-          throw new AflVmError("DISPATCH_COUNT_INVALID", "dispatch count must be a non-negative integer", {
+          throw new AflVmError("DISPATCH_COUNT_INVALID", "repeat count must be a non-negative integer", {
             span: instruction.count.span,
           });
         }
-        const task = evaluateValue(instruction.task, frame);
+        const args = instruction.args.map((argument) => evaluateValue(argument, frame));
         const calls = Array.from({ length: count }, () => ({
           target: instruction.target,
-          args: [cloneVmValue(task)],
+          args: args.map(cloneVmValue),
           span: instruction.span,
         }));
         return this.startDispatch(frame, calls, context, activation, blockVisit, location, signal);
@@ -862,8 +862,8 @@ export class AflVm {
         );
         return copy;
       }
-      case "memory.apply": {
-        const source = asAgent(evaluateValue(instruction.sourceAgent, frame), instruction.sourceAgent.span);
+      case "agent.with_memory": {
+        const source = asAgent(evaluateValue(instruction.agent, frame), instruction.agent.span);
         const memory = asMemory(evaluateValue(instruction.memory, frame), instruction.memory.span);
         return context.locks.use(
           [{ key: source.id, mode: "read" }, { key: memory.id, mode: "write" }],
@@ -887,8 +887,8 @@ export class AflVm {
           },
         );
       }
-      case "freedom.route":
-      case "freedom.flow":
+      case "agent.route":
+      case "agent.flow":
         return this.executeFreedom(frame, instruction, context, activation, blockVisit, location, signal);
     }
   }
@@ -1758,7 +1758,7 @@ export class AflVm {
     switch (instruction.op) {
       case "agent":
         return instruction.memory === undefined ? [] : memory(instruction.memory, "write");
-      case "agent.sysprompt":
+      case "agent.system_prompt":
       case "agent.do":
         return agent(instruction.agent, "write");
       case "sync": {
@@ -1772,14 +1772,14 @@ export class AflVm {
         return memory(instruction.memory, "write");
       case "memory.copy":
         return memory(instruction.memory, "read");
-      case "memory.apply":
+      case "agent.with_memory":
         return [
-          ...agent(instruction.sourceAgent, "read"),
+          ...agent(instruction.agent, "read"),
           ...memory(instruction.memory, "write"),
         ];
-      case "freedom.route":
-      case "freedom.flow":
-        return agent(instruction.planner, "write");
+      case "agent.route":
+      case "agent.flow":
+        return agent(instruction.agent, "write");
       default:
         return [];
     }
@@ -1787,7 +1787,7 @@ export class AflVm {
 
   private async executeFreedom(
     frame: MutableFrame,
-    instruction: FreedomInstruction,
+    instruction: AgentControlInstruction,
     context: VmRunContext,
     activation: ActivationContext,
     blockVisit: number,
@@ -1795,12 +1795,26 @@ export class AflVm {
     signal: AbortSignal,
   ): Promise<Frag | TaskGroupHandle> {
     const mode = freedomInstructionMode(instruction);
-    const planner = asAgent(evaluateValue(instruction.planner, frame), instruction.planner.span);
+    const planner = asAgent(evaluateValue(instruction.agent, frame), instruction.agent.span);
     const prompt = asFrag(evaluateValue(instruction.prompt, frame), instruction.prompt.span, "freedom prompt");
-    const constraint = this.evaluateComputeRecord(instruction.constraint, frame, "Freedom constraint");
+    const constraint: Record<string, ComputeValue> = {};
+    if (instruction.minRoutes !== undefined) {
+      constraint.min_routes = asCompute(
+        evaluateValue(instruction.minRoutes, frame),
+        instruction.minRoutes.span,
+        "min_routes",
+      );
+    }
+    if (instruction.maxRoutes !== undefined) {
+      constraint.max_routes = asCompute(
+        evaluateValue(instruction.maxRoutes, frame),
+        instruction.maxRoutes.span,
+        "max_routes",
+      );
+    }
     const limits = parseFreedomLimits(
       constraint,
-      instruction.constraint.span,
+      instruction.span,
       this.bindings.policy?.freedomLimits,
     );
     const freedomDepth = activation.freedomDepth + 1;
@@ -1823,7 +1837,7 @@ export class AflVm {
       }
       nodes.set(candidate.name, node);
     }
-    const agents = instruction.op === "freedom.flow" ? instruction.agents.map(toSymbol) : [];
+    const agents = instruction.op === "agent.flow" ? instruction.agents.map(toSymbol) : [];
     const refs = new Map<string, VmArgument>();
     for (const [name, expression] of Object.entries(instruction.params.entries)) {
       const value = evaluateValue(expression, frame);
@@ -1914,7 +1928,7 @@ export class AflVm {
         completedNodes: scope.counts.completedNode,
         completedIr: scope.counts.completedIr,
       } as const;
-      if (instruction.op === "freedom.route") {
+      if (instruction.op === "agent.route") {
         const group = await this.startFreedomRouteGroup(
           frame,
           scope,
@@ -2011,21 +2025,6 @@ export class AflVm {
     const count = targets.filter((target) =>
       target.kind === "local" && tracker.scope.nodes.has(target.name)).length;
     this.reserveFreedomRoutes(tracker.scope, count);
-  }
-
-  private evaluateComputeRecord(
-    expression: ValueExpr,
-    frame: MutableFrame,
-    label: string,
-  ): Readonly<Record<string, ComputeValue>> {
-    const value = evaluateValue(expression, frame);
-    if (isFrag(value) || isSymbolRef(value) || isVmHandle(value) ||
-        typeof value !== "object" || value === null || Array.isArray(value) || !isComputeValue(value)) {
-      throw new AflVmError("FREEDOM_CONSTRAINT_INVALID", `${label} must be compute record data`, {
-        span: expression.span,
-      });
-    }
-    return structuredClone(value);
   }
 
   private async executeFreedomTool(
@@ -2427,17 +2426,17 @@ export class AflVm {
           case "call":
             validateTarget(instruction.target, instruction.span);
             break;
-          case "dispatch.list":
+          case "dispatch":
             for (const call of instruction.calls) validateTarget(call.target, call.span);
             break;
-          case "dispatch.batch":
+          case "repeat":
             validateTarget(instruction.target, instruction.span);
             break;
           case "input":
           case "script":
           case "invoke":
-          case "freedom.route":
-          case "freedom.flow":
+          case "agent.route":
+          case "agent.flow":
             diagnostics.push(generatedDiagnostic(
               "FREEDOM_IR_INSTRUCTION_DENIED",
               `Generated IR cannot use '${instruction.op}' in v0`,
@@ -2453,7 +2452,7 @@ export class AflVm {
               ));
             }
             break;
-          case "agent.sysprompt":
+          case "agent.system_prompt":
             if (instruction.prompt.kind === "symbol") {
               diagnostics.push(generatedDiagnostic(
                 "FREEDOM_IR_SYMBOL_DENIED",
@@ -2725,7 +2724,7 @@ export class AflVm {
   }
 }
 
-function isJumpTableScalar(value: ComputeValue): value is null | boolean | number | string {
+function isMatchScalar(value: ComputeValue): value is null | boolean | number | string {
   return value === null || ["boolean", "number", "string"].includes(typeof value);
 }
 
@@ -2876,8 +2875,8 @@ function portableControlKind(value: VmArgument): string {
   return typeof value === "object" ? "record" : typeof value;
 }
 
-function freedomInstructionMode(instruction: FreedomInstruction): FreedomMode {
-  return instruction.op === "freedom.route" ? "route" : "flow";
+function freedomInstructionMode(instruction: AgentControlInstruction): AgentControlMode {
+  return instruction.op === "agent.route" ? "route" : "flow";
 }
 
 function freedomLimitsValue(limits: FreedomLimits): ComputeValue {

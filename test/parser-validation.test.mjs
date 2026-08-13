@@ -48,28 +48,28 @@ test("parser accepts the flow-oriented instruction surface", () => {
 worker(task):
     entry:
         agent = agent @agent.worker
-        agent.sysprompt "work"
+        agent.system_prompt "work"
         request = prompt @prompt.task, task
-        result = agent.do user, request, @schema.Result
+        result = agent.do request, [role: user, schema: @schema.Result]
         ret result
 
 main(task):
     entry:
         count = typescript "return 2", task
-        one = call worker, task
+        one = call worker(task)
         jobs = dispatch [worker(one), @flow.remote(task)]
-        batch = dispatch count, worker, task
+        batch = repeat count, worker(task)
         reports = sync jobs, @format.json
         batch_reports = sync batch
         tool = invoke @mcp.tool.read, reports
         done = oper count == 2 & tool != ""
-        jump done, branch, failed
+        branch done, branch, failed
     branch:
         seed = agent @agent.seed
-        child = fork seed, child.do task
-        memory = memory.copy child.memory
-        applied = memory.apply child, memory
-        routed = freedom.route applied, reports, [min_routes: 1, max_routes: 8], [worker], [reports: reports, batch: batch_reports]
+        child = seed.fork task
+        memory = child.memory.copy
+        applied = child.with_memory memory
+        routed = applied.route reports, [nodes: [worker], params: [reports: reports, batch: batch_reports], min_routes: 1, max_routes: 8]
         result = sync routed
         ret result
     failed:
@@ -77,7 +77,7 @@ main(task):
 `, "surface.afl");
 
   assert.deepEqual(module.nodes.map((node) => node.name), ["worker", "main"]);
-  assert.equal(module.nodes[1].blocks[0].instructions[2].op, "dispatch.list");
+  assert.equal(module.nodes[1].blocks[0].instructions[2].op, "dispatch");
   assert.equal(module.nodes[1].blocks[1].instructions[1].op, "fork");
 });
 
@@ -90,7 +90,7 @@ main():
         empty_list = prompt []
         empty_record = prompt [:]
         planner = agent @agent.planner
-        jobs = freedom.route planner, "route", [], [], []
+        jobs = planner.route "route"
         reports = sync jobs
         ret record
 `);
@@ -104,8 +104,18 @@ main():
   assert.deepEqual(instructions[2].source.items, []);
   assert.equal(instructions[3].source.kind, "record");
   assert.deepEqual(instructions[3].source.entries, {});
-  assert.equal(instructions[5].constraint.kind, "record");
+  assert.equal(instructions[5].minRoutes, undefined);
+  assert.equal(instructions[5].maxRoutes, undefined);
   assert.equal(instructions[5].params.kind, "record");
+  const appendText = parseAfl(`
+main():
+    entry:
+        value = prompt "text.append here"
+        branch = prompt "ordinary destination"
+        ret value
+`);
+  assert.equal(appendText.nodes[0].blocks[0].instructions[0].op, "prompt");
+  assert.equal(appendText.nodes[0].blocks[0].instructions[1].dst, "branch");
   const result = await AflVm.fromSource(`
 main():
     entry:
@@ -137,6 +147,49 @@ main():
   });
 });
 
+test("comma-separated syntax rejects empty items consistently", () => {
+  const sources = [
+    `main(task,):\n    entry:\n        ret task\n`,
+    `main():\n    entry:\n        value = prompt [1,]\n        ret value\n`,
+    `worker(task):\n    entry:\n        ret task\nmain(task):\n    entry:\n        value = call worker(task,)\n        ret value\n`,
+    `worker(task):\n    entry:\n        ret task\nmain(task):\n    entry:\n        jobs = dispatch [worker(task),]\n        result = sync jobs\n        ret result\n`,
+    `main():\n    entry:\n        worker = agent @agent.worker, [workspace: "work/",]\n        ret "done"\n`,
+    `main(task):\n    entry:\n        worker = agent @agent.worker\n        result = worker.do task, [role: user,]\n        ret result\n`,
+    `main(route):\n    entry:\n        match route, ["known": done,], fallback\n    done:\n        ret "done"\n    fallback:\n        ret "fallback"\n`,
+  ];
+  for (const source of sources) {
+    assert.throws(() => parseAfl(source), (error) => {
+      assert.equal(error instanceof AflParseError, true);
+      assert.equal(error.diagnostics[0].code, "PARSE_EMPTY_ITEM");
+      return true;
+    });
+  }
+});
+
+test("parser rejects the removed v0 surface syntax", () => {
+  const instructions = [
+    `worker = agent @agent.worker, "work/"`,
+    `result = worker.do user, task`,
+    `result = call worker, task`,
+    `jobs = dispatch 2, worker, task`,
+    `memory = memory.copy worker.memory`,
+    `branch = memory.apply worker, memory`,
+    `branch = fork worker, branch.do task`,
+    `jobs = freedom.route worker, task, [:], [worker], [:]`,
+  ];
+  for (const instruction of instructions) {
+    assert.throws(() => parseAfl(`main(task):\n    entry:\n        worker = agent @agent.worker\n        ${instruction}\n        ret task\n`), {
+      name: "AflParseError",
+    });
+  }
+  assert.throws(() => parseAfl(`main():\n    entry:\n        worker = agent @agent.worker\n        worker.sysprompt "old"\n        ret "done"\n`), {
+    name: "AflParseError",
+  });
+  assert.throws(() => parseAfl(`main():\n    entry:\n        jump true, done, failed\n    done:\n        ret "done"\n    failed:\n        ret "failed"\n`), {
+    name: "AflParseError",
+  });
+});
+
 test("parser rejects removed seqdo syntax", () => {
   assert.throws(() => parseAfl(`
 main(task):
@@ -158,7 +211,7 @@ main(task):
         ret branch
 `), (error) => {
     assert.equal(error instanceof AflParseError, true);
-    assert.equal(error.diagnostics[0].code, "PARSE_FORK_ACTION");
+    assert.equal(error.diagnostics[0].code, "PARSE_OPCODE");
     return true;
   });
 
@@ -180,10 +233,10 @@ test("agent operands reserve Workspace before optional Memory", () => {
 main(memory, main_workspace):
     entry:
         default_agent = agent @agent.default
-        path_agent = agent @agent.path, "worker/"
-        list_agent = agent @agent.list, [main_workspace, "docs/"]
-        memory_agent = agent @agent.memory,, memory
-        full_agent = agent @agent.full, main_workspace, memory
+        path_agent = agent @agent.path, [workspace: "worker/"]
+        list_agent = agent @agent.list, [workspace: [main_workspace, "docs/"]]
+        memory_agent = agent @agent.memory, [memory: memory]
+        full_agent = agent @agent.full, [workspace: main_workspace, memory: memory]
         ret "done"
 `);
   const instructions = module.nodes[0].blocks[0].instructions;
@@ -208,7 +261,7 @@ main(memory, main_workspace):
   const singlePathList = validateModule(parseAfl(`
 main():
     entry:
-        worker = agent @agent.worker, ["work/"]
+        worker = agent @agent.worker, [workspace: ["work/"]]
         ret "done"
 `));
   assert.equal(singlePathList.ok, false);
@@ -218,8 +271,8 @@ main():
 main():
     entry:
         source = agent @agent.source
-        memory = memory.copy source.memory
-        reviewer = agent @agent.reviewer, memory
+        memory = source.memory.copy
+        reviewer = agent @agent.reviewer, [workspace: memory]
         ret "done"
 `));
   assert.equal(oldMemoryPosition.ok, false);
@@ -229,8 +282,8 @@ main():
 main():
     entry:
         source = agent @agent.source
-        memory = memory.copy source.memory
-        reviewer = agent @agent.reviewer, [memory, "docs/"]
+        memory = source.memory.copy
+        reviewer = agent @agent.reviewer, [workspace: [memory, "docs/"]]
         ret "done"
 `));
   assert.equal(memoryInsideWorkspaceList.ok, false);
@@ -276,7 +329,7 @@ test("validator computes definite availability across CFG joins", () => {
   const result = validateModule(parseAfl(`
 main():
     entry:
-        jump true, left, right
+        branch true, left, right
     left:
         value = prompt "left"
         jump done
@@ -289,7 +342,7 @@ main():
   assert.equal(result.diagnostics.some((item) => item.code === "NAME_UNAVAILABLE"), true);
 });
 
-test("validator checks local call arity, fork receiver, and TaskGroup consumption", () => {
+test("validator checks local call arity and TaskGroup consumption", () => {
   const result = validateModule(parseAfl(`
 worker(task):
     entry:
@@ -297,24 +350,23 @@ worker(task):
 main(task):
     entry:
         source = agent @agent.worker
-        child = fork source, wrong.do task
-        bad = call worker
+        child = source.fork task
+        bad = call worker()
         jobs = dispatch [worker(task)]
         ret bad
 `));
   assert.equal(result.ok, false);
   const codes = new Set(result.diagnostics.map((item) => item.code));
-  assert.equal(codes.has("FORK_RECEIVER_MISMATCH"), true);
   assert.equal(codes.has("CALL_ARITY"), true);
   assert.equal(codes.has("TASK_GROUP_UNCONSUMED"), true);
 });
 
-test("freedom.route produces a TaskGroup that must be synced", () => {
+test("agent.route produces a TaskGroup that must be synced", () => {
   const invalid = validateModule(parseAfl(`
 main():
     entry:
         planner = agent @agent.planner
-        jobs = freedom.route planner, "route", [], [], []
+        jobs = planner.route "route"
         ret "done"
 `));
   assert.equal(invalid.ok, false);
@@ -324,7 +376,7 @@ main():
 main():
     entry:
         planner = agent @agent.planner
-        jobs = freedom.route planner, "route", [], [], []
+        jobs = planner.route "route"
         reports = sync jobs
         ret reports
 `));
@@ -336,10 +388,10 @@ test("validator rejects obviously bound or multiply-bound Memory", () => {
 main():
     entry:
         source = agent @agent.source
-        copy = memory.copy source.memory
-        first = memory.apply source, copy
-        second = memory.apply source, copy
-        third = memory.apply source, source.memory
+        copy = source.memory.copy
+        first = source.with_memory copy
+        second = source.with_memory copy
+        third = source.with_memory source.memory
         ret "done"
 `));
   assert.equal(result.ok, false);
@@ -356,7 +408,7 @@ worker(task):
 main(task, choose_left):
     entry:
         jobs = dispatch [worker(task)]
-        jump choose_left, left, right
+        branch choose_left, left, right
     left:
         left_result = sync jobs
         ret left_result
@@ -373,7 +425,7 @@ worker(task):
 main(task, choose_left):
     entry:
         jobs = dispatch [worker(task)]
-        jump choose_left, left, right
+        branch choose_left, left, right
     left:
         result = sync jobs
         ret result
@@ -384,11 +436,11 @@ main(task, choose_left):
   assert.equal(invalid.diagnostics.some((item) => item.code === "TASK_GROUP_UNCONSUMED"), true);
 });
 
-test("jump tables preserve ordered scalar cases and validate every target", () => {
+test("match preserves ordered scalar cases and validates every target", () => {
   const module = parseAfl(`
 main(route):
     entry:
-        jump route, ["research": research, "rtl": rtl, 3: numbered], fallback
+        match route, ["research": research, "rtl": rtl, 3: numbered], fallback
     research:
         ret "research"
     rtl:
@@ -399,7 +451,7 @@ main(route):
         ret "fallback"
 `);
   const terminator = module.nodes[0].blocks[0].terminator;
-  assert.equal(terminator.op, "jump.table");
+  assert.equal(terminator.op, "match");
   assert.deepEqual(terminator.cases, [
     { value: "research", target: "research" },
     { value: "rtl", target: "rtl" },
@@ -411,7 +463,7 @@ main(route):
 main():
     entry:
         route = prompt "rtl"
-        jump route, ["rtl": rtl], fallback
+        match route, ["rtl": rtl], fallback
     rtl:
         ret
     fallback:
@@ -422,7 +474,7 @@ main():
   const invalid = validateModule(parseAfl(`
 main(route):
     entry:
-        jump route, ["known": missing], fallback
+        match route, ["known": missing], fallback
     fallback:
         ret "fallback"
 `));
@@ -432,14 +484,14 @@ main(route):
   const nonScalar = validateModule(parseAfl(`
 main():
     entry:
-        jump ["rtl"], ["rtl": rtl], fallback
+        match ["rtl"], ["rtl": rtl], fallback
     rtl:
         ret
     fallback:
         ret
 `));
   assert.equal(nonScalar.ok, false);
-  assert.equal(nonScalar.diagnostics.some((item) => item.code === "JUMP_TABLE_SELECTOR_NOT_SCALAR"), true);
+  assert.equal(nonScalar.diagnostics.some((item) => item.code === "MATCH_SELECTOR_NOT_SCALAR"), true);
 
   const directNode = module.nodes[0];
   const directEntry = directNode.blocks[0];
@@ -462,12 +514,12 @@ main():
   };
   const directValidation = validateModule(invalidDirectIr);
   assert.equal(directValidation.ok, false);
-  assert.equal(directValidation.diagnostics.some((item) => item.code === "JUMP_TABLE_CASE_DUPLICATE"), true);
+  assert.equal(directValidation.diagnostics.some((item) => item.code === "MATCH_CASE_DUPLICATE"), true);
 
   assert.throws(() => parseAfl(`
 main(route):
     entry:
-        jump route, ["same": first, "same": second], fallback
+        match route, ["same": first, "same": second], fallback
     first:
         ret
     second:
@@ -476,7 +528,7 @@ main(route):
         ret
 `), (error) => {
     assert.equal(error instanceof AflParseError, true);
-    assert.equal(error.diagnostics[0].code, "PARSE_JUMP_TABLE_CASE_DUPLICATE");
+    assert.equal(error.diagnostics[0].code, "PARSE_MATCH_CASE_DUPLICATE");
     return true;
   });
 });

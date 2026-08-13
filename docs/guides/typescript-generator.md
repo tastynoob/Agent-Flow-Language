@@ -14,7 +14,7 @@ const coder = bdr.agent("@agent.coder", {
   name: "coder",
   workspace: "work/coder",
 });
-coder.sysprompt("Implement the task carefully.");
+coder.systemPrompt("Implement the task carefully.");
 const result = coder.do(main.params.task, { name: "result" });
 
 bdr.when(result.startsWith("DONE:"));
@@ -31,11 +31,11 @@ const source = bdr.build();
 ```afl
 main(task):
     entry:
-        coder = agent @agent.coder, "work/coder"
-        coder.sysprompt "Implement the task carefully."
+        coder = agent @agent.coder, [workspace: "work/coder"]
+        coder.system_prompt "Implement the task carefully."
         result = coder.do task
         condition_1 = typescript "return String(args[0]).startsWith(String(args[1]))", result, "DONE:"
-        jump condition_1, __afl_when_1_then, __afl_when_1_else
+        branch condition_1, __afl_when_1_then, __afl_when_1_else
 
     __afl_when_1_then:
         ret result
@@ -77,7 +77,7 @@ const coder = new Agent(bdr, "@agent.coder", {
   name: "coder",
   workspace: ["work/coder", "shared/reference"],
 });
-coder.sysprompt("Implement the task carefully.");
+coder.systemPrompt("Implement the task carefully.");
 const result = coder.do(main.params.task, {
   name: "result",
   role: "user",
@@ -87,7 +87,7 @@ const result = coder.do(main.params.task, {
 
 `name` 控制生成的 AFL 目标名称；省略时 generator 根据 Agent symbol 分配唯一名称。`workspace` 接受单个路径、包含主读写目录和只读目录的 string list，或已有 `AflValue`。跨平台代码应使用相对 `executionRoot` 的普通路径，不应嵌入盘符、用户目录或 shell 展开语法。
 
-`memory` 接受已有 Memory 的 `AflValue`。只设置 Memory 时会自动生成 AFL 所需的空 workspace 占位，例如 `reviewer = agent @agent.reviewer,, review_memory`。`do()` 默认使用 `user` role；显式 role 使用标准 role 或 `@role.*`，schema 必须使用 `@schema.*`。`Agent.memory` 返回可用于 Memory instruction 的 `agent.memory` 引用。
+`memory` 接受已有 Memory 的 `AflValue`。只设置 Memory 时生成 `reviewer = agent @agent.reviewer, [memory: review_memory]`。`do()` 默认使用 `user` role；显式 role 使用标准 role 或 `@role.*`，schema 必须使用 `@schema.*`。`Agent.memory` 返回可用于 Memory instruction 的 `agent.memory` 引用。
 
 ## `when` 与 `otherwise`
 
@@ -164,7 +164,7 @@ JavaScript string、number、boolean、`null`、array 和 plain record 作为 AF
 尚未封装或不值得封装的 instruction 可以直接写入：
 
 ```ts
-bdr.emit("memory.append coder.memory, user, result");
+bdr.emit("coder.memory.append user, result");
 const reports = bdr.assign("reports", "sync jobs");
 const parsed = bdr.typescript("return JSON.parse(args[0])", [reports], "parsed");
 ```

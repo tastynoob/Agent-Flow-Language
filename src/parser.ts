@@ -8,7 +8,7 @@ import type {
   FlowCallExpr,
   FlowTarget,
   ForkAction,
-  JumpTableCase,
+  MatchCase,
   NameExpr,
   NodeDocumentation,
   OperExpr,
@@ -48,7 +48,10 @@ export function parseAfl(source: string, sourceName?: string): AflModule {
       throw parseError("PARSE_NODE_HEADER", "expected node declaration 'name(args):'", header, sourceName);
     }
     const name = match[1]!;
-    const parameters = splitTopLevel(match[2]!).map((item) => item.trim()).filter(Boolean);
+    const parameterSource = match[2]!.trim();
+    const parameters = parameterSource === ""
+      ? []
+      : splitRequiredItems(parameterSource, header, sourceName, "node parameter list");
     for (const parameter of parameters) {
       if (!NAME.test(parameter)) {
         throw parseError("PARSE_PARAMETER", `invalid parameter '${parameter}'`, header, sourceName);
@@ -234,6 +237,13 @@ function stripComment(line: string): string {
 }
 
 function parseStatement(line: SourceLine, sourceName?: string): AflInstruction | AflTerminator {
+  const assignment = splitAssignment(line.text);
+  if (assignment !== undefined) {
+    const [dst, rhs] = assignment;
+    requireName(dst, line, sourceName, "destination");
+    return parseAssignedInstruction(dst, rhs, line, sourceName);
+  }
+
   if (line.text === "ret") {
     return { op: "ret", span: line.span };
   }
@@ -244,74 +254,82 @@ function parseStatement(line: SourceLine, sourceName?: string): AflInstruction |
     return { op: "fail", error: parseValue(line.text.slice(5), line, sourceName), span: line.span };
   }
   if (line.text.startsWith("jump ")) {
-    const operands = splitTopLevel(line.text.slice(5));
-    if (operands.length === 1) {
-      const target = operands[0]!.trim();
-      requireName(target, line, sourceName, "jump target");
-      return { op: "jump", trueTarget: target, span: line.span };
-    }
-    if (operands.length === 3) {
-      if (operands[1]!.trim().startsWith("[")) {
-        const defaultTarget = operands[2]!.trim();
-        requireName(defaultTarget, line, sourceName, "jump table default target");
-        return {
-          op: "jump.table",
-          selector: parseValue(operands[0]!, line, sourceName),
-          cases: parseJumpTable(operands[1]!, line, sourceName),
-          defaultTarget,
-          span: line.span,
-        };
-      }
-      const trueTarget = operands[1]!.trim();
-      const falseTarget = operands[2]!.trim();
-      requireName(trueTarget, line, sourceName, "jump target");
-      requireName(falseTarget, line, sourceName, "jump target");
-      return {
-        op: "jump",
-        condition: parseValue(operands[0]!, line, sourceName),
-        trueTarget,
-        falseTarget,
-        span: line.span,
-      };
-    }
-    throw parseError(
-      "PARSE_JUMP",
-      "jump expects one target, condition with two targets, or selector with a jump table and default target",
-      line,
-      sourceName,
-    );
+    const target = line.text.slice(5).trim();
+    requireName(target, line, sourceName, "jump target");
+    return { op: "jump", target, span: line.span };
   }
 
-  if (line.text.startsWith("memory.append ")) {
-    const operands = requireOperandCount(splitTopLevel(line.text.slice(14)), 3, line, sourceName, "memory.append");
-    const role = operands[1]!.trim();
-    requireRole(role, line, sourceName);
+  if (line.text.startsWith("branch ")) {
+    const operands = requireOperandCount(
+      splitRequiredItems(line.text.slice(7), line, sourceName, "branch"),
+      3,
+      line,
+      sourceName,
+      "branch",
+    );
+    const trueTarget = operands[1]!.trim();
+    const falseTarget = operands[2]!.trim();
+    requireName(trueTarget, line, sourceName, "branch target");
+    requireName(falseTarget, line, sourceName, "branch target");
     return {
-      op: "memory.append",
-      memory: parseName(operands[0]!, line, sourceName),
-      role,
-      frag: parseValue(operands[2]!, line, sourceName),
+      op: "branch",
+      condition: parseValue(operands[0]!, line, sourceName),
+      trueTarget,
+      falseTarget,
       span: line.span,
     };
   }
 
-  const systemPrompt = /^([A-Za-z_][A-Za-z0-9_]*)\.sysprompt\s+(.+)$/u.exec(line.text);
+  if (line.text.startsWith("match ")) {
+    const operands = requireOperandCount(
+      splitRequiredItems(line.text.slice(6), line, sourceName, "match"),
+      3,
+      line,
+      sourceName,
+      "match",
+    );
+    const defaultTarget = operands[2]!.trim();
+    requireName(defaultTarget, line, sourceName, "match default target");
+    return {
+      op: "match",
+      selector: parseValue(operands[0]!, line, sourceName),
+      cases: parseMatchCases(operands[1]!, line, sourceName),
+      defaultTarget,
+      span: line.span,
+    };
+  }
+
+  const memoryAppend = /^(.+)\.append\s+(.+)$/u.exec(line.text);
+  if (memoryAppend !== null) {
+    const operands = requireOperandCount(
+      splitRequiredItems(memoryAppend[2]!, line, sourceName, "Memory append"),
+      2,
+      line,
+      sourceName,
+      "Memory append",
+    );
+    const role = operands[0]!.trim();
+    requireRole(role, line, sourceName);
+    return {
+      op: "memory.append",
+      memory: parseName(memoryAppend[1]!, line, sourceName),
+      role,
+      frag: parseValue(operands[1]!, line, sourceName),
+      span: line.span,
+    };
+  }
+
+  const systemPrompt = /^([A-Za-z_][A-Za-z0-9_]*)\.system_prompt\s+(.+)$/u.exec(line.text);
   if (systemPrompt !== null) {
     return {
-      op: "agent.sysprompt",
+      op: "agent.system_prompt",
       agent: parseName(systemPrompt[1]!, line, sourceName),
       prompt: parseValue(systemPrompt[2]!, line, sourceName),
       span: line.span,
     };
   }
 
-  const assignment = splitAssignment(line.text);
-  if (assignment === undefined) {
-    throw parseError("PARSE_INSTRUCTION", "expected an assignment, effect instruction, or terminator", line, sourceName);
-  }
-  const [dst, rhs] = assignment;
-  requireName(dst, line, sourceName, "destination");
-  return parseAssignedInstruction(dst, rhs, line, sourceName);
+  throw parseError("PARSE_INSTRUCTION", "expected an assignment, effect instruction, or terminator", line, sourceName);
 }
 
 function parseAssignedInstruction(
@@ -321,24 +339,23 @@ function parseAssignedInstruction(
   sourceName?: string,
 ): AflInstruction {
   if (rhs.startsWith("agent ")) {
-    const operands = splitTopLevel(rhs.slice(6));
-    if (operands.length < 1 || operands.length > 3 || operands[0]!.trim().length === 0) {
-      throw parseError("PARSE_AGENT", "agent expects a symbol, optional Workspace, and optional Memory", line, sourceName);
+    const operands = splitRequiredItems(rhs.slice(6), line, sourceName, "agent");
+    if (operands.length < 1 || operands.length > 2) {
+      throw parseError("PARSE_AGENT", "agent expects a symbol and optional options", line, sourceName);
     }
-    if (operands.length === 2 && operands[1]!.trim().length === 0) {
-      throw parseError("PARSE_AGENT", "agent cannot end with an empty Workspace operand", line, sourceName);
-    }
-    if (operands.length === 3 && operands[2]!.trim().length === 0) {
-      throw parseError("PARSE_AGENT", "agent cannot end with an empty Memory operand", line, sourceName);
-    }
+    const options = operands[1] === undefined
+      ? new Map<string, string>()
+      : parseOptions(operands[1], line, sourceName, "Agent options", ["workspace", "memory"]);
     return {
       op: "agent",
       dst,
       agent: parseSymbol(operands[0]!, line, sourceName),
-      ...(operands[1] === undefined || operands[1].trim().length === 0
+      ...(options.get("workspace") === undefined
         ? {}
-        : { workspace: parseValue(operands[1], line, sourceName) }),
-      ...(operands[2] === undefined ? {} : { memory: parseName(operands[2], line, sourceName) }),
+        : { workspace: parseValue(options.get("workspace")!, line, sourceName) }),
+      ...(options.get("memory") === undefined
+        ? {}
+        : { memory: parseName(options.get("memory")!, line, sourceName) }),
       span: line.span,
     };
   }
@@ -349,16 +366,13 @@ function parseAssignedInstruction(
       op: "agent.do",
       dst,
       agent: parseName(agentWork[1]!, line, sourceName),
-      ...parseAgentWorkOperands(agentWork[2]!, line, sourceName),
+      ...parseAgentWorkOperands(agentWork[2]!, line, sourceName, "Agent do"),
       span: line.span,
     };
   }
 
   if (rhs.startsWith("prompt ")) {
-    const operands = splitTopLevel(rhs.slice(7));
-    if (operands.length === 0) {
-      throw parseError("PARSE_PROMPT", "prompt expects a source", line, sourceName);
-    }
+    const operands = splitRequiredItems(rhs.slice(7), line, sourceName, "prompt");
     return {
       op: "prompt",
       dst,
@@ -369,7 +383,7 @@ function parseAssignedInstruction(
   }
 
   if (rhs.startsWith("input ")) {
-    const operands = splitTopLevel(rhs.slice(6));
+    const operands = splitRequiredItems(rhs.slice(6), line, sourceName, "input");
     if (operands.length < 1 || operands.length > 2) {
       throw parseError("PARSE_INPUT", "input expects a prompt and optional schema", line, sourceName);
     }
@@ -389,10 +403,7 @@ function parseAssignedInstruction(
   for (const language of ["python", "typescript", "shell"] as const) {
     const prefix = `${language} `;
     if (rhs.startsWith(prefix)) {
-      const operands = splitTopLevel(rhs.slice(prefix.length));
-      if (operands.length === 0) {
-        throw parseError("PARSE_SCRIPT", `${language} expects a quoted script`, line, sourceName);
-      }
+      const operands = splitRequiredItems(rhs.slice(prefix.length), line, sourceName, language);
       const source = parseStringLiteral(operands[0]!, line, sourceName);
       return {
         op: "script",
@@ -406,15 +417,12 @@ function parseAssignedInstruction(
   }
 
   if (rhs.startsWith("call ")) {
-    const operands = splitTopLevel(rhs.slice(5));
-    if (operands.length === 0) {
-      throw parseError("PARSE_CALL", "call expects a flow", line, sourceName);
-    }
+    const call = parseFlowCall(rhs.slice(5), line, sourceName);
     return {
       op: "call",
       dst,
-      target: parseFlowTarget(operands[0]!, line, sourceName),
-      args: operands.slice(1).map((item) => parseValue(item, line, sourceName)),
+      target: call.target,
+      args: call.args,
       span: line.span,
     };
   }
@@ -425,43 +433,52 @@ function parseAssignedInstruction(
       if (!body.endsWith("]")) {
         throw parseError("PARSE_DISPATCH_LIST", "dispatch list is missing closing ']'", line, sourceName);
       }
-      const calls = splitTopLevel(body.slice(1, -1)).filter((item) => item.trim().length > 0)
-        .map((item) => parseFlowCall(item, line, sourceName));
-      return { op: "dispatch.list", dst, calls, span: line.span };
+      const listBody = body.slice(1, -1).trim();
+      const calls = listBody === ""
+        ? []
+        : splitRequiredItems(listBody, line, sourceName, "dispatch list")
+            .map((item) => parseFlowCall(item, line, sourceName));
+      return { op: "dispatch", dst, calls, span: line.span };
     }
-    const operands = requireOperandCount(splitTopLevel(body), 3, line, sourceName, "dispatch batch");
+    throw parseError("PARSE_DISPATCH", "dispatch expects a list of flow calls", line, sourceName);
+  }
+
+  if (rhs.startsWith("repeat ")) {
+    const operands = requireOperandCount(
+      splitRequiredItems(rhs.slice(7), line, sourceName, "repeat"),
+      2,
+      line,
+      sourceName,
+      "repeat",
+    );
+    const call = parseFlowCall(operands[1]!, line, sourceName);
     return {
-      op: "dispatch.batch",
+      op: "repeat",
       dst,
       count: parseValue(operands[0]!, line, sourceName),
-      target: parseFlowTarget(operands[1]!, line, sourceName),
-      task: parseValue(operands[2]!, line, sourceName),
+      target: call.target,
+      args: call.args,
       span: line.span,
     };
   }
 
-  if (rhs.startsWith("fork ")) {
-    const operands = requireOperandCount(splitTopLevel(rhs.slice(5)), 2, line, sourceName, "fork");
-    const actionMatch = /^([A-Za-z_][A-Za-z0-9_]*)\.do\s+(.+)$/u.exec(operands[1]!.trim());
-    if (actionMatch === null) {
-      throw parseError("PARSE_FORK_ACTION", "fork action must be 'dst.do ...'", line, sourceName);
-    }
+  const fork = /^([A-Za-z_][A-Za-z0-9_]*)\.fork\s+(.+)$/u.exec(rhs);
+  if (fork !== null) {
     const action: ForkAction = {
-      ...parseAgentWorkOperands(actionMatch[2]!, line, sourceName),
+      ...parseAgentWorkOperands(fork[2]!, line, sourceName, "Agent fork"),
       span: line.span,
     };
     return {
       op: "fork",
       dst,
-      sourceAgent: parseName(operands[0]!, line, sourceName),
-      actionReceiver: actionMatch[1]!,
+      sourceAgent: parseName(fork[1]!, line, sourceName),
       action,
       span: line.span,
     };
   }
 
   if (rhs.startsWith("sync ")) {
-    const operands = splitTopLevel(rhs.slice(5));
+    const operands = splitRequiredItems(rhs.slice(5), line, sourceName, "sync");
     if (operands.length < 1 || operands.length > 2) {
       throw parseError("PARSE_SYNC", "sync expects a TaskGroup and optional formatter", line, sourceName);
     }
@@ -475,10 +492,7 @@ function parseAssignedInstruction(
   }
 
   if (rhs.startsWith("invoke ")) {
-    const operands = splitTopLevel(rhs.slice(7));
-    if (operands.length === 0) {
-      throw parseError("PARSE_INVOKE", "invoke expects a capability symbol", line, sourceName);
-    }
+    const operands = splitRequiredItems(rhs.slice(7), line, sourceName, "invoke");
     return {
       op: "invoke",
       dst,
@@ -488,64 +502,32 @@ function parseAssignedInstruction(
     };
   }
 
-  if (rhs.startsWith("memory.copy ")) {
-    return { op: "memory.copy", dst, memory: parseName(rhs.slice(12), line, sourceName), span: line.span };
+  const memoryCopy = /^(.+)\.copy$/u.exec(rhs);
+  if (memoryCopy !== null) {
+    return { op: "memory.copy", dst, memory: parseName(memoryCopy[1]!, line, sourceName), span: line.span };
   }
 
-  if (rhs.startsWith("memory.apply ")) {
-    const operands = requireOperandCount(splitTopLevel(rhs.slice(13)), 2, line, sourceName, "memory.apply");
+  const withMemory = /^([A-Za-z_][A-Za-z0-9_]*)\.with_memory\s+(.+)$/u.exec(rhs);
+  if (withMemory !== null) {
     return {
-      op: "memory.apply",
+      op: "agent.with_memory",
       dst,
-      sourceAgent: parseName(operands[0]!, line, sourceName),
-      memory: parseName(operands[1]!, line, sourceName),
+      agent: parseName(withMemory[1]!, line, sourceName),
+      memory: parseName(withMemory[2]!, line, sourceName),
       span: line.span,
     };
   }
 
-  if (rhs.startsWith("freedom.route ")) {
-    const operands = splitTopLevel(rhs.slice(13));
-    if (operands.length !== 5) {
-      throw parseError(
-        "PARSE_FREEDOM_ROUTE",
-        "freedom.route expects planner, prompt, constraint, Node allowlist, and controlled params",
-        line,
-        sourceName,
-      );
-    }
-    return {
-      op: "freedom.route",
+  const agentControl = /^([A-Za-z_][A-Za-z0-9_]*)\.(route|flow)\s+(.+)$/u.exec(rhs);
+  if (agentControl !== null) {
+    return parseAgentControlInstruction(
       dst,
-      planner: parseName(operands[0]!, line, sourceName),
-      prompt: parseValue(operands[1]!, line, sourceName),
-      constraint: parseRecord(operands[2]!, line, sourceName, "Freedom constraint"),
-      nodes: parseLocalNodeList(operands[3]!, line, sourceName),
-      params: parseRecord(operands[4]!, line, sourceName, "Freedom controlled params"),
-      span: line.span,
-    };
-  }
-
-  if (rhs.startsWith("freedom.flow ")) {
-    const operands = splitTopLevel(rhs.slice(13));
-    if (operands.length !== 6) {
-      throw parseError(
-        "PARSE_FREEDOM_FLOW",
-        "freedom.flow expects writer, prompt, constraint, Node allowlist, Agent allowlist, and controlled params",
-        line,
-        sourceName,
-      );
-    }
-    return {
-      op: "freedom.flow",
-      dst,
-      planner: parseName(operands[0]!, line, sourceName),
-      prompt: parseValue(operands[1]!, line, sourceName),
-      constraint: parseRecord(operands[2]!, line, sourceName, "Freedom constraint"),
-      nodes: parseLocalNodeList(operands[3]!, line, sourceName),
-      agents: parseAgentSymbolList(operands[4]!, line, sourceName),
-      params: parseRecord(operands[5]!, line, sourceName, "Freedom controlled params"),
-      span: line.span,
-    };
+      agentControl[1]!,
+      agentControl[2]! as "route" | "flow",
+      agentControl[3]!,
+      line,
+      sourceName,
+    );
   }
 
   throw parseError("PARSE_OPCODE", `unknown instruction '${rhs.split(/\s/u, 1)[0] ?? rhs}'`, line, sourceName);
@@ -554,28 +536,113 @@ function parseAssignedInstruction(
 function parseAgentWorkOperands(
   text: string,
   line: SourceLine,
-  sourceName?: string,
+  sourceName: string | undefined,
+  label: string,
 ): { role?: string; input: ValueExpr; schema?: SymbolExpr } {
-  const operands = splitTopLevel(text);
-  if (operands.length === 0 || operands.length > 3) {
-    throw parseError("PARSE_AGENT_WORK", "Agent work expects input with optional role and schema", line, sourceName);
+  const operands = splitRequiredItems(text, line, sourceName, label);
+  if (operands.length < 1 || operands.length > 2) {
+    throw parseError("PARSE_AGENT_WORK", `${label} expects input and optional options`, line, sourceName);
   }
-  let role: string | undefined;
-  if (operands.length >= 2 && isRole(operands[0]!.trim())) {
-    role = operands.shift()!.trim();
-  }
-  let schema: SymbolExpr | undefined;
-  if (operands.length === 2 && operands[1]!.trim().startsWith("@schema.")) {
-    schema = parseSchema(operands.pop()!, line, sourceName);
-  }
-  if (operands.length !== 1) {
-    throw parseError("PARSE_AGENT_WORK", "Agent work has an invalid role/input/schema combination", line, sourceName);
-  }
+  const options = operands[1] === undefined
+    ? new Map<string, string>()
+    : parseOptions(operands[1], line, sourceName, `${label} options`, ["role", "schema"]);
+  const role = options.get("role")?.trim();
+  if (role !== undefined) requireRole(role, line, sourceName);
+  const schema = options.get("schema") === undefined
+    ? undefined
+    : parseSchema(options.get("schema")!, line, sourceName);
   return {
     ...(role === undefined ? {} : { role }),
     input: parseValue(operands[0]!, line, sourceName),
     ...(schema === undefined ? {} : { schema }),
   };
+}
+
+function parseAgentControlInstruction(
+  dst: string,
+  agent: string,
+  mode: "route" | "flow",
+  text: string,
+  line: SourceLine,
+  sourceName?: string,
+): AflInstruction {
+  const operands = splitRequiredItems(text, line, sourceName, `Agent ${mode}`);
+  if (operands.length < 1 || operands.length > 2) {
+    throw parseError(
+      mode === "route" ? "PARSE_FREEDOM_ROUTE" : "PARSE_FREEDOM_FLOW",
+      `Agent ${mode} expects prompt and optional options`,
+      line,
+      sourceName,
+    );
+  }
+  const allowed = mode === "flow"
+    ? ["nodes", "agents", "params", "min_routes", "max_routes"]
+    : ["nodes", "params", "min_routes", "max_routes"];
+  const options = operands[1] === undefined
+    ? new Map<string, string>()
+    : parseOptions(operands[1], line, sourceName, `Agent ${mode} options`, allowed);
+  const nodes = parseLocalNodeList(options.get("nodes") ?? "[]", line, sourceName);
+  const params = parseRecord(options.get("params") ?? "[:]", line, sourceName, `Agent ${mode} params`);
+  const base = {
+    dst,
+    agent: parseName(agent, line, sourceName),
+    prompt: parseValue(operands[0]!, line, sourceName),
+    nodes,
+    params,
+    ...(options.get("min_routes") === undefined
+      ? {}
+      : { minRoutes: parseValue(options.get("min_routes")!, line, sourceName) }),
+    ...(options.get("max_routes") === undefined
+      ? {}
+      : { maxRoutes: parseValue(options.get("max_routes")!, line, sourceName) }),
+    span: line.span,
+  };
+  if (mode === "route") return { op: "agent.route", ...base };
+  return {
+    op: "agent.flow",
+    ...base,
+    agents: parseAgentSymbolList(options.get("agents") ?? "[]", line, sourceName),
+  };
+}
+
+function parseOptions(
+  text: string,
+  line: SourceLine,
+  sourceName: string | undefined,
+  label: string,
+  allowed: readonly string[],
+): Map<string, string> {
+  const source = text.trim();
+  if (!source.startsWith("[") || !source.endsWith("]")) {
+    throw parseError("PARSE_OPTIONS", `${label} must be enclosed in '[' and ']'`, line, sourceName);
+  }
+  const body = source.slice(1, -1).trim();
+  if (body === ":") return new Map();
+  if (body === "") {
+    throw parseError("PARSE_OPTIONS", `${label} uses '[:]' for empty options`, line, sourceName);
+  }
+  const result = new Map<string, string>();
+  const allowedFields = new Set(allowed);
+  for (const item of splitRequiredItems(body, line, sourceName, label)) {
+    const colon = findTopLevelCharacter(item, ":");
+    if (colon <= 0) {
+      throw parseError("PARSE_OPTIONS", `invalid ${label} entry '${item}'`, line, sourceName);
+    }
+    const key = item.slice(0, colon).trim();
+    requireName(key, line, sourceName, `${label} field`);
+    if (!allowedFields.has(key)) {
+      throw parseError("PARSE_OPTIONS_FIELD", `unknown ${label} field '${key}'`, line, sourceName);
+    }
+    if (result.has(key)) {
+      throw parseError("PARSE_OPTIONS_FIELD_DUPLICATE", `${label} repeats field '${key}'`, line, sourceName);
+    }
+    const value = item.slice(colon + 1).trim();
+    if (value === "") {
+      throw parseError("PARSE_OPTIONS", `${label} field '${key}' requires a value`, line, sourceName);
+    }
+    result.set(key, value);
+  }
+  return result;
 }
 
 function parseFlowCall(text: string, line: SourceLine, sourceName?: string): FlowCallExpr {
@@ -588,7 +655,8 @@ function parseFlowCall(text: string, line: SourceLine, sourceName?: string): Flo
   const argsText = trimmed.slice(open + 1, -1);
   const args = argsText.trim().length === 0
     ? []
-    : splitTopLevel(argsText).map((item) => parseValue(item, line, sourceName));
+    : splitRequiredItems(argsText, line, sourceName, "flow call arguments")
+        .map((item) => parseValue(item, line, sourceName));
   return { target, args, span: line.span };
 }
 
@@ -612,7 +680,7 @@ function parseLocalNodeList(text: string, line: SourceLine, sourceName?: string)
   }
   const body = value.slice(1, -1).trim();
   if (body.length === 0) return [];
-  return splitTopLevel(body).map((item) => {
+  return splitRequiredItems(body, line, sourceName, "Freedom Node allowlist").map((item) => {
     const name = item.trim();
     requireName(name, line, sourceName, "Freedom Node");
     return { kind: "local", name, span: line.span };
@@ -626,7 +694,7 @@ function parseAgentSymbolList(text: string, line: SourceLine, sourceName?: strin
   }
   const body = value.slice(1, -1).trim();
   if (body.length === 0) return [];
-  return splitTopLevel(body).map((item) => {
+  return splitRequiredItems(body, line, sourceName, "Freedom Agent allowlist").map((item) => {
     const agent = parseSymbol(item, line, sourceName);
     if (!agent.name.startsWith("@agent.")) {
       throw parseError(
@@ -647,7 +715,6 @@ function parseRecord(
   label: string,
 ): RecordExpr {
   const source = text.trim();
-  if (source === "[]") return { kind: "record", entries: {}, span: line.span };
   const value = parseValue(source, line, sourceName);
   if (value.kind !== "record") {
     throw parseError("PARSE_FREEDOM_RECORD", `${label} must be a record`, line, sourceName);
@@ -655,40 +722,40 @@ function parseRecord(
   return value;
 }
 
-function parseJumpTable(
+function parseMatchCases(
   text: string,
   line: SourceLine,
   sourceName?: string,
-): JumpTableCase[] {
+): MatchCase[] {
   const value = text.trim();
   if (!value.startsWith("[") || !value.endsWith("]")) {
-    throw parseError("PARSE_JUMP_TABLE", "jump table must be enclosed in '[' and ']'", line, sourceName);
+    throw parseError("PARSE_MATCH", "match cases must be enclosed in '[' and ']'", line, sourceName);
   }
   const body = value.slice(1, -1).trim();
   if (body === "") {
-    throw parseError("PARSE_JUMP_TABLE_EMPTY", "jump table requires at least one case", line, sourceName);
+    throw parseError("PARSE_MATCH_EMPTY", "match requires at least one case", line, sourceName);
   }
-  const cases: JumpTableCase[] = [];
-  for (const item of splitTopLevel(body)) {
+  const cases: MatchCase[] = [];
+  for (const item of splitRequiredItems(body, line, sourceName, "match table")) {
     const colon = findTopLevelCharacter(item, ":");
     if (colon <= 0) {
-      throw parseError("PARSE_JUMP_TABLE_CASE", `invalid jump table case '${item.trim()}'`, line, sourceName);
+      throw parseError("PARSE_MATCH_CASE", `invalid match case '${item.trim()}'`, line, sourceName);
     }
     const expression = parseValue(item.slice(0, colon), line, sourceName);
-    if (expression.kind !== "literal" || !isJumpTableScalar(expression.value)) {
+    if (expression.kind !== "literal" || !isMatchScalar(expression.value)) {
       throw parseError(
-        "PARSE_JUMP_TABLE_CASE",
-        "jump table case values must be null, boolean, number, or string literals",
+        "PARSE_MATCH_CASE",
+        "match case values must be null, boolean, number, or string literals",
         line,
         sourceName,
       );
     }
     const target = item.slice(colon + 1).trim();
-    requireName(target, line, sourceName, "jump table target");
+    requireName(target, line, sourceName, "match target");
     if (cases.some((entry) => entry.value === expression.value)) {
       throw parseError(
-        "PARSE_JUMP_TABLE_CASE_DUPLICATE",
-        `jump table repeats case ${JSON.stringify(expression.value)}`,
+        "PARSE_MATCH_CASE_DUPLICATE",
+        `match repeats case ${JSON.stringify(expression.value)}`,
         line,
         sourceName,
       );
@@ -698,7 +765,7 @@ function parseJumpTable(
   return cases;
 }
 
-function isJumpTableScalar(value: unknown): value is null | boolean | number | string {
+function isMatchScalar(value: unknown): value is null | boolean | number | string {
   return value === null || ["boolean", "number", "string"].includes(typeof value);
 }
 
@@ -773,7 +840,7 @@ function parseValue(text: string, line: SourceLine, sourceName?: string): ValueE
   if (value.startsWith("[") && value.endsWith("]")) {
     const body = value.slice(1, -1).trim();
     if (body === ":") return { kind: "record", entries: {}, span: line.span };
-    const items = body === "" ? [] : splitTopLevel(body);
+    const items = body === "" ? [] : splitRequiredItems(body, line, sourceName, "collection literal");
     const record = items.length > 0 && items.every((item) => findTopLevelCharacter(item, ":") > 0);
     const mixed = items.some((item) => findTopLevelCharacter(item, ":") > 0) && !record;
     if (mixed) {
@@ -1023,6 +1090,19 @@ export function splitTopLevel(text: string): string[] {
   return values;
 }
 
+function splitRequiredItems(
+  text: string,
+  line: SourceLine,
+  sourceName: string | undefined,
+  label: string,
+): string[] {
+  const values = splitTopLevel(text);
+  if (values.some((value) => value.length === 0)) {
+    throw parseError("PARSE_EMPTY_ITEM", `${label} cannot contain an empty item`, line, sourceName);
+  }
+  return values;
+}
+
 function findTopLevelCharacter(text: string, target: string): number {
   let quoted = false;
   let escaped = false;
@@ -1069,7 +1149,7 @@ function isRole(value: string): boolean {
 }
 
 function isTerminator(value: AflInstruction | AflTerminator): value is AflTerminator {
-  return value.op === "jump" || value.op === "jump.table" || value.op === "ret" || value.op === "fail";
+  return value.op === "jump" || value.op === "branch" || value.op === "match" || value.op === "ret" || value.op === "fail";
 }
 
 function parseError(

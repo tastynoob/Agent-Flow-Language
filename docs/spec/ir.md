@@ -45,16 +45,18 @@ Frag 不携带 role。Frag 进入 Agent 或 Memory 时才确定 role。Handle �
 
 | 类别 | 指令 |
 | --- | --- |
-| Agent | `agent`、`agent.sysprompt`、`agent.do` |
+| Agent | `agent`、`agent.system_prompt`、`agent.do` |
 | 数据与输入 | `prompt`、`input`、`oper` |
 | Script | `python`、`typescript`、`shell` |
-| Flow | `call`、两种 `dispatch`、`sync`、`fork` |
+| Flow | `call`、`dispatch`、`repeat`、`sync`、`fork` |
 | Capability | `invoke` |
-| Memory | `memory.append`、`memory.copy`、`memory.apply` |
-| 动态 Flow | `freedom.route`、`freedom.flow` |
-| 控制流 | `jump`（无条件、boolean 或有序跳转表）、`ret`、`fail` |
+| Memory | `memory.append`、`memory.copy`、`agent.with_memory` |
+| 动态 Flow | `agent.route`、`agent.flow` |
+| 控制流 | `jump`、`branch`、`match`、`ret`、`fail` |
 
 完整操作数格式见[文本语法](syntax.md)，运行行为见[执行语义](semantics.md)。
+
+Core IR opcode 与 AFL 表层操作保持一一对应。接收者语法会在 IR 中展开为显式字段，例如 `target.append` 对应 `memory.append`，`planner.route` 对应 `agent.route`；`jump`、`branch` 和 `match` 是三种独立 terminator，不共用兼容形状。
 
 ## 5. Dependency 调度
 
@@ -65,8 +67,8 @@ Basic block 内的指令不因文本相邻而自动串行。VM 从名称引用�
 需要显式 child flow 生命周期时使用：
 
 - `dispatch [flow_a(...), flow_b(...)]` 启动一组显式调用；
-- `dispatch count, flow, task` 启动 `count` 个同构调用；
-- `freedom.route` 让 planner 从显式候选 Node 中构造动态 TaskGroup；
+- `repeat count, flow(args...)` 启动 `count` 个同构调用；
+- `planner.route` 让 planner 从显式候选 Node 中构造动态 TaskGroup；
 - `sync` 等待 TaskGroup 并收集结果；
 - `fork` 复制 source Agent 的 Memory，创建 branch Agent，并立即执行一次 `do`。
 

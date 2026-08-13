@@ -69,7 +69,7 @@ node_name(arg_a, arg_b):
 不要把同一 block 内的文本顺序误认为执行顺序。VM 根据下列关系调度普通 instruction：
 
 - 数据依赖：读取某个局部值的 instruction 等待其生产者。
-- Agent 依赖：同一 Agent 的 `sysprompt`、`do` 和相关 Memory 操作按同一 block 内的文本顺序排序。
+- Agent 依赖：同一 Agent 的 `system_prompt`、`do` 和相关 Memory 操作按同一 block 内的文本顺序排序。
 - Memory 依赖：同一 Memory 的状态操作按文本顺序排序；copy 读取前序操作已提交的状态。
 - TaskGroup 依赖：`sync` 等待并消费对应 group。
 - workspace 依赖：写 workspace 与相同或重叠 workspace 的读写访问互斥；只读 workspace 可并行读取。
@@ -80,18 +80,18 @@ node_name(arg_a, arg_b):
 
 ### `agent`
 
-形式：`coder = agent @agent.coder`；`coder = agent @agent.coder, "work/coder"`；`coder = agent @agent.coder, ["work/coder", "shared/specs"]`；`coder = agent @agent.coder,, saved_memory`。
+形式：`coder = agent @agent.coder`；`coder = agent @agent.coder, [workspace: "work/coder"]`；`coder = agent @agent.coder, [workspace: ["work/coder", "shared/specs"], memory: saved_memory]`。
 
-- 使用第一个 operand 选择 Agent symbol。
-- 使用可选 workspace 字符串声明一个主读写目录；使用至少两个元素的 list 把第一个目录作为主读写 workspace，其余目录作为只读 workspace。
+- 使用第一个 operand 选择 Agent symbol；第二个 operand 是可选的 typed options record。
+- `workspace` 字符串声明一个主读写目录；至少两个元素的 list 把第一项作为主读写 workspace，其余项作为只读 workspace。
 - 省略 workspace 时，让 VM 为该 Agent 分配独立临时 workspace。不要依赖临时目录的物理位置。
-- 如需绑定既有 Memory，把它放在第三个 operand；省略第二个 operand 时保留两个逗号。
+- 如需绑定既有 Memory，使用 `memory` option；不使用空 operand 占位。
 - 只绑定尚未被其他 Agent 拥有的 Memory。创建后通过 `coder.memory` 取得其 Memory handle。
 - 让宿主拒绝主 workspace 与只读 workspace 的重叠、逃逸或不合法解析。不要把只读声明当作 executor 已经强制执行的证明。
 
-### `agent.sysprompt`
+### `agent.system_prompt`
 
-形式：`coder.sysprompt "Act as a careful implementer."`；`coder.sysprompt @prompt.coder_system`；`coder.sysprompt prepared_fragment`。
+形式：`coder.system_prompt "Act as a careful implementer."`；`coder.system_prompt @prompt.coder_system`；`coder.system_prompt prepared_fragment`。
 
 - 在 `agent.do` 前设置独立的 system prompt。
 - 传入字符串、Frag、compute value 或 prompt symbol；symbol 通过 `prompts` binding 渲染。
@@ -100,7 +100,7 @@ node_name(arg_a, arg_b):
 
 ### `agent.do`
 
-形式：`answer = coder.do request`；`answer = coder.do @role.reviewer, request`；`answer = coder.do request, @schema.review`。
+形式：`answer = coder.do request`；`answer = coder.do request, [role: @role.reviewer]`；`answer = coder.do request, [schema: @schema.review]`。
 
 - 把一次 `do` 视为完整的 Agent activation，而不是单个模型请求。executor 可以在内部执行多轮推理和工具调用。
 - 省略 role 时使用 `user`；也可使用标准 role 或 `@role.*` 自定义 role。
@@ -153,7 +153,7 @@ node_name(arg_a, arg_b):
 
 ### `call`
 
-形式：`result = call local_node, input_value`；`result = call @flow.lookup, query`。
+形式：`result = call local_node(input_value)`；`result = call @flow.lookup(query)`。
 
 - 调用本模块 node 时匹配精确参数数量。局部调用可以传递 VM 内部值，包括由被调 node 合法使用的 handle。
 - 调用 symbol flow 时使用 `flows.invoke`，只传 Frag、compute 或 symbol。
@@ -168,9 +168,9 @@ node_name(arg_a, arg_b):
 - 结果顺序按声明顺序确定，不按完成顺序确定。
 - 任一 child 失败时取消其余 child，并让后续 `sync` 传播失败。
 
-### `dispatch` 批量形式
+### `repeat`
 
-形式：`jobs = dispatch task_count, process_item, task`。
+形式：`jobs = repeat task_count, process_item(task)`。
 
 - 把 `task_count` 求值为非负整数，使用同一个 task 参数启动指定数量的调用。
 - 把总任务数与并发 worker 上限分开：operand 决定总调用数，`maxDispatchWorkers` 限制同时执行数。
@@ -187,11 +187,10 @@ node_name(arg_a, arg_b):
 
 ### `fork`
 
-形式：`branch = fork source, branch.do "Explore an alternative"`。
+形式：`branch = source.fork "Explore an alternative"`；`branch = source.fork request, [role: user, schema: @schema.Result]`。
 
-- 让左侧目标名与 `.do` receiver 相同。
 - 复制 source Agent 的 Memory 和可用 continuation checkpoint，创建具有相同 symbol、system prompt 和 workspace 的新 Agent，然后立即执行其首次 `do`。
-- 当前文本 parser 的快捷形式只接受默认 `user` role 和一个 input。需要自定义 role 或 schema 时，先使用 `memory.copy` 与 `memory.apply` 创建分支，再单独执行普通 `agent.do`。
+- options 与普通 `do` 相同，可以显式指定 role 或 schema。
 - 把首次输出保留在 branch Memory 中；该 instruction 返回的是新 Agent handle，不是输出 Frag。
 - 把 branch Memory 视为独立快照；后续修改不会回流到 source。
 - 即使 Memory 独立，共享或重叠 workspace 仍会形成资源锁和潜在外部副作用。
@@ -209,7 +208,7 @@ node_name(arg_a, arg_b):
 
 ### `memory.append`
 
-形式：`memory.append coder.memory, user, request`；`memory.append memory_copy, @role.note, note`。
+形式：`coder.memory.append user, request`；`memory_copy.append @role.note, note`。
 
 - 向目标 Memory 追加一条带 role 的 Frag。
 - 使用标准 role 或 `@role.*`；让 executor 的 Memory contract 验证可导入的 role schema。
@@ -217,15 +216,15 @@ node_name(arg_a, arg_b):
 
 ### `memory.copy`
 
-形式：`snapshot = memory.copy coder.memory`。
+形式：`snapshot = coder.memory.copy`。
 
 - 创建独立 Memory 快照，保留消息 role 和可用 continuation checkpoint。
 - 不让后续 source 更新传播到 copy，也不让 copy 更新回写 source。
 - 允许参考 VM 使用持久化 base reference 延迟物化，但不要让 binding 暴露共享可变状态。
 
-### `memory.apply`
+### `with_memory`
 
-形式：`reviewer = memory.apply coder, snapshot`。
+形式：`reviewer = coder.with_memory snapshot`。
 
 - 创建新 Agent，沿用 source 的 symbol、system prompt 和 workspace，并取得给定 Memory 的所有权。
 - 只使用未被其他 Agent 拥有的 Memory；该操作不再复制 Memory。
@@ -235,9 +234,9 @@ node_name(arg_a, arg_b):
 
 只在路由数量、调用目标或子流程结构必须由 Agent 在运行时决定时使用 Freedom。优先把候选范围和参数显式列入 allowlist。两种 Freedom 都继续使用 planner/writer 现有的 Memory 与 session，把 prompt 作为 `user` 消息追加，并只在当前 activation 临时注入控制工具。
 
-### `freedom.route`
+### `agent.route`
 
-形式：`routes = freedom.route planner, request, [min_routes: 1, max_routes: 3], [inspect, test, summarize], [payload: input_value, policy: policy_record]`。
+形式：`routes = planner.route request, [nodes: [inspect, test, summarize], params: [payload: input_value, policy: policy_record], min_routes: 1, max_routes: 3]`。
 
 - 要求 planner executor 支持 `dynamicControlTools`。
 - 只暴露 `afl.environment.get` 和 `afl.route.add`。planner 可读取受控参数，并登记 allowlist 中的 local node 调用。
@@ -245,9 +244,9 @@ node_name(arg_a, arg_b):
 - 不把 planner 的最终文本当作 route 结果；它只保留在 planner Memory 和 trace 中。
 - 用 `min_routes` 和 `max_routes` 约束数量；`max_routes` 必须为正、不得小于 `min_routes`，并受宿主上限约束。
 
-### `freedom.flow`
+### `agent.flow`
 
-形式：`result = freedom.flow writer, request, [min_routes: 1, max_routes: 4], [inspect, test, summarize], [@agent.coder, @agent.reviewer], [payload: input_value]`。
+形式：`result = writer.flow request, [nodes: [inspect, test, summarize], agents: [@agent.coder, @agent.reviewer], params: [payload: input_value], min_routes: 1, max_routes: 4]`。
 
 - 只暴露 `afl.environment.get`、`afl.node.execute`、`afl.ir.validate` 和 `afl.ir.execute`。
 - 让 `node.execute` 立即执行 allowlist 中的 node；允许后续工具调用引用先前结果。
@@ -261,9 +260,9 @@ Freedom 的参数 record 只放 Frag 或 compute value，不放 handle 或 symbo
 
 ### `jump`
 
-形式：`jump next`；`jump approved, accepted, rejected`。
+形式：`jump next`；`branch approved, accepted, rejected`；`match route, ["fast": fast, "safe": safe], fallback`。
 
-- 无条件跳转到指定 block，或使用布尔 compute value 选择两个 block。
+- `jump` 无条件跳转；`branch` 使用 boolean compute value 选择两个 block；`match` 按顺序做类型敏感的精确匹配。
 - 不把 Frag、数字或字符串当作隐式 truthy 值。
 - 在控制流合流后，只使用所有前驱都定义的值。
 

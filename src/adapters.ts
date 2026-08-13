@@ -1,4 +1,4 @@
-import type { AflModule, ComputeValue, Frag, FreedomMode, ScriptLanguage, SymbolRef } from "./ir.js";
+import type { AflModule, ComputeValue, Frag, AgentControlMode, ScriptLanguage, SymbolRef } from "./ir.js";
 import type { AgentExecutorBackend, AgentInteractionHost } from "./agent-executor.js";
 import type { AgentApprovalQueue } from "./approval-queue.js";
 import type { AgentPreToolPolicyConfig } from "./agent-tool-policy.js";
@@ -108,7 +108,7 @@ export interface SchemaAdapter {
 }
 
 export interface FreedomPolicyRequest {
-  readonly mode: FreedomMode;
+  readonly mode: AgentControlMode;
   readonly module: AflModule;
   readonly runId: string;
   readonly node: string;

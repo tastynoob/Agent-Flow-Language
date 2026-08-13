@@ -6,19 +6,19 @@
 coder_review(task):
     entry:
         coder = agent @agent.coder
-        coder.sysprompt @prompt.coder
+        coder.system_prompt @prompt.coder
         task_prompt = prompt "Implement the task", task
         code = coder.do task_prompt
         jump review
 
     review:
-        review_memory = memory.copy coder.memory
-        reviewer = agent @agent.reviewer,, review_memory
-        reviewer.sysprompt @prompt.reviewer
+        review_memory = coder.memory.copy
+        reviewer = agent @agent.reviewer, [memory: review_memory]
+        reviewer.system_prompt @prompt.reviewer
         review_prompt = prompt "Review the implementation. If no defect exists, output exactly finish; otherwise output the defect list"
         review_result = reviewer.do review_prompt
         finish = oper review_result == "finish"
-        jump finish, done, revise
+        branch finish, done, revise
 
     revise:
         fix_prompt = prompt "Fix the following defects", review_result
@@ -39,7 +39,7 @@ coder_review(task):
 
 ```text
 revise:
-    memory.append coder.memory, user, review_result
+    coder.memory.append user, review_result
     fix_command = prompt @prompt.fix_current_defects
     code = coder.do fix_command
     jump review
@@ -53,7 +53,7 @@ revise:
 blind_review(code):
     entry:
         reviewer = agent @agent.reviewer
-        reviewer.sysprompt @prompt.reviewer
+        reviewer.system_prompt @prompt.reviewer
         review_prompt = prompt "Review only the supplied code. Return exactly finish when no defect exists", code
         review_result = reviewer.do review_prompt
         ret review_result
@@ -66,9 +66,9 @@ Reviewer 只看显式传入的 `code` Frag，不继承 Coder 的工作历史。
 ```text
 parallel_review(code):
     entry:
-        security = agent @agent.security_reviewer, "workers/security/"
-        quality = agent @agent.quality_reviewer, "workers/quality/"
-        tests = agent @agent.test_reviewer, "workers/tests/"
+        security = agent @agent.security_reviewer, [workspace: "workers/security/"]
+        quality = agent @agent.quality_reviewer, [workspace: "workers/quality/"]
+        tests = agent @agent.test_reviewer, [workspace: "workers/tests/"]
 
         security_prompt = prompt "Review security", code
         quality_prompt = prompt "Review maintainability", code
@@ -105,9 +105,9 @@ explore_alternatives(coder, task):
         safe_prompt = prompt "Try the lowest-risk approach", task
         simple_prompt = prompt "Try the simplest maintainable approach", task
 
-        fast = fork coder, fast.do fast_prompt
-        safe = fork coder, safe.do safe_prompt
-        simple = fork coder, simple.do simple_prompt
+        fast = coder.fork fast_prompt
+        safe = coder.fork safe_prompt
+        simple = coder.fork simple_prompt
 
         finish_prompt = prompt "Finish and return the proposed result"
         fast_result = fast.do finish_prompt
@@ -128,7 +128,7 @@ guided_work(task):
         start_prompt = prompt "Start the task. Output ask_user if external input is required"
         step = worker.do start_prompt
         needs_user = oper step == "ask_user"
-        jump needs_user, ask_user, continue_work
+        branch needs_user, ask_user, continue_work
 
     ask_user:
         answer = input "Provide the missing information"
@@ -151,7 +151,7 @@ structured_review(code):
     entry:
         reviewer = agent @agent.reviewer
         review_prompt = prompt "Return the review as JSON", code
-        report = reviewer.do review_prompt, @schema.ReviewReport
+        report = reviewer.do review_prompt, [schema: @schema.ReviewReport]
         ret report
 ```
 
@@ -193,29 +193,29 @@ route_task(task):
         route_prompt = prompt "Return a known route name, or exactly unknown", task
         route = router.do route_prompt
         known = oper route != "unknown"
-        jump known, known_route, fallback
+        branch known, known_route, fallback
 
     known_route:
-        result = call @flow.known_dispatch, task, route
+        result = call @flow.known_dispatch(task, route)
         ret result
 
     fallback:
         planner = agent @agent.planner
         freedom_prompt = prompt "Use an existing Node or construct and validate a small AFL flow for this unresolved task", task, route
-        result = freedom.flow planner, freedom_prompt, [min_routes: 0, max_routes: 2], [known_worker], [@agent.worker], [task: task]
+        result = planner.flow freedom_prompt, [nodes: [known_worker], agents: [@agent.worker], params: [task: task], min_routes: 0, max_routes: 2]
         ret result
 ```
 
-`freedom.flow` 在已知路由无法覆盖任务时接管。VM 只在这次 writer activation 中注入环境查询、Node 调用、IR 校验和 IR 执行工具；候选 Node、Agent 与参数引用都来自指令本身。Generated IR 必须先通过同一 parser、validator、作用域和 policy 检查，child Agent 的主工作区还不能与 planner 重叠。指令最终返回 planner 的 final response role-free Frag。
+`agent.flow` 在已知路由无法覆盖任务时接管。VM 只在这次 writer activation 中注入环境查询、Node 调用、IR 校验和 IR 执行工具；候选 Node、Agent 与参数引用都来自指令本身。Generated IR 必须先通过同一 parser、validator、作用域和 policy 检查，child Agent 的主工作区还不能与 planner 重叠。指令最终返回 planner 的 final response role-free Frag。
 
 ## 12. 可复用 Flow 集
 
 ```text
 deliver(task):
     entry:
-        draft = call @flow.common.implement, task
-        reviewed = call @flow.common.review_until_pass, task, draft
-        packaged = call @flow.common.package_result, reviewed
+        draft = call @flow.common.implement(task)
+        reviewed = call @flow.common.review_until_pass(task, draft)
+        packaged = call @flow.common.package_result(reviewed)
         ret packaged
 ```
 

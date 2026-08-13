@@ -33,11 +33,11 @@ main(task):
         code = coder.do task
         jump review
     review:
-        review_memory = memory.copy coder.memory
-        reviewer = agent @agent.reviewer,, review_memory
+        review_memory = coder.memory.copy
+        reviewer = agent @agent.reviewer, [memory: review_memory]
         review_result = reviewer.do "review"
         finish = typescript "const lines = String(args[0]).replaceAll('*', '').replaceAll('_', '').toLowerCase().split(String.fromCharCode(10)).map(line => line.trim()); return lines.some(line => ['finish', 'approved', 'pass'].some(verdict => line === verdict || line.startsWith('verdict: ' + verdict) || line.startsWith('status: ' + verdict)))", review_result
-        jump finish, done, revise
+        branch finish, done, revise
     revise:
         fix = prompt "fix", review_result
         code = coder.do fix
@@ -75,8 +75,8 @@ test("independent Agents run concurrently while one Agent remains ordered", asyn
   const parallel = AflVm.fromSource(`
 main():
     entry:
-        left = agent @agent.left, "left/"
-        right = agent @agent.right, "right/"
+        left = agent @agent.left, [workspace: "left/"]
+        right = agent @agent.right, [workspace: "right/"]
         left_result = left.do "left"
         right_result = right.do "right"
         result = prompt "joined", left_result, right_result
@@ -122,8 +122,8 @@ main():
     entry:
         source = agent @agent.worker
         seed = source.do "seed"
-        left = fork source, left.do "left-start"
-        right = fork source, right.do "right-start"
+        left = source.fork "left-start"
+        right = source.fork "right-start"
         left_result = left.do "left-end"
         right_result = right.do "right-end"
         source_result = source.do "source-end"
@@ -142,7 +142,7 @@ main():
   assert.equal(leftEnd.messages.includes("out:seed"), true);
 });
 
-test("memory.append and memory.apply preserve roles without sharing source state", async () => {
+test("memory.append and agent.with_memory preserve roles without sharing source state", async () => {
   const agents = new MockAgentAdapter();
   const requests = [];
   agents.on("@agent.worker", (request) => {
@@ -154,9 +154,9 @@ main():
     entry:
         source = agent @agent.worker
         seed = source.do "seed"
-        copied = memory.copy source.memory
-        memory.append copied, tool, "observation"
-        branch = memory.apply source, copied
+        copied = source.memory.copy
+        copied.append tool, "observation"
+        branch = source.with_memory copied
         branch_result = branch.do "branch"
         source_result = source.do "source"
         result = prompt "done", branch_result, source_result
@@ -195,7 +195,7 @@ use_twice(first, second):
 main():
     entry:
         worker = agent @agent.worker
-        result = call use_twice, worker, worker
+        result = call use_twice(worker, worker)
         ret result
 `, { agents });
   await vm.run();

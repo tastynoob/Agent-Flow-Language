@@ -98,8 +98,8 @@ block_name:
 
 ```text
 jump target
-jump condition, true_target, false_target
-jump selector, [case_value: target, ...], default_target
+branch condition, true_target, false_target
+match selector, [case_value: target, ...], default_target
 ret
 ret value
 fail error
@@ -109,7 +109,7 @@ fail error
 
 ```text
 route:
-    jump route_kind, ["research": research, "rtl": implement, "verify": verify], fallback
+    match route_kind, ["research": research, "rtl": implement, "verify": verify], fallback
 ```
 
 跳转表一次只激活一个目标。需要同时启动多个 flow 时使用 `dispatch`。
@@ -120,7 +120,7 @@ route:
 review:
     review_result = reviewer.do review_prompt
     finish = oper review_result == "finish"
-    jump finish, done, revise
+    branch finish, done, revise
 
 revise:
     ...
@@ -151,7 +151,7 @@ Agent、Memory 等资源可以作为指令接收者：
 
 ```text
 result = coder.do prompt
-memory.append coder.memory, user, review_result
+coder.memory.append user, review_result
 ```
 
 Operand 可以是名称、字段/索引引用、字面量、role 或外部 symbol。指令自身定义 operand 的数量和含义。
@@ -166,7 +166,7 @@ Frag = wrapper<string>
 
 Frag 在 IR 中表现为一个名称，字符串 wrapper 是其运行时表示。Frag 自身不带 role；JSON、XML、Markdown 或 flow 自定义格式都只是它所包装的字符串内容。
 
-String literal 在需要 Frag 的位置自动包装成 Frag。Prompt symbol 需要由 `prompt` 或 `agent.sysprompt` 交给 Prompt binding 渲染。
+String literal 在需要 Frag 的位置自动包装成 Frag。Prompt symbol 需要由 `prompt` 或 `agent.system_prompt` 交给 Prompt binding 渲染。
 
 指令结果分为三类：
 
@@ -174,7 +174,7 @@ String literal 在需要 Frag 的位置自动包装成 Frag。Prompt symbol 需�
 | --- | --- | --- |
 | 数据指令 | `do`、`prompt`、`input`、`invoke`、`call`、`sync` | role-free Frag |
 | 计算指令 | `oper`、`python`、`typescript`、`shell` | VM compute value |
-| 资源指令 | `agent`、`memory.copy`、`memory.apply`、`dispatch`、`fork` | Agent、Memory、TaskGroup 等 handle |
+| 资源指令 | `agent`、Memory `copy`、`with_memory`、`dispatch`、`repeat`、`fork` | Agent、Memory、TaskGroup 等 handle |
 
 Terminator 和 `memory.append` 等 effect instruction 不需要产生结果。
 
@@ -184,31 +184,31 @@ Terminator 和 `memory.append` 等 effect instruction 不需要产生结果。
 
 ```text
 coder = agent @agent.coder
-worker = agent @agent.worker, "workers/worker/"
-reviewer = agent @agent.reviewer, ["workers/reviewer/", "docs/", "src/"]
-reviewer = agent @agent.reviewer,, review_memory
+worker = agent @agent.worker, [workspace: "workers/worker/"]
+reviewer = agent @agent.reviewer, [workspace: ["workers/reviewer/", "docs/", "src/"]]
+reviewer = agent @agent.reviewer, [memory: review_memory]
 ```
 
-第二个 operand 固定表示 Workspace：单个路径是主工作区；列表第一项是主工作区，后续至少一项是只读工作区。只有主工作区时必须使用字符串形式。省略时 VM 为这次 Agent allocation 在 `.afl/tmpworkspace/<run-id>/` 下分配稳定且互不重叠的主工作区。第三个 operand 才是已有 Memory；省略 Workspace 但传入 Memory 时必须保留空的第二个位置，如 `agent @agent.reviewer,, review_memory`。
+第二个 operand 是可选的 typed options record。`workspace` 为单个路径时表示主工作区；为列表时，第一项是主工作区，后续至少一项是只读工作区。只有主工作区时必须使用字符串。省略 `workspace` 时，VM 为这次 Agent allocation 在 `.afl/tmpworkspace/<run-id>/` 下分配稳定且互不重叠的主工作区。`memory` 绑定已有 Memory，不使用空 operand 占位。
 
 设置 system prompt：
 
 ```text
-coder.sysprompt @prompt.coder
-coder.sysprompt "You are responsible for implementation."
+coder.system_prompt @prompt.coder
+coder.system_prompt "You are responsible for implementation."
 ```
 
-`sysprompt` 隐含 `system` role，不需要再写 role operand。
+`system_prompt` 隐含 `system` role，不需要再写 role option。
 
 执行一次 Agent 工作：
 
 ```text
 step = coder.do prompt
-step = coder.do user, prompt
-step = coder.do user, prompt, @schema.StepResult
+step = coder.do prompt, [role: user]
+step = coder.do prompt, [role: user, schema: @schema.StepResult]
 ```
 
-省略 role 时使用 `user`。显式 role 位于输入 Frag 之前。末尾 schema symbol 是可选的输出约束；schema 校验成功后，返回结果仍然是包含格式化字符串的 Frag。
+省略 role 时使用 `user`。显式 role 和 schema 都位于 options 中；schema 校验成功后，返回结果仍然是包含格式化字符串的 Frag。
 
 一次 `do` 表示完整的 Agent 工作激活，可以在执行后端内部包含多个模型 turn 和工具步骤。Core IR、validator、VM 和 adapter API 不再区分单步与连续执行 mode。
 
@@ -268,8 +268,8 @@ result = shell "command", arg0, arg1, ...
 同步调用 node 或 flow：
 
 ```text
-result = call local_node, arg0, arg1
-result = call @flow.review, arg0, arg1
+result = call local_node(arg0, arg1)
+result = call @flow.review(arg0, arg1)
 ```
 
 业务 flow 的调用结果规范化为 Frag。
@@ -283,10 +283,10 @@ jobs = dispatch [@flow.security(code), @flow.performance(code), @flow.tests(code
 批量启动同一种 child flow：
 
 ```text
-jobs = dispatch worker_count, @flow.review_once, code
+jobs = repeat worker_count, @flow.review_once(code)
 ```
 
-List 形式逐项启动显式写出的 flow call，可以混用不同 flow 和不同参数。Batch 形式的第一个 operand `worker_count` 是非负整数 compute value，VM 启动对应数量的相同调用：
+List 形式逐项启动显式写出的 flow call，可以混用不同 flow 和不同参数。`repeat` 的第一个 operand `worker_count` 是非负整数 compute value，VM 启动对应数量的相同调用：
 
 ```text
 @flow.review_once(code)
@@ -299,15 +299,15 @@ List 形式逐项启动显式写出的 flow call，可以混用不同 flow 和�
 从已有 Agent 派生一个并行分支：
 
 ```text
-new_agent = fork agent, new_agent.do prompt
-long_agent = fork agent, long_agent.do task
+new_agent = agent.fork prompt
+long_agent = agent.fork task
 ```
 
-`fork` 左侧的 `dst` 在同一条指令的启动动作中表示新分支 Agent。VM 复制 source Agent 的 Memory，用相同 Agent binding 创建 `dst`，再在该分支上启动右侧的 `do`：
+VM 复制 receiver Agent 的 Memory，用相同 Agent binding 创建左侧的新分支 Agent，再在该分支上执行一次 `do`：
 
 ```text
-security = fork coder, security.do security_prompt
-quality = fork coder, quality.do quality_prompt
+security = coder.fork security_prompt
+quality = coder.fork quality_prompt
 ```
 
 两条 `fork` 都只读取 fork 时的 `coder` Memory，Source Agent、各 branch Agent 和各份 Memory 在 fork 后互相独立。Branch 继承 source Workspace；如果它们共享可写路径，实际 Agent 执行会由 Workspace lock 串行。后续对 branch Agent 的状态性调用排在其启动动作之后。
@@ -339,46 +339,46 @@ Agent 创建后可以通过 `.memory` 引用其 working memory。
 把 role-free Frag 加入 Memory：
 
 ```text
-memory.append coder.memory, user, review_result
-memory.append coder.memory, tool, tool_result
+coder.memory.append user, review_result
+coder.memory.append tool, tool_result
 ```
 
 复制完整 Memory：
 
 ```text
-review_memory = memory.copy coder.memory
-reviewer = agent @agent.reviewer,, review_memory
+review_memory = coder.memory.copy
+reviewer = agent @agent.reviewer, [memory: review_memory]
 ```
 
 把 Memory 应用到已有 Agent 的配置副本：
 
 ```text
-branch_memory = memory.copy coder.memory
-branch = memory.apply coder, branch_memory
+branch_memory = coder.memory.copy
+branch = coder.with_memory branch_memory
 ```
 
-`memory.apply` 返回新的 Agent handle。新 Agent 沿用 source Agent 的 binding 与配置并使用给定 Memory；source Agent 不发生变化。给定 Memory 已绑定 Agent 时，VM 报告 `MEMORY_ALREADY_BOUND`。
+`with_memory` 返回新的 Agent handle。新 Agent 沿用 source Agent 的 binding 与配置并使用给定 Memory；source Agent 不发生变化。给定 Memory 已绑定 Agent 时，VM 报告 `MEMORY_ALREADY_BOUND`。
 
 `memory.append` 需要 role，因为它建立从 Frag 到 Memory message 的边界。`memory.copy` 保留来源消息已有的 role，因此不接收新的 role。
 
 ## 13. Freedom
 
-`freedom.route` 临时向普通 planner Agent 暴露环境查询和动态路由登记工具，并返回 TaskGroup：
+`agent.route` 临时向普通 planner Agent 暴露环境查询和动态路由登记工具，并返回 TaskGroup：
 
 ```text
-jobs = freedom.route planner, prompt, [min_routes: 1, max_routes: 2], [node0, node1], [task: task, spec: spec]
+jobs = planner.route prompt, [nodes: [node0, node1], params: [task: task, spec: spec], min_routes: 1, max_routes: 2]
 reports = sync jobs
 ```
 
 Planner 通过 `afl.route.add` 登记 Node 调用；Node 在 planner activation 完成后由 VM 按 dispatch policy 启动，不把结果隐式交回 planner。`sync` 负责等待、格式化结果和传播 child failure。
 
-`freedom.flow` 暴露环境查询、既有 Node 执行以及 generated IR 的校验和执行工具：
+`agent.flow` 暴露环境查询、既有 Node 执行以及 generated IR 的校验和执行工具：
 
 ```text
-result = freedom.flow writer, prompt, [min_routes: 0, max_routes: 4], [node0, node1], [@agent.fast, @agent.strong], [task: task]
+result = writer.flow prompt, [nodes: [node0, node1], agents: [@agent.fast, @agent.strong], params: [task: task], min_routes: 0, max_routes: 4]
 ```
 
-Node allowlist 只接受本 module 的 Node 名称；Flow 的 Agent allowlist 只接受 `@agent.*` symbol。`constraint` 是只含 `min_routes` 和 `max_routes` 的具名 record，两者分别要求本次 activation 至少和至多路由多少次；`min_routes` 可以为 0，`max_routes` 必须为正整数且不小于前者。并行度、超时和工具调用预算属于 VM policy，不进入 AFL 指令约束。Freedom 的 constraint 和 controlled params 操作数已确定为 record，因此这两个位置允许用 `[]` 简写空 record；一般表达式中的 `[]` 仍是空 list，显式空 record 写作 `[:]`。
+Node allowlist 只接受本 module 的 Node 名称；Flow 的 Agent allowlist 只接受 `@agent.*` symbol。`min_routes` 和 `max_routes` 分别要求本次 activation 至少和至多路由多少次；`min_routes` 可以为 0，`max_routes` 必须为正整数且不小于前者。并行度、超时和工具调用预算属于 VM policy，不进入 AFL options。所有语境中 `[]` 都是空 list，`[:]` 都是空 record；空 typed options 也写作 `[:]`，通常直接省略。
 
 受控参数也使用具名 record。Agent 可以通过 `{ref: "param:name"}` 选择显式参数，也可以通过 `{string: "..."}` 传入自由文本；这里的 `{...}` 是临时 tool 的 JSON 参数，不是 AFL record 语法。Flow writer 还可以引用本次 activation 中先前工具产生的结果。Route planner 完成后，VM 检查已登记 route 是否满足 `min_routes` 并返回 TaskGroup；零 route 对应合法的空 TaskGroup。Flow 成功执行过 Node 或 generated IR 时返回 writer 的 final response Frag，未成功执行任何内容时返回空 Frag。临时工具都不会泄漏到该 Agent 后续的普通 `do`。
 
@@ -387,9 +387,9 @@ Freedom activation 延续该 Agent 已有的 Memory 和 executor session，指�
 ## 14. 指令形式汇总
 
 ```text
-dst = agent symbol [, workspace [, memory]]
-agent.sysprompt prompt
-dst = agent.do [role,] frag [, schema]
+dst = agent symbol [, [workspace: value, memory: memory]]
+agent.system_prompt prompt
+dst = agent.do frag [, [role: role, schema: schema]]
 
 dst = prompt prompt_source [, value ...]
 dst = input prompt_source [, schema]
@@ -399,23 +399,23 @@ dst = python "script" [, value ...]
 dst = typescript "script" [, value ...]
 dst = shell "command" [, value ...]
 
-dst = call flow [, value ...]
+dst = call flow(value ...)
 dst = dispatch [flow_call, flow_call, ...]
-dst = dispatch count, flow, task
-dst = fork source_agent, dst.do frag
+dst = repeat count, flow(task)
+dst = source_agent.fork frag
 dst = sync task_group [, formatter]
 dst = invoke symbol [, value ...]
 
-memory.append memory, role, frag
-dst = memory.copy memory
-dst = memory.apply source_agent, memory
+target_memory.append role, frag
+dst = source_memory.copy
+dst = source_agent.with_memory memory
 
-dst = freedom.route planner, prompt, constraint, [node ...], [param: value ...]
-dst = freedom.flow writer, prompt, constraint, [node ...], [agent_symbol ...], [param: value ...]
+dst = planner.route prompt, [nodes: [node ...], params: [param: value ...], min_routes: value, max_routes: value]
+dst = writer.flow prompt, [nodes: [node ...], agents: [agent_symbol ...], params: [param: value ...], min_routes: value, max_routes: value]
 
 jump target
-jump condition, true_target, false_target
-jump selector, [case_value: target, ...], default_target
+branch condition, true_target, false_target
+match selector, [case_value: target, ...], default_target
 ret [value]
 fail error
 ```

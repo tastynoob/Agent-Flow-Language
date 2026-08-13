@@ -109,7 +109,7 @@ export interface AgentInstruction extends InstructionBase {
 }
 
 export interface SystemPromptInstruction extends InstructionBase {
-  readonly op: "agent.sysprompt";
+  readonly op: "agent.system_prompt";
   readonly agent: NameExpr;
   readonly prompt: ValueExpr;
 }
@@ -160,18 +160,18 @@ export interface CallInstruction extends InstructionBase {
   readonly args: readonly ValueExpr[];
 }
 
-export interface DispatchListInstruction extends InstructionBase {
-  readonly op: "dispatch.list";
+export interface DispatchInstruction extends InstructionBase {
+  readonly op: "dispatch";
   readonly dst: string;
   readonly calls: readonly FlowCallExpr[];
 }
 
-export interface DispatchBatchInstruction extends InstructionBase {
-  readonly op: "dispatch.batch";
+export interface RepeatInstruction extends InstructionBase {
+  readonly op: "repeat";
   readonly dst: string;
   readonly count: ValueExpr;
   readonly target: FlowTarget;
-  readonly task: ValueExpr;
+  readonly args: readonly ValueExpr[];
 }
 
 export interface SyncInstruction extends InstructionBase {
@@ -192,7 +192,6 @@ export interface ForkInstruction extends InstructionBase {
   readonly op: "fork";
   readonly dst: string;
   readonly sourceAgent: NameExpr;
-  readonly actionReceiver: string;
   readonly action: ForkAction;
 }
 
@@ -216,34 +215,35 @@ export interface MemoryCopyInstruction extends InstructionBase {
   readonly memory: NameExpr;
 }
 
-export interface MemoryApplyInstruction extends InstructionBase {
-  readonly op: "memory.apply";
+export interface AgentWithMemoryInstruction extends InstructionBase {
+  readonly op: "agent.with_memory";
   readonly dst: string;
-  readonly sourceAgent: NameExpr;
+  readonly agent: NameExpr;
   readonly memory: NameExpr;
 }
 
-export type FreedomMode = "route" | "flow";
+export type AgentControlMode = "route" | "flow";
 
-interface FreedomInstructionBase extends InstructionBase {
+interface AgentControlInstructionBase extends InstructionBase {
   readonly dst: string;
-  readonly planner: NameExpr;
+  readonly agent: NameExpr;
   readonly prompt: ValueExpr;
-  readonly constraint: RecordExpr;
   readonly nodes: readonly FlowTarget[];
   readonly params: RecordExpr;
+  readonly minRoutes?: ValueExpr;
+  readonly maxRoutes?: ValueExpr;
 }
 
-export interface FreedomRouteInstruction extends FreedomInstructionBase {
-  readonly op: "freedom.route";
+export interface AgentRouteInstruction extends AgentControlInstructionBase {
+  readonly op: "agent.route";
 }
 
-export interface FreedomFlowInstruction extends FreedomInstructionBase {
-  readonly op: "freedom.flow";
+export interface AgentFlowInstruction extends AgentControlInstructionBase {
+  readonly op: "agent.flow";
   readonly agents: readonly SymbolExpr[];
 }
 
-export type FreedomInstruction = FreedomRouteInstruction | FreedomFlowInstruction;
+export type AgentControlInstruction = AgentRouteInstruction | AgentFlowInstruction;
 
 export type AflInstruction =
   | AgentInstruction
@@ -254,32 +254,37 @@ export type AflInstruction =
   | OperInstruction
   | ScriptInstruction
   | CallInstruction
-  | DispatchListInstruction
-  | DispatchBatchInstruction
+  | DispatchInstruction
+  | RepeatInstruction
   | SyncInstruction
   | ForkInstruction
   | InvokeInstruction
   | MemoryAppendInstruction
   | MemoryCopyInstruction
-  | MemoryApplyInstruction
-  | FreedomInstruction;
+  | AgentWithMemoryInstruction
+  | AgentControlInstruction;
 
 export interface JumpTerminator extends InstructionBase {
   readonly op: "jump";
-  readonly condition?: ValueExpr;
-  readonly trueTarget: string;
-  readonly falseTarget?: string;
+  readonly target: string;
 }
 
-export interface JumpTableCase {
+export interface BranchTerminator extends InstructionBase {
+  readonly op: "branch";
+  readonly condition: ValueExpr;
+  readonly trueTarget: string;
+  readonly falseTarget: string;
+}
+
+export interface MatchCase {
   readonly value: PrimitiveValue;
   readonly target: string;
 }
 
-export interface JumpTableTerminator extends InstructionBase {
-  readonly op: "jump.table";
+export interface MatchTerminator extends InstructionBase {
+  readonly op: "match";
   readonly selector: ValueExpr;
-  readonly cases: readonly JumpTableCase[];
+  readonly cases: readonly MatchCase[];
   readonly defaultTarget: string;
 }
 
@@ -293,7 +298,7 @@ export interface FailTerminator extends InstructionBase {
   readonly error: ValueExpr;
 }
 
-export type AflTerminator = JumpTerminator | JumpTableTerminator | ReturnTerminator | FailTerminator;
+export type AflTerminator = JumpTerminator | BranchTerminator | MatchTerminator | ReturnTerminator | FailTerminator;
 
 export interface AflBlock {
   readonly name: string;

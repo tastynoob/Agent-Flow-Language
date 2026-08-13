@@ -3,15 +3,15 @@
 #
 # AFL describes the workflow topology. Dashboards, persistent task state,
 # snapshots, event delivery, audit logs, and cancellation are VM concerns.
-# Each department is an ordinary documented Node selected through freedom.route.
+# Each department is an ordinary documented Node selected through the planner's route activation.
 
 main(message):
     entry:
         taizi = agent @agent.edict.taizi
-        taizi.sysprompt "You are Taizi, the first recipient. For casual conversation return exactly casual. For work requests, clean up the request and return a concise task brief."
+        taizi.system_prompt "You are Taizi, the first recipient. For casual conversation return exactly casual. For work requests, clean up the request and return a concise task brief."
         triage_result = taizi.do message
         is_casual = oper triage_result == "casual"
-        jump is_casual, casual_reply, plan
+        branch is_casual, casual_reply, plan
 
     casual_reply:
         reply = taizi.do "Reply directly to the user's casual message."
@@ -19,9 +19,9 @@ main(message):
 
     plan:
         zhongshu = agent @agent.edict.zhongshu
-        zhongshu.sysprompt "You are Zhongshu. Plan and decompose the task, but do not execute it. Produce a concrete plan for Menxia review."
+        zhongshu.system_prompt "You are Zhongshu. Plan and decompose the task, but do not execute it. Produce a concrete plan for Menxia review."
         menxia = agent @agent.edict.menxia
-        menxia.sysprompt "You are Menxia. Review the plan before execution. Return exactly approve when it can proceed; otherwise return a concrete rejection list."
+        menxia.system_prompt "You are Menxia. Review the plan before execution. Return exactly approve when it can proceed; otherwise return a concrete rejection list."
         plan_prompt = prompt "Create an execution plan for this task brief", triage_result
         execution_plan = zhongshu.do plan_prompt
         jump review_1
@@ -30,7 +30,7 @@ main(message):
         review_prompt_1 = prompt "Review the Zhongshu plan. This is review round 1", execution_plan
         review_result_1 = menxia.do review_prompt_1
         approved_1 = oper review_result_1 == "approve"
-        jump approved_1, assign, revise_1
+        branch approved_1, assign, revise_1
 
     revise_1:
         revision_prompt_1 = prompt "Revise the plan to resolve every Menxia rejection", review_result_1
@@ -41,7 +41,7 @@ main(message):
         review_prompt_2 = prompt "Review the revised Zhongshu plan. This is review round 2", execution_plan
         review_result_2 = menxia.do review_prompt_2
         approved_2 = oper review_result_2 == "approve"
-        jump approved_2, assign, revise_2
+        branch approved_2, assign, revise_2
 
     revise_2:
         revision_prompt_2 = prompt "Revise the plan to resolve every Menxia rejection", review_result_2
@@ -52,15 +52,15 @@ main(message):
         review_prompt_3 = prompt "Review the revised Zhongshu plan. This is the final review round", execution_plan
         review_result_3 = menxia.do review_prompt_3
         approved_3 = oper review_result_3 == "approve"
-        jump approved_3, assign, rejected
+        branch approved_3, assign, rejected
 
     assign:
-        shangshu = agent @agent.edict.shangshu, "workspaces/shangshu/"
-        shangshu.sysprompt "You are Shangshu. Select the relevant departments, assign clear subtasks, and combine completed department reports. During routing, inspect the available Node interfaces and add only departments needed by the approved plan."
+        shangshu = agent @agent.edict.shangshu, [workspace: "workspaces/shangshu/"]
+        shangshu.system_prompt "You are Shangshu. Select the relevant departments, assign clear subtasks, and combine completed department reports. During routing, inspect the available Node interfaces and add only departments needed by the approved plan."
         assignment_prompt = prompt "Select departments and allocate the approved plan. Include enough context for each assigned department to work", execution_plan
         assignments = shangshu.do assignment_prompt
         route_prompt = prompt "Inspect the six department interfaces. Add every department that has an assignment to the route TaskGroup. Pass the approved plan and complete assignments by reference. Department execution and report collection happen after routing", execution_plan, assignments
-        department_jobs = freedom.route shangshu, route_prompt, [min_routes: 1, max_routes: 6], [hubu, libu, bingbu, xingbu, gongbu, libu_hr], [plan: execution_plan, assignments: assignments]
+        department_jobs = shangshu.route route_prompt, [nodes: [hubu, libu, bingbu, xingbu, gongbu, libu_hr], params: [plan: execution_plan, assignments: assignments], min_routes: 1, max_routes: 6]
         department_reports = sync department_jobs
         summary_prompt = prompt "Summarize execution status and unresolved issues from these department reports", department_reports
         execution_summary = shangshu.do summary_prompt
@@ -80,8 +80,8 @@ hubu(plan, assignments):
     # @param assignments The complete Shangshu department assignments.
     # @returns Hubu execution report.
     entry:
-        official = agent @agent.edict.hubu, "workspaces/hubu/"
-        official.sysprompt "You are Hubu. Execute only the finance, data, resource, accounting, reporting, and cost-analysis work assigned to Hubu."
+        official = agent @agent.edict.hubu, [workspace: "workspaces/hubu/"]
+        official.system_prompt "You are Hubu. Execute only the finance, data, resource, accounting, reporting, and cost-analysis work assigned to Hubu."
         task = prompt "Execute Hubu's assignment and report results, evidence, and unresolved issues", plan, assignments
         report = official.do task
         ret report
@@ -92,8 +92,8 @@ libu(plan, assignments):
     # @param assignments The complete Shangshu department assignments.
     # @returns Libu execution report.
     entry:
-        official = agent @agent.edict.libu, "workspaces/libu/"
-        official.sysprompt "You are Libu. Execute only the documentation, specification, report, and API-documentation work assigned to Libu."
+        official = agent @agent.edict.libu, [workspace: "workspaces/libu/"]
+        official.system_prompt "You are Libu. Execute only the documentation, specification, report, and API-documentation work assigned to Libu."
         task = prompt "Execute Libu's assignment and report deliverables and unresolved issues", plan, assignments
         report = official.do task
         ret report
@@ -104,8 +104,8 @@ bingbu(plan, assignments):
     # @param assignments The complete Shangshu department assignments.
     # @returns Bingbu execution report.
     entry:
-        official = agent @agent.edict.bingbu, "workspaces/bingbu/"
-        official.sysprompt "You are Bingbu. Execute only the coding, algorithm, implementation, bug-fix, and code-review work assigned to Bingbu."
+        official = agent @agent.edict.bingbu, [workspace: "workspaces/bingbu/"]
+        official.system_prompt "You are Bingbu. Execute only the coding, algorithm, implementation, bug-fix, and code-review work assigned to Bingbu."
         task = prompt "Execute Bingbu's assignment and report changes, verification, and unresolved issues", plan, assignments
         report = official.do task
         ret report
@@ -116,8 +116,8 @@ xingbu(plan, assignments):
     # @param assignments The complete Shangshu department assignments.
     # @returns Xingbu execution report.
     entry:
-        official = agent @agent.edict.xingbu, "workspaces/xingbu/"
-        official.sysprompt "You are Xingbu. Execute only the security, compliance, testing, and audit work assigned to Xingbu."
+        official = agent @agent.edict.xingbu, [workspace: "workspaces/xingbu/"]
+        official.system_prompt "You are Xingbu. Execute only the security, compliance, testing, and audit work assigned to Xingbu."
         task = prompt "Execute Xingbu's assignment and report findings, evidence, and unresolved risks", plan, assignments
         report = official.do task
         ret report
@@ -128,8 +128,8 @@ gongbu(plan, assignments):
     # @param assignments The complete Shangshu department assignments.
     # @returns Gongbu execution report.
     entry:
-        official = agent @agent.edict.gongbu, "workspaces/gongbu/"
-        official.sysprompt "You are Gongbu. Execute only the CI/CD, deployment, tooling, and infrastructure work assigned to Gongbu."
+        official = agent @agent.edict.gongbu, [workspace: "workspaces/gongbu/"]
+        official.system_prompt "You are Gongbu. Execute only the CI/CD, deployment, tooling, and infrastructure work assigned to Gongbu."
         task = prompt "Execute Gongbu's assignment and report changes, validation, and unresolved issues", plan, assignments
         report = official.do task
         ret report
@@ -140,8 +140,8 @@ libu_hr(plan, assignments):
     # @param assignments The complete Shangshu department assignments.
     # @returns Libu personnel execution report.
     entry:
-        official = agent @agent.edict.libu_hr, "workspaces/libu-hr/"
-        official.sysprompt "You are Libu Personnel. Execute only Agent registration, permission, training, and organizational work assigned to Libu Personnel."
+        official = agent @agent.edict.libu_hr, [workspace: "workspaces/libu-hr/"]
+        official.system_prompt "You are Libu Personnel. Execute only Agent registration, permission, training, and organizational work assigned to Libu Personnel."
         task = prompt "Execute Libu Personnel's assignment and report changes and unresolved issues", plan, assignments
         report = official.do task
         ret report

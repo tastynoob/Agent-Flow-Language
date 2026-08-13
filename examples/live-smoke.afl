@@ -1,6 +1,6 @@
 main():
     entry:
         worker = agent @agent.smoke
-        worker.sysprompt "Follow the user's request and answer concisely."
+        worker.system_prompt "Follow the user's request and answer concisely."
         result = worker.do "Reply with exactly: afl-live-ok"
         ret result

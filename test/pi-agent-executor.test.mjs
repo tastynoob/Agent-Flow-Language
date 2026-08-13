@@ -178,7 +178,7 @@ main():
     entry:
         planner = agent @agent.planner
         seeded = planner.do "seed"
-        jobs = freedom.route planner, "route", [], [], []
+        jobs = planner.route "route"
         reports = sync jobs
         ordinary = planner.do "ordinary"
         ret ordinary
@@ -309,10 +309,10 @@ test("Pi persists a canonical-only lazy base as continuation references without 
 main():
     entry:
         source = agent @agent.worker
-        memory.append source.memory, user, "seed context"
-        copied = memory.copy source.memory
+        source.memory.append user, "seed context"
+        copied = source.memory.copy
         reviewer = agent @agent.worker
-        branch = memory.apply reviewer, copied
+        branch = reviewer.with_memory copied
         result = branch.do "review"
         ret result
 `;
@@ -503,9 +503,9 @@ main():
     entry:
         source = agent @agent.source
         seed = source.do "seed"
-        copied = memory.copy source.memory
+        copied = source.memory.copy
         reviewer = agent @agent.reviewer
-        branch = memory.apply reviewer, copied
+        branch = reviewer.with_memory copied
         result = branch.do "review"
         ret result
 `, { agentExecutor: backend });
@@ -518,7 +518,7 @@ main():
   assert.doesNotMatch(JSON.stringify(copy), /source-only thinking/u);
 });
 
-test("memory.copy freezes a Pi checkpoint used by memory.apply", async () => {
+test("memory.copy freezes a Pi checkpoint used by agent.with_memory", async () => {
   const faux = fauxProvider();
   const models = createModels();
   models.setProvider(faux.provider);
@@ -537,9 +537,9 @@ main():
     entry:
         source = agent @agent.worker
         seed = source.do "seed"
-        copied = memory.copy source.memory
+        copied = source.memory.copy
         later = source.do "source-later"
-        branch = memory.apply source, copied
+        branch = source.with_memory copied
         branch_result = branch.do "branch"
         ret branch_result
 `, { agentExecutor: backend });
@@ -551,7 +551,7 @@ main():
   assert.equal(contexts.get("source-later").includes("out:seed"), true);
 });
 
-test("memory.apply rebuilds Pi context when the source Workspace is incompatible", async (t) => {
+test("agent.with_memory rebuilds Pi context when the source Workspace is incompatible", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "afl-pi-checkpoint-workspace-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const faux = fauxProvider();
@@ -571,11 +571,11 @@ test("memory.apply rebuilds Pi context when the source Workspace is incompatible
   const vm = AflVm.fromSource(`
 main():
     entry:
-        first = agent @agent.worker, "first/"
+        first = agent @agent.worker, [workspace: "first/"]
         seed = first.do "seed"
-        copied = memory.copy first.memory
-        second = agent @agent.worker, "second/"
-        branch = memory.apply second, copied
+        copied = first.memory.copy
+        second = agent @agent.worker, [workspace: "second/"]
+        branch = second.with_memory copied
         result = branch.do "branch"
         ret result
 `, { agentExecutor: backend });
@@ -859,7 +859,7 @@ test("Pi coding tools are created for each Agent primary Workspace", async (t) =
   const vm = AflVm.fromSource(`
 main():
     entry:
-        worker = agent @agent.worker, "work/"
+        worker = agent @agent.worker, [workspace: "work/"]
         result = worker.do "report the working directory"
         ret result
 `, { agentExecutor: backend });
@@ -904,7 +904,7 @@ test("Pi coding binding executes write and GCC tools inside bubblewrap", async (
   const vm = AflVm.fromSource(`
 main():
     entry:
-        worker = agent @agent.worker, "work/"
+        worker = agent @agent.worker, [workspace: "work/"]
         result = worker.do "compile inside the sandbox"
         ret result
 `, {
@@ -998,7 +998,7 @@ test("Pi elevated tool retries a sandbox-blocked operation on the host after man
   const vm = AflVm.fromSource(`
 main():
     entry:
-        worker = agent @agent.worker, "work/"
+        worker = agent @agent.worker, [workspace: "work/"]
         result = worker.do "read a host-only file after the sandbox blocks it"
         ret result
 `, {
@@ -1082,7 +1082,7 @@ test("Pi soft policy block reaches approval only after the model actively reques
   const vm = AflVm.fromSource(`
 main():
     entry:
-        worker = agent @agent.worker, "work/"
+        worker = agent @agent.worker, [workspace: "work/"]
         result = worker.do "retry a soft-blocked command only if alternatives are too costly"
         ret result
 `, {
@@ -1164,7 +1164,7 @@ test("Pi elevated tool rejects direct elevation without a matching sandbox failu
   const vm = AflVm.fromSource(`
 main():
     entry:
-        worker = agent @agent.worker, "work/"
+        worker = agent @agent.worker, [workspace: "work/"]
         result = worker.do "try to elevate directly"
         ret result
 `, {
@@ -1194,7 +1194,7 @@ test("Pi Memory facet rejects unsupported AFL roles before model execution", asy
 main():
     entry:
         worker = agent @agent.worker
-        memory.append worker.memory, tool, "native detail"
+        worker.memory.append tool, "native detail"
         result = worker.do "continue"
         ret result
 `, { agentExecutor: backend });

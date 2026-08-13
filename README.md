@@ -7,7 +7,7 @@ AFL 适合表达代码审核循环、并行研究、专家投票、分层组织�
 ## 特点
 
 - **行为是一等内容**：循环、分支、调用、并发和失败路径都属于工作流语义，不只是节点图或配置数据。
-- **确定性与自主性并存**：可预先确定的步骤使用明确控制流；无法预设的部分通过 `freedom.route` 和 `freedom.flow` 交给 Agent，并保留作用域和验证边界。
+- **确定性与自主性并存**：可预先确定的步骤使用明确控制流；无法预设的部分通过 Agent 的 `route` 和 `flow` activation 交给模型，并保留作用域和验证边界。
 - **依赖驱动并发**：没有数据或资源冲突的工作可以自然并行，同一 Agent、Memory 和重叠 Workspace 的操作保持有序。
 - **上下文显式流动**：业务数据与消息角色相互分离；Agent Memory 可以复制、应用和分支，不依赖隐式全局对话。
 - **运行环境解耦**：工作流使用 symbol 描述 Agent、Prompt、Schema、Capability 和外部 Flow，具体模型与服务由运行环境绑定。
@@ -26,11 +26,11 @@ main(task):
         jump review
 
     review:
-        review_memory = memory.copy coder.memory
-        reviewer = agent @agent.reviewer,, review_memory
+        review_memory = coder.memory.copy
+        reviewer = agent @agent.reviewer, [memory: review_memory]
         verdict = reviewer.do "Return exactly finish when correct; otherwise list every defect."
         finished = oper verdict == "finish"
-        jump finished, done, revise
+        branch finished, done, revise
 
     revise:
         code = coder.do verdict

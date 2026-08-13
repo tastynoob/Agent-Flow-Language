@@ -24,7 +24,7 @@ main():
         answer = input @prompt.question, @schema.Answer
         count = typescript "return args[0].length", answer
         page = invoke @mcp.page.read, answer, count
-        local = call identity, page
+        local = call identity(page)
         jobs = dispatch [identity(local), @flow.echo(answer)]
         result = sync jobs, @format.join
         ret result
@@ -82,7 +82,7 @@ main():
   assert.equal(seen.formatter, true);
 });
 
-test("freedom.route registers allowed Nodes and returns a TaskGroup", async (t) => {
+test("agent.route registers allowed Nodes and returns a TaskGroup", async (t) => {
   const root = await temporaryRoot(t);
   const workspaces = new Map();
   const seenTools = [];
@@ -160,7 +160,7 @@ department(task):
 main(task):
     entry:
         planner = agent @agent.planner
-        jobs = freedom.route planner, "choose", [min_routes: 1, max_routes: 1], [department], [task: task]
+        jobs = planner.route "choose", [nodes: [department], params: [task: task], min_routes: 1, max_routes: 1]
         reports = sync jobs
         ret reports
 `, {
@@ -201,12 +201,12 @@ test("Freedom derives its control scope only from the instruction op", async (t)
 main():
     entry:
         planner = agent @agent.planner
-        jobs = freedom.route planner, "route", [], [], []
+        jobs = planner.route "route"
         reports = sync jobs
         ret reports
 `);
   const instruction = module.nodes[0].blocks[0].instructions.find((item) =>
-    item.op === "freedom.route");
+    item.op === "agent.route");
   assert.ok(instruction);
   instruction.mode = "flow";
 
@@ -231,7 +231,7 @@ main():
   assert.equal(authorizedMode, "route");
 });
 
-test("freedom.route can use its injected tool contract without an environment lookup", async (t) => {
+test("agent.route can use its injected tool contract without an environment lookup", async (t) => {
   const root = await temporaryRoot(t);
   let active = 0;
   let maximumActive = 0;
@@ -288,7 +288,7 @@ second():
 main():
     entry:
         planner = agent @agent.planner
-        jobs = freedom.route planner, "route both", [min_routes: 2, max_routes: 2], [first, second], []
+        jobs = planner.route "route both", [nodes: [first, second], min_routes: 2, max_routes: 2]
         reports = sync jobs
         ret reports
 `, {
@@ -304,7 +304,7 @@ main():
   assert.equal(maximumActive, 2);
 });
 
-test("freedom.route defers child failure to sync", async (t) => {
+test("agent.route defers child failure to sync", async (t) => {
   const root = await temporaryRoot(t);
   const backend = controlBackend(async (request, host) => {
     const registered = await host.executeControlTool({
@@ -323,7 +323,7 @@ failing():
 main():
     entry:
         planner = agent @agent.planner
-        jobs = freedom.route planner, "route", [min_routes: 1, max_routes: 1], [failing], []
+        jobs = planner.route "route", [nodes: [failing], min_routes: 1, max_routes: 1]
         reports = sync jobs
         ret reports
 `, { agentExecutor: backend });
@@ -333,7 +333,7 @@ main():
   );
 });
 
-test("freedom.flow executes a Node immediately and returns the writer summary", async (t) => {
+test("agent.flow executes a Node immediately and returns the writer summary", async (t) => {
   const root = await temporaryRoot(t);
   let childCompleted = false;
   const backend = controlBackend(async (request, host) => {
@@ -366,20 +366,20 @@ department(task):
 main():
     entry:
         writer = agent @agent.writer
-        summary = freedom.flow writer, "execute", [min_routes: 1, max_routes: 1], [department], [], [task: "job"]
+        summary = writer.flow "execute", [nodes: [department], params: [task: "job"], min_routes: 1, max_routes: 1]
         ret summary
 `, { agentExecutor: backend });
   const result = await vm.run("main", [], { executionRoot: root, runId: "flow-node-execute" });
   assert.equal(result.output.content, "flow-summary");
 });
 
-test("freedom.flow validates and executes scoped IR without leaking tools into ordinary do", async (t) => {
+test("agent.flow validates and executes scoped IR without leaking tools into ordinary do", async (t) => {
   const root = await temporaryRoot(t);
   const observedTools = [];
   let irApprovals = 0;
   const generatedSource = `generated(task):
     entry:
-        result = call department, task
+        result = call department(task)
         ret result
 `;
   const backend = controlBackend(async (request, host) => {
@@ -411,7 +411,7 @@ test("freedom.flow validates and executes scoped IR without leaking tools into o
       id: "workspace-warning",
       name: "afl.ir.validate",
       input: {
-        source: `overlap():\n    entry:\n        worker = agent @agent.worker, \"writer/child\"\n        result = worker.do \"task\"\n        ret result\n`,
+        source: `overlap():\n    entry:\n        worker = agent @agent.worker, [workspace: \"writer/child\"]\n        result = worker.do \"task\"\n        ret result\n`,
         entry: "overlap",
       },
       signal: request.signal,
@@ -466,8 +466,8 @@ department(task):
         ret result
 main(task):
     entry:
-        writer = agent @agent.writer, "writer"
-        planned = freedom.flow writer, "plan", [min_routes: 1, max_routes: 1], [department], [@agent.worker], [task: task]
+        writer = agent @agent.writer, [workspace: "writer"]
+        planned = writer.flow "plan", [nodes: [department], agents: [@agent.worker], params: [task: task], min_routes: 1, max_routes: 1]
         ordinary = writer.do "after"
         ret ordinary
 `, {
@@ -497,13 +497,13 @@ test("Freedom reports static Workspace overlap and rejects it at runtime", async
   const source = `
 department(task):
     entry:
-        worker = agent @agent.department, "shared/child"
+        worker = agent @agent.department, [workspace: "shared/child"]
         result = worker.do task
         ret result
 main():
     entry:
-        planner = agent @agent.planner, ["planner", "shared"]
-        jobs = freedom.route planner, "plan", [], [department], []
+        planner = agent @agent.planner, [workspace: ["planner", "shared"]]
+        jobs = planner.route "plan", [nodes: [department]]
         reports = sync jobs
         ret reports
 `;
@@ -542,13 +542,13 @@ test("Freedom controlled params reject VM handles hidden behind unknown Node par
   const vm = AflVm.fromSource(`
 route(planner, leaked):
     entry:
-        jobs = freedom.route planner, "route", [], [], [leaked: leaked]
+        jobs = planner.route "route", [params: [leaked: leaked]]
         reports = sync jobs
         ret reports
 main():
     entry:
         planner = agent @agent.planner
-        result = call route, planner, planner
+        result = call route(planner, planner)
         ret result
 `, { agentExecutor: controlBackend(async () => completed("unexpected")) });
   await assert.rejects(vm.run(), { code: "FREEDOM_PARAM_INVALID" });
@@ -561,7 +561,7 @@ test("Freedom route constraints cannot expand VM policy limits", async (t) => {
 main():
     entry:
         planner = agent @agent.planner
-        jobs = freedom.route planner, "route", [max_routes: 3], [], []
+        jobs = planner.route "route", [max_routes: 3]
         reports = sync jobs
         ret reports
 `, {
@@ -583,11 +583,11 @@ test("Freedom rejects VM scheduling fields in instruction constraints", () => {
 main():
     entry:
         planner = agent @agent.planner
-        jobs = freedom.route planner, "route", [max_parallel: 2], [], []
+        jobs = planner.route "route", [max_parallel: 2]
         reports = sync jobs
         ret reports
 `, { agentExecutor: controlBackend(async () => completed("unexpected")) }), (error) =>
-    error.diagnostics?.some((item) => item.code === "FREEDOM_CONSTRAINT_INVALID") === true);
+    error.diagnostics?.some((item) => item.code === "PARSE_OPTIONS_FIELD") === true);
 });
 
 test("Freedom returns an empty TaskGroup for an empty Route and an empty Frag for an empty Flow", async (t) => {
@@ -596,7 +596,7 @@ test("Freedom returns an empty TaskGroup for an empty Route and an empty Frag fo
 main():
     entry:
         planner = agent @agent.planner
-        jobs = freedom.route planner, "optional route", [min_routes: 0, max_routes: 1], [], []
+        jobs = planner.route "optional route", [min_routes: 0, max_routes: 1]
         reports = sync jobs
         ret reports
 `, { agentExecutor: controlBackend(async () => completed("unexecuted route claim")) });
@@ -607,7 +607,7 @@ main():
 main():
     entry:
         writer = agent @agent.writer
-        result = freedom.flow writer, "validate only", [min_routes: 0, max_routes: 1], [], [], []
+        result = writer.flow "validate only", [min_routes: 0, max_routes: 1]
         ret result
 `, {
     agentExecutor: controlBackend(async (request, host) => {
@@ -636,7 +636,7 @@ test("Freedom preserves the writer result after IR execution without a routed No
 main():
     entry:
         writer = agent @agent.writer
-        result = freedom.flow writer, "execute IR", [min_routes: 0, max_routes: 1], [], [], []
+        result = writer.flow "execute IR", [min_routes: 0, max_routes: 1]
         ret result
 `, {
     agentExecutor: controlBackend(async (request, host) => {
@@ -670,7 +670,7 @@ available():
 main():
     entry:
         planner = agent @agent.planner
-        jobs = freedom.route planner, "route", [min_routes: 1, max_routes: 1], [available], []
+        jobs = planner.route "route", [nodes: [available], min_routes: 1, max_routes: 1]
         reports = sync jobs
         ret reports
 `, { agentExecutor: controlBackend(async () => completed("too-early")) });
