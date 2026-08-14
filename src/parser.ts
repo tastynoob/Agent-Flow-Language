@@ -950,7 +950,11 @@ function parseStringLiteral(text: string, line: SourceLine, sourceName?: string)
 }
 
 function parseOper(text: string, line: SourceLine, sourceName?: string): OperExpr {
-  const parser = new OperParser(tokenizeOper(text, line, sourceName), line, sourceName);
+  const source = text.trim();
+  if (source.startsWith("[") && source.endsWith("]")) {
+    return parseValue(source, line, sourceName);
+  }
+  const parser = new OperParser(tokenizeOper(source, line, sourceName), line, sourceName);
   return parser.parse();
 }
 

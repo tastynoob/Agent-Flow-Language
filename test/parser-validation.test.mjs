@@ -147,6 +147,22 @@ main():
   });
 });
 
+test("oper constructs list and record compute values", async () => {
+  const vm = AflVm.fromSource(`
+main(revision):
+    entry:
+        state = oper [revision: revision, lifecycle: "repair", flags: [true, false]]
+        ret state
+`, {});
+
+  const result = await vm.run("main", [3]);
+  assert.deepEqual(result.output, {
+    revision: 3,
+    lifecycle: "repair",
+    flags: [true, false],
+  });
+});
+
 test("comma-separated syntax rejects empty items consistently", () => {
   const sources = [
     `main(task,):\n    entry:\n        ret task\n`,

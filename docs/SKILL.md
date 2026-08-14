@@ -133,7 +133,7 @@ node_name(arg_a, arg_b):
 
 ### `oper`
 
-形式：`ready = oper attempts < 3 & approved`；`label = oper "build-" + build_id`；`item = oper payload.items[0]`。
+形式：`ready = oper attempts < 3 & approved`；`label = oper "build-" + build_id`；`item = oper payload.items[0]`；`state = oper [revision: revision, lifecycle: "repair"]`。
 
 - 使用 `!`、一元 `-`、`&`、`|`、`==`、`!=`、比较运算、`+`、`-`、`*`、`/`、路径和括号。
 - 只对布尔值使用 `&` 和 `|`，并依赖其短路语义。

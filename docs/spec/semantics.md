@@ -190,9 +190,10 @@ finish = oper review_result == "finish"
 
 ```text
 finish = oper review_result == "finish"
+state = oper [revision: revision, lifecycle: "repair"]
 ```
 
-`oper` 返回本地 compute value，通常用于 `jump` 或后续计算。它不把输入或结果自动加入任何 Memory，也不隐式解析 JSON。
+`oper` 返回本地 compute value，通常用于 `jump`、后续计算，或从已有 compute value 组装独立的 list/record 字面量。它不把输入或结果自动加入任何 Memory，也不隐式解析 JSON。
 
 ### 8.2 `compute`
 

@@ -260,11 +260,12 @@ answer = input question, @schema.BranchChoice
 finish = oper review_result == "finish"
 ready = oper accepted & tests_passed & !budget_exhausted
 retry = oper attempt < max_attempts
+state = oper [revision: revision, lifecycle: "repair", flags: [true, false]]
 ```
 
 Frag 参与 string operation 时读取其包装的字符串。`oper` 不隐式把 Frag 猜测或解析成 JSON object；通用模型输出使用 `compute` 显式提取，自定义格式再使用 script executor 或项目 capability。
 
-表达式支持 `!`、一元 `-`、`&`、`|`、`==`、`!=`、`<`、`<=`、`>`、`>=`、`+`、`-`、`*`、`/`、字段/索引读取和括号。`oper` 返回 compute value，不返回 Frag。
+表达式支持 `!`、一元 `-`、`&`、`|`、`==`、`!=`、`<`、`<=`、`>`、`>=`、`+`、`-`、`*`、`/`、字段/索引读取和括号。也可以用一个独立的 list 或 record 字面量组装已有 compute value；集合字面量本身不与运算符混写。`oper` 返回 compute value，不返回 Frag。
 
 ### 8.2 `compute`
 

@@ -82,6 +82,25 @@ test("generator serializes arrays and records with bracket literals", () => {
   assert.equal(argument.entries.empty.kind, "record");
 });
 
+test("generator variables can hold collection compute values", async () => {
+  const builder = new AflIrBuilder({ sourceName: "collection-variable.generated.afl" });
+  builder.node("main");
+  const state = builder.variable("state", {
+    revision: 2,
+    lifecycle: "repair",
+    flags: [true, false],
+  });
+  builder.ret(state);
+
+  const source = builder.build();
+  assert.match(source, /state = oper \[revision: 2, lifecycle: "repair", flags: \[true, false\]\]/u);
+  assert.deepEqual((await AflVm.fromSource(source, {}).run("main")).output, {
+    revision: 2,
+    lifecycle: "repair",
+    flags: [true, false],
+  });
+});
+
 test("Agent values expose lazy text conditions for when/otherwise", () => {
   const builder = new AflIrBuilder({ sourceName: "agent.generated.afl" });
   const main = builder.node("main", ["task"], {
