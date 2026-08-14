@@ -56,7 +56,7 @@ import type {
   BackendSessionRef,
 } from "./agent-executor.js";
 import { AgentExecutorError } from "./agent-executor.js";
-import type { SymbolRef } from "./ir.js";
+import type { AgentStandardToolName, SymbolRef } from "./ir.js";
 import {
   AFL_MESSAGE_ROLE_SCHEMA,
   type AgentMemoryContract,
@@ -288,6 +288,7 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
       structuredOutput: false,
       interrupt: true,
       dynamicControlTools: true,
+      standardTools: true,
       interactiveApproval: true,
       sandboxEnforcement: knownBindings.length > 0 &&
         knownBindings.every((binding) => binding.sandboxEnforcement === true),
@@ -354,6 +355,7 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     try {
       await this.importMessages(record, pending.slice(0, -1));
       const unsubscribe = this.bindEvents(record, host);
+      let restoreStandardTools: (() => Promise<void>) | undefined;
       let restoreControlTools: (() => Promise<void>) | undefined;
       let removeAuthorization: (() => void) | undefined;
       let result: AgentExecutionResult;
@@ -364,6 +366,7 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
         record.hostRouter.pendingSandboxActions.clear();
         record.hostRouter.elevationCandidates.splice(0);
         record.hostRouter.activation = { host, request };
+        restoreStandardTools = await this.configureStandardTools(record, request);
         restoreControlTools = await this.configureControlTools(record, request, host);
         removeAuthorization = this.bindAuthorization(record, request, host);
         request.signal.addEventListener("abort", abort, { once: true });
@@ -375,6 +378,7 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
         request.signal.removeEventListener("abort", abort);
         removeAuthorization?.();
         await restoreControlTools?.();
+        await restoreStandardTools?.();
         unsubscribe();
       }
       if (result.stopReason !== "completed") {
@@ -723,6 +727,31 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     return async () => {
       await record.harness.setTools(baselineTools, baselineActiveNames);
     };
+  }
+
+  private async configureStandardTools(
+    record: PiSessionRecord,
+    request: AgentExecutionRequest,
+  ): Promise<(() => Promise<void>) | undefined> {
+    if (request.tools === undefined) return undefined;
+    const baselineActiveNames = record.harness.getActiveTools().map((tool) => tool.name);
+    const availableNames = new Set(record.harness.getTools().map((tool) => tool.name));
+    const requestedNames = request.tools.map(piStandardToolName);
+    const missing = requestedNames.find((name) => !availableNames.has(name));
+    if (missing !== undefined) {
+      throw new AgentExecutorError(
+        "AGENT_CAPABILITY_UNSUPPORTED",
+        `Pi binding for '${request.agent.name}' does not provide AFL standard tool '${aflStandardToolName(missing)}'`,
+      );
+    }
+    await record.harness.setActiveTools([
+      AFL_TRANSACTION_TOOL_NAME,
+      ...(record.executionContext.elevation === undefined || requestedNames.length === 0
+        ? []
+        : [AFL_ELEVATION_TOOL_NAME]),
+      ...requestedNames,
+    ]);
+    return () => record.harness.setActiveTools(baselineActiveNames);
   }
 
   private requireSession(
@@ -1732,7 +1761,14 @@ function sandboxWorkspaceContextPrompt(workspace: AgentWorkspaceSet, elevationAv
 }
 
 function codingTools(): AgentHarnessTool<ExecutionToolContext>[] {
-  return [createReadTool(), createListTool(), createBashTool(), createEditTool(), createWriteTool()];
+  return [
+    createReadTool(),
+    createListTool(),
+    createSearchTool(),
+    createBashTool(),
+    createEditTool(),
+    createWriteTool(),
+  ];
 }
 
 const LIST_TOOL_SCHEMA = Type.Object({
@@ -1761,10 +1797,84 @@ function createListTool(): AgentHarnessTool<ExecutionToolContext, typeof LIST_TO
   };
 }
 
+const SEARCH_TOOL_SCHEMA = Type.Object({
+  query: Type.String({ minLength: 1, description: "Literal text to find" }),
+  path: Type.Optional(Type.String({
+    description: "File or directory to search, relative to the primary workspace or an absolute sandbox path",
+  })),
+  case_sensitive: Type.Optional(Type.Boolean({ description: "Whether matching is case-sensitive; defaults to true" })),
+  max_results: Type.Optional(Type.Integer({
+    minimum: 1,
+    maximum: 500,
+    description: "Maximum matching lines to return; defaults to 100",
+  })),
+});
+
+function createSearchTool(): AgentHarnessTool<ExecutionToolContext, typeof SEARCH_TOOL_SCHEMA> {
+  return {
+    name: "search",
+    label: "search",
+    description: "Recursively search UTF-8 workspace files for literal text without modifying them.",
+    parameters: SEARCH_TOOL_SCHEMA,
+    async execute(_toolCallId, params, signal, _onUpdate, { env }) {
+      const root = await env.absolutePath(params.path ?? ".", signal);
+      if (!root.ok) throw root.error;
+      const files = await collectSearchFiles(env, root.value, signal);
+      const query = params.case_sensitive === false ? params.query.toLocaleLowerCase() : params.query;
+      const limit = params.max_results ?? 100;
+      const matches: string[] = [];
+      for (const file of files) {
+        if (matches.length >= limit) break;
+        const content = await env.readTextFile(file, signal);
+        if (!content.ok || content.value.includes("\0")) continue;
+        const lines = content.value.split(/\r?\n/u);
+        for (let index = 0; index < lines.length && matches.length < limit; index += 1) {
+          const line = lines[index]!;
+          const candidate = params.case_sensitive === false ? line.toLocaleLowerCase() : line;
+          if (candidate.includes(query)) matches.push(`${file}:${index + 1}:${line.slice(0, 1_000)}`);
+        }
+      }
+      return {
+        content: [{ type: "text", text: matches.length === 0 ? "[no matches]" : matches.join("\n") }],
+        details: { matches: matches.length, truncated: matches.length >= limit },
+      };
+    },
+  };
+}
+
+async function collectSearchFiles(
+  env: ExecutionToolContext["env"],
+  root: string,
+  signal: AbortSignal | undefined,
+): Promise<string[]> {
+  const info = await env.fileInfo(root, signal);
+  if (!info.ok) throw info.error;
+  if (info.value.kind === "file") return info.value.size <= 2_000_000 ? [root] : [];
+  if (info.value.kind !== "directory") return [];
+  const files: string[] = [];
+  const directories = [root];
+  let visited = 0;
+  while (directories.length > 0 && visited < 10_000) {
+    const directory = directories.pop()!;
+    const listed = await env.listDir(directory, signal);
+    if (!listed.ok) {
+      if (directory === root) throw listed.error;
+      continue;
+    }
+    for (const entry of listed.value) {
+      visited += 1;
+      if (visited >= 10_000) break;
+      if (entry.kind === "directory") directories.push(entry.path);
+      else if (entry.kind === "file" && entry.size <= 2_000_000) files.push(entry.path);
+    }
+  }
+  return files.sort((left, right) => left.localeCompare(right));
+}
+
 function codingToolBoundaries(
   boundary: AgentToolExecutionBoundary,
 ): Readonly<Record<string, AgentToolExecutionBoundary>> {
-  return { read: boundary, list: boundary, bash: boundary, edit: boundary, write: boundary };
+  return { read: boundary, list: boundary, search: boundary, bash: boundary, edit: boundary, write: boundary };
 }
 
 function createCodingToolActionNormalizer(env: ExecutionToolContext["env"]): (
@@ -1774,12 +1884,21 @@ function createCodingToolActionNormalizer(env: ExecutionToolContext["env"]): (
 ) => Promise<Readonly<Record<string, unknown>>> {
   return async (toolName, input, signal) => {
     if (toolName === "bash") return { ...input, cwd: env.cwd, env: {}, inheritEnv: true };
-    if (toolName !== "read" && toolName !== "list" && toolName !== "edit" && toolName !== "write") return input;
+    if (toolName !== "read" && toolName !== "list" && toolName !== "search" &&
+      toolName !== "edit" && toolName !== "write") return input;
     if (typeof input.path !== "string") return input;
     const resolved = await env.absolutePath(input.path, signal);
     if (!resolved.ok) throw resolved.error;
     return { ...input, path: resolved.value };
   };
+}
+
+function piStandardToolName(name: AgentStandardToolName): string {
+  return name === "shell" ? "bash" : name;
+}
+
+function aflStandardToolName(name: string): string {
+  return name === "bash" ? "shell" : name;
 }
 
 async function disposeExecutionContext(context: PiExecutionContext<any> | undefined): Promise<void> {

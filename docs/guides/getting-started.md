@@ -57,15 +57,57 @@ afl-vm ./bindings.mjs ./flow.afl
 
 ## `bindings` 模块
 
-`bindings` 模块默认导出一个 `VmBindings` 对象，也可以提供名为 `bindings` 的导出。最小模块只需导出空对象：
+`bindings` 模块默认导出一个 `VmBindings` 对象，也可以提供名为 `bindings` 的导出。纯计算工作流的最小模块只需导出空对象：
 
 ```js
 export default {};
 ```
 
-各项 binding 均在工作流实际使用时按需检查。纯计算工作流可以使用空对象；使用 Agent、Prompt、Script、Capability、外部 Flow、Formatter 或 Schema 时，再提供对应 adapter。可用字段见 [IR 概览](../spec/ir.md#6-bindings)。
+普通 Pi 工作流不需要手工创建 executor 或文件工具：
 
-带原生 agent loop 和 session 的运行时通过 `agentExecutor` 接入。Pi 配置示例见 [`examples/pi-bindings.mjs`](../../examples/pi-bindings.mjs)；不同 Agent 可以通过 Pi backend 的 `agents` map 绑定不同模型和工具。工具权限、人工请求及 bubblewrap 配置见 [Agent 工具安全](agent-security.md)。
+```js
+import { defineBindings, pi } from "@afl-lang/core";
+
+export default defineBindings({
+  agents: pi({
+    model: "deepseek/deepseek-v4-pro",
+    thinking: "high",
+    sandbox: "bubblewrap",
+  }),
+});
+```
+
+Agent 在 AFL 中选择标准工具权限：
+
+```afl
+coder = agent @agent.coder, [workspace: "work/coder/", tools: "coding"]
+reviewer = agent @agent.reviewer, [workspace: ["work/reviewer/", "src/"], tools: "readonly"]
+planner = agent @agent.planner, [tools: "none"]
+```
+
+`none`、`readonly`、`editing`、`coding` 是标准 profile；也可以显式写 `tools: ["read", "write"]`。具体工具集合见[语法规范](../spec/syntax.md#6-agent-指令与-role)。工具选择属于 AFL flow，模型、沙箱和执行细节属于 bindings。
+
+领域 capability 可以直接声明为函数表，不需要手写 `switch`、参数解包或返回值包装：
+
+```js
+export default defineBindings({
+  agents: pi({ model: "deepseek/deepseek-v4-pro" }),
+  capabilities: {
+    "@project.inspect": async ({ executionRoot, signal }, state) => {
+      return inspectProject(executionRoot, state, signal);
+    },
+  },
+  scripts: "typescript",
+});
+```
+
+handler 第一个参数是标准 context，包含 `capability`、`runId`、`node`、`block`、`executionRoot` 和 `signal`，后续参数与 AFL `invoke` 的 operand 顺序一致。普通 object、list、number 和 boolean 返回值会自动编码为 Frag；字符串直接成为 Frag。
+
+`scripts: "typescript"` 使用进程内 `Function`，只适用于宿主信任 AFL source 的场景。它不是 TypeScript 编译器，也不是沙箱。
+
+各项 binding 均在工作流实际使用时按需检查。使用 Prompt、Input、外部 Flow、Formatter、Schema 或自定义底层 executor 时仍可提供原始 adapter。可用字段见 [IR 概览](../spec/ir.md#6-bindings)。
+
+带原生 agent loop 和 session 的运行时底层仍通过 `agentExecutor` 接入。Pi 配置示例见 [`examples/pi-bindings.mjs`](../../examples/pi-bindings.mjs)；`pi({ agents: ... })` 可以为特定 Agent 覆盖模型、思考、超时和沙箱配置。工具权限、人工请求及 bubblewrap 配置见 [Agent 工具安全](agent-security.md)。
 
 ## 开发与测试
 

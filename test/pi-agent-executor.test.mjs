@@ -869,6 +869,90 @@ main():
   assert.equal(observedWorkingDirectory, await realpath(join(root, "work")));
 });
 
+test("Pi activates only the AFL standard tools selected by each Agent", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "afl-pi-tool-profile-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const seen = [];
+  faux.setResponses([
+    (context) => {
+      seen.push(context.tools.map((tool) => tool.name));
+      return fauxAssistantMessage("reviewed");
+    },
+    (context) => {
+      seen.push(context.tools.map((tool) => tool.name));
+      return fauxAssistantMessage("planned");
+    },
+    (context) => {
+      seen.push(context.tools.map((tool) => tool.name));
+      return fauxAssistantMessage("coded");
+    },
+  ]);
+  const backend = new PiAgentExecutorBackend({
+    models,
+    defaultBinding: createPiCodingAgentBinding({ model: faux.getModel() }),
+  });
+  const vm = AflVm.fromSource(`
+main():
+    entry:
+        reviewer = agent @agent.reviewer, [tools: "readonly"]
+        reviewed = reviewer.do "review"
+        planner = agent @agent.planner, [tools: "none"]
+        planned = planner.do reviewed
+        coder = agent @agent.coder, [tools: ["read", "write", "shell"]]
+        coded = coder.do planned
+        ret coded
+`, { agentExecutor: backend });
+
+  const result = await vm.run("main", [], { executionRoot: root });
+  assert.equal(result.output.content, "coded");
+  assert.deepEqual(seen.map((tools) => tools.toSorted()), [
+    ["read", "list", "search", "afl_transaction_request"].toSorted(),
+    ["afl_transaction_request"],
+    ["read", "bash", "write", "afl_transaction_request"].toSorted(),
+  ]);
+});
+
+test("Pi standard search tool finds literal text without shell access", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "afl-pi-search-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, "work"), { recursive: true });
+  await writeFile(join(root, "work", "notes.txt"), "alpha\nneedle here\nomega\n", "utf8");
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  faux.setResponses([
+    (context) => {
+      assert.equal(context.tools.some((tool) => tool.name === "bash"), false);
+      return fauxAssistantMessage(
+        fauxToolCall("search", { query: "needle", path: "." }, { id: "search-1" }),
+        { stopReason: "toolUse" },
+      );
+    },
+    (context) => {
+      const result = context.messages.findLast((message) => message.role === "toolResult");
+      assert.match(result.content.map((block) => block.text ?? "").join(""), /notes\.txt:2:needle here/u);
+      return fauxAssistantMessage("found");
+    },
+  ]);
+  const backend = new PiAgentExecutorBackend({
+    models,
+    defaultBinding: createPiCodingAgentBinding({ model: faux.getModel() }),
+  });
+  const vm = AflVm.fromSource(`
+main():
+    entry:
+        reviewer = agent @agent.reviewer, [workspace: "work/", tools: ["search"]]
+        result = reviewer.do "find needle"
+        ret result
+`, { agentExecutor: backend });
+
+  const result = await vm.run("main", [], { executionRoot: root });
+  assert.equal(result.output.content, "found");
+});
+
 test("Pi coding binding executes write and GCC tools inside bubblewrap", async (t) => {
   try {
     await access("/usr/bin/bwrap");

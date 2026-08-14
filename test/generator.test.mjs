@@ -89,7 +89,11 @@ test("Agent values expose lazy text conditions for when/otherwise", () => {
     parameters: { task: "The requested work." },
     returns: "The completed result.",
   });
-  const coder = builder.agent("@agent.coder", { name: "coder", workspace: "work/coder" });
+  const coder = builder.agent("@agent.coder", {
+    name: "coder",
+    workspace: "work/coder",
+    tools: "coding",
+  });
   coder.systemPrompt("Implement the task carefully.");
   const result = coder.do(main.params.task, { name: "result" });
 
@@ -104,7 +108,7 @@ test("Agent values expose lazy text conditions for when/otherwise", () => {
     source,
     /condition_1 = typescript "return String\(args\[0\]\)\.startsWith\(String\(args\[1\]\)\)", result, "DONE:"/u,
   );
-  assert.match(source, /coder = agent @agent\.coder, \[workspace: "work\/coder"\]/u);
+  assert.match(source, /coder = agent @agent\.coder, \[workspace: "work\/coder", tools: "coding"\]/u);
   assert.match(source, /result = coder\.do task/u);
   assert.deepEqual(parseAfl(source).nodes[0].documentation, {
     description: "Run one coding task.",

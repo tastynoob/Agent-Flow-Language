@@ -1,6 +1,7 @@
-import type { ComputeValue, PrimitiveValue } from "../ir.js";
+import type { AgentStandardToolName, ComputeValue, PrimitiveValue } from "../ir.js";
 import { isComputeValue } from "../ir.js";
 import { parseAfl } from "../parser.js";
+import { AGENT_TOOL_PROFILES, type AgentToolProfileName } from "../standard-agent-tools.js";
 import { assertValidModule } from "../validation.js";
 
 const NAME = /^[A-Za-z_][A-Za-z0-9_]*$/u;
@@ -29,6 +30,7 @@ export interface AflAgentOptions {
   readonly name?: string;
   readonly workspace?: string | readonly string[] | AflValue;
   readonly memory?: AflValue;
+  readonly tools?: AgentToolProfileName | readonly AgentStandardToolName[];
 }
 
 export interface AflAgentDoOptions {
@@ -680,9 +682,16 @@ export class AflIrBuilder {
         ? options.workspace._toAfl(this, this._currentScope())
         : serializeCompute(typeof options.workspace === "string" ? options.workspace : [...options.workspace]);
     const memory = options.memory?._toAfl(this, this._currentScope());
+    if (typeof options.tools === "string" && !Object.hasOwn(AGENT_TOOL_PROFILES, options.tools)) {
+      throw new TypeError(`unknown Agent tool profile '${options.tools}'`);
+    }
+    const tools = options.tools === undefined
+      ? undefined
+      : serializeCompute(typeof options.tools === "string" ? options.tools : [...options.tools]);
     const optionEntries = [
       ...(workspace === undefined ? [] : [`workspace: ${workspace}`]),
       ...(memory === undefined ? [] : [`memory: ${memory}`]),
+      ...(tools === undefined ? [] : [`tools: ${tools}`]),
     ];
     this._emitAssignment(
       destination,

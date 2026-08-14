@@ -1,5 +1,5 @@
 import type { BackendSessionRef } from "./agent-executor.js";
-import type { AflModule, ComputeValue, Frag, SymbolRef } from "./ir.js";
+import type { AflModule, AgentStandardToolName, ComputeValue, Frag, SymbolRef } from "./ir.js";
 import type { BackendSessionState, Message, PersistedMemoryBase } from "./memory.js";
 import type { AgentWorkspaceSet } from "./workspace.js";
 
@@ -30,6 +30,7 @@ export interface AgentHandle {
   readonly agent: SymbolRef;
   readonly memory: MemoryHandle;
   readonly workspace: AgentWorkspaceSet;
+  readonly tools?: readonly AgentStandardToolName[];
   readonly origin: AgentOrigin;
   systemPrompt?: string;
   session?: BackendSessionRef;

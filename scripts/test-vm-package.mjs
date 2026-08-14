@@ -69,6 +69,13 @@ try {
     "bin",
     "vm-command.mjs",
   );
+  const installedCore = await import(pathToFileURL(join(installedPackage, "dist", "src", "index.js")).href);
+  const friendlyBindings = installedCore.defineBindings({
+    agents: installedCore.pi({ model: "deepseek/deepseek-v4-pro" }),
+  });
+  if (friendlyBindings.agentExecutor?.name !== "pi") {
+    throw new Error("installed package did not expose functional defineBindings/pi helpers");
+  }
   const { runVmCommand } = await import(pathToFileURL(commandModule).href);
   let output = "";
   let errorOutput = "";

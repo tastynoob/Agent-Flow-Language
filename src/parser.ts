@@ -17,6 +17,11 @@ import type {
   SymbolExpr,
   ValueExpr,
 } from "./ir.js";
+import {
+  expandAgentToolProfile,
+  isAgentStandardToolName,
+  isAgentToolProfileName,
+} from "./standard-agent-tools.js";
 
 interface SourceLine {
   readonly number: number;
@@ -345,7 +350,7 @@ function parseAssignedInstruction(
     }
     const options = operands[1] === undefined
       ? new Map<string, string>()
-      : parseOptions(operands[1], line, sourceName, "Agent options", ["workspace", "memory"]);
+      : parseOptions(operands[1], line, sourceName, "Agent options", ["workspace", "memory", "tools"]);
     return {
       op: "agent",
       dst,
@@ -356,6 +361,9 @@ function parseAssignedInstruction(
       ...(options.get("memory") === undefined
         ? {}
         : { memory: parseName(options.get("memory")!, line, sourceName) }),
+      ...(options.get("tools") === undefined
+        ? {}
+        : { tools: parseAgentTools(options.get("tools")!, line, sourceName) }),
       span: line.span,
     };
   }
@@ -531,6 +539,48 @@ function parseAssignedInstruction(
   }
 
   throw parseError("PARSE_OPCODE", `unknown instruction '${rhs.split(/\s/u, 1)[0] ?? rhs}'`, line, sourceName);
+}
+
+function parseAgentTools(
+  text: string,
+  line: SourceLine,
+  sourceName?: string,
+): readonly import("./ir.js").AgentStandardToolName[] {
+  const value = parseValue(text, line, sourceName);
+  if (value.kind === "literal" && typeof value.value === "string") {
+    if (!isAgentToolProfileName(value.value)) {
+      throw parseError(
+        "PARSE_AGENT_TOOLS",
+        `unknown Agent tool profile '${value.value}'`,
+        line,
+        sourceName,
+      );
+    }
+    return [...expandAgentToolProfile(value.value)];
+  }
+  if (value.kind !== "list") {
+    throw parseError(
+      "PARSE_AGENT_TOOLS",
+      "Agent tools must be a profile string or a list of standard tool names",
+      line,
+      sourceName,
+    );
+  }
+  const tools = value.items.map((item) => {
+    if (item.kind !== "literal" || typeof item.value !== "string" || !isAgentStandardToolName(item.value)) {
+      throw parseError(
+        "PARSE_AGENT_TOOLS",
+        "Agent tool lists may contain only read, list, search, write, edit, or shell",
+        line,
+        sourceName,
+      );
+    }
+    return item.value;
+  });
+  if (new Set(tools).size !== tools.length) {
+    throw parseError("PARSE_AGENT_TOOLS", "Agent tool lists cannot contain duplicates", line, sourceName);
+  }
+  return tools;
 }
 
 function parseAgentWorkOperands(

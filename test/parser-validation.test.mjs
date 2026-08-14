@@ -290,6 +290,52 @@ main():
   assert.equal(memoryInsideWorkspaceList.diagnostics.some((item) => item.code === "VALUE_KIND_INVALID"), true);
 });
 
+test("Agent tools accept standard profiles and explicit lists", () => {
+  const module = parseAfl(`
+main():
+    entry:
+        planner = agent @agent.planner, [tools: "none"]
+        reviewer = agent @agent.reviewer, [tools: "readonly"]
+        coder = agent @agent.coder, [tools: ["read", "write", "shell"]]
+        ret "done"
+`);
+  const instructions = module.nodes[0].blocks[0].instructions;
+  assert.deepEqual(instructions[0].tools, []);
+  assert.deepEqual(instructions[1].tools, ["read", "list", "search"]);
+  assert.deepEqual(instructions[2].tools, ["read", "write", "shell"]);
+
+  for (const tools of ['"unknown"', '["read", "read"]', '["custom"]', 'tool_name']) {
+    assert.throws(
+      () => parseAfl(`main():\n    entry:\n        worker = agent @agent.worker, [tools: ${tools}]\n        ret "done"\n`),
+      (error) => error instanceof AflParseError && error.diagnostics[0].code === "PARSE_AGENT_TOOLS",
+    );
+  }
+});
+
+test("validator rejects invalid Agent tools in directly constructed IR", () => {
+  const module = parseAfl(`
+main():
+    entry:
+        worker = agent @agent.worker
+        ret "done"
+`);
+  const instruction = module.nodes[0].blocks[0].instructions[0];
+  const invalid = {
+    ...module,
+    nodes: [{
+      ...module.nodes[0],
+      blocks: [{
+        ...module.nodes[0].blocks[0],
+        instructions: [{ ...instruction, tools: ["read", "read", "custom"] }],
+      }],
+    }],
+  };
+  const result = validateModule(invalid);
+  assert.equal(result.ok, false);
+  assert.equal(result.diagnostics.some((item) => item.code === "AGENT_TOOL_DUPLICATE"), true);
+  assert.equal(result.diagnostics.some((item) => item.code === "AGENT_TOOL_UNKNOWN"), true);
+});
+
 test("parser reports stable source location for indentation errors", () => {
   assert.throws(
     () => parseAfl("main():\n   entry:\n        ret", "bad.afl"),

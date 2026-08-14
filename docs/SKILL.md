@@ -80,12 +80,14 @@ node_name(arg_a, arg_b):
 
 ### `agent`
 
-形式：`coder = agent @agent.coder`；`coder = agent @agent.coder, [workspace: "work/coder"]`；`coder = agent @agent.coder, [workspace: ["work/coder", "shared/specs"], memory: saved_memory]`。
+形式：`coder = agent @agent.coder`；`coder = agent @agent.coder, [workspace: "work/coder", tools: "coding"]`；`reviewer = agent @agent.reviewer, [workspace: ["work/reviewer", "shared/specs"], memory: saved_memory, tools: "readonly"]`。
 
 - 使用第一个 operand 选择 Agent symbol；第二个 operand 是可选的 typed options record。
 - `workspace` 字符串声明一个主读写目录；至少两个元素的 list 把第一项作为主读写 workspace，其余项作为只读 workspace。
 - 省略 workspace 时，让 VM 为该 Agent 分配独立临时 workspace。不要依赖临时目录的物理位置。
 - 如需绑定既有 Memory，使用 `memory` option；不使用空 operand 占位。
+- 使用 `tools` 在 flow 中选择标准工具。`none` 不含文件/命令工具；`readonly` 为 read/list/search；`editing` 再加入 write/edit；`coding` 再加入 shell。也可显式使用标准工具字符串列表。
+- 把 `tools` 视为模型可见能力选择，不视为 sandbox 证明。省略时由 executor binding 决定默认工具；显式声明时 executor 必须支持 `standardTools`。
 - 只绑定尚未被其他 Agent 拥有的 Memory。创建后通过 `coder.memory` 取得其 Memory handle。
 - 让宿主拒绝主 workspace 与只读 workspace 的重叠、逃逸或不合法解析。不要把只读声明当作 executor 已经强制执行的证明。
 
@@ -307,6 +309,20 @@ VmBindings
 
 对于参考 CLI binding module，导出 default object 或名为 `bindings` 的 object。其他宿主直接把等价对象传给 VM，不需要采用 JavaScript 模块形式。
 
+普通 Pi workflow 优先使用人性化组合 API：
+
+```js
+export default defineBindings({
+  agents: pi({ model: "deepseek/deepseek-v4-pro", thinking: "high", sandbox: "bubblewrap" }),
+  capabilities: {
+    "@project.inspect": async ({ executionRoot, signal }, state) => inspect(executionRoot, state, signal),
+  },
+  scripts: "typescript",
+});
+```
+
+函数表 capability 的第一个参数包含 `capability`、`runId`、`node`、`block`、`executionRoot` 和 `signal`，后续参数对应 AFL operand。只在信任 AFL source 时使用 `scripts: "typescript"`；它在宿主进程执行，不是沙箱。
+
 让宿主按 symbol 解析实现；AFL v0 本身没有 package 或 provider 声明语法。
 
 ### 通用值边界
@@ -326,7 +342,7 @@ VmBindings
 | `prompts.render` | `prompt`, `args`, `signal` | string | 只解析 symbol prompt；保持参数顺序；响应取消 |
 | `input.read` | `runId`, `node`, `block`, `prompt`, `schema?`, `signal` | string | 允许交互或自动输入；不要自行跳过 VM schema 校验 |
 | `scripts.execute` | `language`, `source`, `args`, `signal` | compute | 隔离执行环境；验证输出可序列化且数字有限 |
-| `capabilities.invoke` | `capability`, `args`, `signal` | string 或 Frag | 只实现明确 symbol；把副作用纳入授权和审计 |
+| `capabilities.invoke` | `runId`, `node`, `block`, `executionRoot`, `capability`, `args`, `signal` | string 或 Frag | 只实现明确 symbol；把副作用纳入授权和审计 |
 | `flows.invoke` | `flow`, `args`, `signal` | Frag 或 compute | 不接受 handle；传播取消；稳定地报告远端失败 |
 | `formatters.format` | `formatter`, `values`, `signal` | string | 不改变输入次序；对空列表定义稳定行为 |
 | `schemas.validate` | `schema`, `content`, `signal` | void | 只验证，不转换；失败时给出安全、可定位的错误 |
@@ -366,6 +382,7 @@ result = { output: string }
 | `structuredOutput` | 能接收并遵守结构化输出请求；VM 仍使用 `schemas` 复核 |
 | `interrupt` | 能在取消信号后中断进行中的执行 |
 | `dynamicControlTools` | 能在 activation 中调用 VM 提供的 Freedom control tools |
+| `standardTools` | 能按 Agent allocation 的 `tools` 字段激活 VM 标准工具 |
 | `interactiveApproval` | 能发起显式 elevation 或 transaction 审批 |
 | `sandboxEnforcement` | executor 自身确实强制执行工作区、进程、网络或工具隔离 |
 
@@ -376,7 +393,7 @@ request = {
   runId, node, block,
   agent, systemPrompt?,
   memory, memoryRevision,
-  workspace,
+  workspace, tools?,
   session?, sessionMemoryRevision?,
   schema?, control?, signal
 }

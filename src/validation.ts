@@ -21,6 +21,7 @@ import type {
   ValueExpr,
 } from "./ir.js";
 import { workspacePathOverlap } from "./workspace.js";
+import { isAgentStandardToolName } from "./standard-agent-tools.js";
 
 export interface ValidationSuccess {
   readonly ok: true;
@@ -373,6 +374,17 @@ function validateInstructionKinds(
 ): void {
   switch (instruction.op) {
     case "agent":
+      if (instruction.tools !== undefined) {
+        const seen = new Set<string>();
+        for (const tool of instruction.tools) {
+          if (!isAgentStandardToolName(tool)) {
+            add(diagnostics, module, instruction.span, "AGENT_TOOL_UNKNOWN", `unknown standard Agent tool '${tool}'`);
+          } else if (seen.has(tool)) {
+            add(diagnostics, module, instruction.span, "AGENT_TOOL_DUPLICATE", `Agent tool '${tool}' is repeated`);
+          }
+          seen.add(tool);
+        }
+      }
       if (instruction.workspace !== undefined) {
         validateWorkspaceExpression(module, instruction.workspace, kinds, diagnostics);
         expectKind(module, instruction.workspace, kinds, ["compute", "unknown"], "Agent Workspace", diagnostics);

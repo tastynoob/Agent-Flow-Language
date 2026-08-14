@@ -1,6 +1,8 @@
 # Agent 工具安全
 
-AFL v0 的 Agent 工具安全由 TypeScript bindings 配置，不增加 AFL IR 指令。当前实现包含六个可组合部分：pre-tool policy、串行人工请求队列、Pi 内建提权工具、Pi 内建事务申请工具、可选的 bubblewrap execution environment，以及 cc-safety-net policy adapter。
+AFL v0 的 Agent 工具执行边界由 AFL 与 TypeScript bindings 共同描述。Agent allocation 的 `tools` option 选择 VM 标准工具；bindings 配置实际 executor、安全策略和 sandbox。当前实现包含标准工具 profile、pre-tool policy、串行人工请求队列、Pi 内建提权工具、Pi 内建事务申请工具、可选的 bubblewrap execution environment，以及 cc-safety-net policy adapter。
+
+`tools` 不是 sandbox，也不替代 pre-tool policy：它决定模型在本次 Agent activation 中能看到哪些标准工具。`readonly` 不暴露写入和 Shell 工具，`none` 不暴露文件或命令工具。只有 executor 对 Workspace 和只读挂载的实际强制执行才能提供安全边界。
 
 这些能力只覆盖 `AgentExecutorBackend` 内的工具调用。AFL `script`、`capability`、外部 Flow adapter 和其他宿主扩展仍使用各自的 binding/`VmPolicy` 边界。
 

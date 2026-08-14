@@ -71,6 +71,7 @@ import {
   type FlowTarget,
   type AgentControlInstruction,
   type AgentControlMode,
+  type AgentStandardToolName,
   type Frag,
   type SourceSpan,
   type SymbolExpr,
@@ -566,6 +567,7 @@ export class AflVm {
             memory,
             workspace,
             this.agentOrigin(frame, activation, location),
+            instruction.tools,
           );
           memory.owner = agent.id;
           return agent;
@@ -760,6 +762,7 @@ export class AflVm {
               systemPrompt: source.systemPrompt,
               agent: source.agent,
               workspace: source.workspace,
+              tools: source.tools,
             };
           },
         );
@@ -777,6 +780,7 @@ export class AflVm {
           memory,
           snapshot.workspace,
           this.agentOrigin(frame, activation, location),
+          snapshot.tools,
         );
         memory.owner = branch.id;
         if (snapshot.systemPrompt !== undefined) branch.systemPrompt = snapshot.systemPrompt;
@@ -802,6 +806,10 @@ export class AflVm {
           });
         }
         const request = {
+          runId: context.runId,
+          node: location.node,
+          block: location.block,
+          executionRoot: context.executionRoot,
           capability: toSymbol(instruction.capability),
           args: instruction.args.map((argument) => this.toPromptArgument(evaluateValue(argument, frame), argument.span)),
           signal,
@@ -881,6 +889,7 @@ export class AflVm {
               memory,
               source.workspace,
               this.agentOrigin(frame, activation, location),
+              source.tools,
             );
             if (source.systemPrompt !== undefined) agent.systemPrompt = source.systemPrompt;
             memory.owner = agent.id;
@@ -927,6 +936,12 @@ export class AflVm {
         `Agent executor '${executor.name}' does not support activation-scoped AFL control tools`,
       );
     }
+    if (agent.tools !== undefined && !executor.capabilities.standardTools) {
+      throw new AflVmError(
+        "AGENT_CAPABILITY_UNSUPPORTED",
+        `Agent executor '${executor.name}' does not support AFL standard tool selection`,
+      );
+    }
     return context.locks.use(
       [{ key: agent.id, mode: "write" }, { key: agent.memory.id, mode: "write" }],
       signal,
@@ -953,6 +968,7 @@ export class AflVm {
               agent: agent.agent,
               ...(agent.systemPrompt === undefined ? {} : { systemPrompt: agent.systemPrompt }),
               workspace: agent.workspace,
+              ...(agent.tools === undefined ? {} : { tools: agent.tools }),
               messages: cloneMessages(agent.memory.messages),
               ...(schema === undefined ? {} : { schema: toSymbol(schema) }),
               ...(control === undefined ? {} : { control: control.activation }),
@@ -971,6 +987,7 @@ export class AflVm {
               memory: cloneMessages(agent.memory.messages),
               memoryRevision: agent.memory.revision,
               workspace: agent.workspace,
+              ...(agent.tools === undefined ? {} : { tools: agent.tools }),
               ...(agent.session === undefined ? {} : { session: agent.session }),
               ...(agent.sessionMemoryRevision === undefined
                 ? {}
@@ -2589,8 +2606,17 @@ export class AflVm {
     memory: MemoryHandle,
     workspace: AgentWorkspaceSet,
     origin: AgentOrigin,
+    tools?: readonly AgentStandardToolName[],
   ): AgentHandle {
-    return { kind: "agent", id: this.nextHandle(context, "agent"), agent, memory, workspace, origin };
+    return {
+      kind: "agent",
+      id: this.nextHandle(context, "agent"),
+      agent,
+      memory,
+      workspace,
+      origin,
+      ...(tools === undefined ? {} : { tools: Object.freeze([...tools]) }),
+    };
   }
 
   private agentOrigin(

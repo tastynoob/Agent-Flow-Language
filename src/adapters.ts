@@ -1,4 +1,12 @@
-import type { AflModule, ComputeValue, Frag, AgentControlMode, ScriptLanguage, SymbolRef } from "./ir.js";
+import type {
+  AflModule,
+  AgentControlMode,
+  AgentStandardToolName,
+  ComputeValue,
+  Frag,
+  ScriptLanguage,
+  SymbolRef,
+} from "./ir.js";
 import type { AgentExecutorBackend, AgentInteractionHost } from "./agent-executor.js";
 import type { AgentApprovalQueue } from "./approval-queue.js";
 import type { AgentPreToolPolicyConfig } from "./agent-tool-policy.js";
@@ -13,6 +21,7 @@ export interface AgentRunRequest {
   readonly agent: SymbolRef;
   readonly systemPrompt?: string;
   readonly workspace: AgentWorkspaceSet;
+  readonly tools?: readonly AgentStandardToolName[];
   readonly messages: readonly Message[];
   readonly schema?: SymbolRef;
   readonly signal: AbortSignal;
@@ -68,6 +77,10 @@ export interface ScriptAdapter {
 }
 
 export interface CapabilityRequest {
+  readonly runId: string;
+  readonly node: string;
+  readonly block: string;
+  readonly executionRoot: string;
   readonly capability: SymbolRef;
   readonly args: readonly PromptArgument[];
   readonly signal: AbortSignal;

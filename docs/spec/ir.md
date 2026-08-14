@@ -92,6 +92,8 @@ Basic block 内的指令不因文本相邻而自动串行。VM 从名称引用�
 
 只有 flow 实际执行到对应能力时，VM 才要求该 binding 存在。纯计算 flow 可以使用空 bindings object。
 
+Reference VM 提供 `defineBindings()` 作为组合入口。`agents: pi(...)` 会规范化为 `agentExecutor`，函数表式 `capabilities` 会规范化为 `CapabilityAdapter`，`scripts: "typescript"` 会启用显式可信的进程内 script executor。这些 helper 不改变 Core IR 或 adapter 边界，高级宿主仍可直接实现原始接口。
+
 Freedom 不使用单独的 Move 或 Freedom binding。它要求 `agentExecutor` 支持 activation-scoped control tools；候选 Node、Agent 和参数范围直接来自当前 AFL 指令。
 
 ## 7. 文档边界

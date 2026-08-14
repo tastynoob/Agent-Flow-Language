@@ -106,7 +106,10 @@ export interface AgentInstruction extends InstructionBase {
   readonly agent: SymbolExpr;
   readonly workspace?: ValueExpr;
   readonly memory?: NameExpr;
+  readonly tools?: readonly AgentStandardToolName[];
 }
+
+export type AgentStandardToolName = "read" | "list" | "search" | "write" | "edit" | "shell";
 
 export interface SystemPromptInstruction extends InstructionBase {
   readonly op: "agent.system_prompt";

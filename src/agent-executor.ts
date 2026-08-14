@@ -1,6 +1,5 @@
 import type { AgentAdapter, AgentRunRequest } from "./adapters.js";
-import type { SymbolRef } from "./ir.js";
-import type { ComputeValue } from "./ir.js";
+import type { AgentStandardToolName, ComputeValue, SymbolRef } from "./ir.js";
 import {
   AFL_MESSAGE_ROLE_SCHEMA,
   type AgentMemoryContract,
@@ -24,6 +23,7 @@ export interface AgentExecutorCapabilities {
   readonly structuredOutput: boolean;
   readonly interrupt: boolean;
   readonly dynamicControlTools: boolean;
+  readonly standardTools: boolean;
   readonly interactiveApproval: boolean;
   readonly sandboxEnforcement: boolean;
 }
@@ -51,6 +51,7 @@ export interface AgentExecutionRequest {
   readonly memory: readonly Message[];
   readonly memoryRevision: number;
   readonly workspace: AgentWorkspaceSet;
+  readonly tools?: readonly AgentStandardToolName[];
   readonly session?: BackendSessionRef;
   readonly sessionMemoryRevision?: number;
   readonly schema?: SymbolRef;
@@ -236,6 +237,7 @@ const STATELESS_CAPABILITIES = {
   structuredOutput: false,
   interrupt: true,
   dynamicControlTools: false,
+  standardTools: false,
   interactiveApproval: false,
   sandboxEnforcement: false,
 } as const;

@@ -185,11 +185,26 @@ Terminator 和 `memory.append` 等 effect instruction 不需要产生结果。
 ```text
 coder = agent @agent.coder
 worker = agent @agent.worker, [workspace: "workers/worker/"]
-reviewer = agent @agent.reviewer, [workspace: ["workers/reviewer/", "docs/", "src/"]]
+reviewer = agent @agent.reviewer, [workspace: ["workers/reviewer/", "docs/", "src/"], tools: "readonly"]
+coder = agent @agent.coder, [tools: "coding"]
+editor = agent @agent.editor, [tools: ["read", "write", "edit"]]
 reviewer = agent @agent.reviewer, [memory: review_memory]
 ```
 
 第二个 operand 是可选的 typed options record。`workspace` 为单个路径时表示主工作区；为列表时，第一项是主工作区，后续至少一项是只读工作区。只有主工作区时必须使用字符串。省略 `workspace` 时，VM 为这次 Agent allocation 在 `.afl/tmpworkspace/<run-id>/` 下分配稳定且互不重叠的主工作区。`memory` 绑定已有 Memory，不使用空 operand 占位。
+
+`tools` 选择 VM 标准 Agent 工具。它接受 profile 字符串或显式字符串列表：
+
+| Profile | 标准工具 |
+| --- | --- |
+| `none` | 无文件或命令工具 |
+| `readonly` | `read`、`list`、`search` |
+| `editing` | `read`、`list`、`search`、`write`、`edit` |
+| `coding` | `read`、`list`、`search`、`write`、`edit`、`shell` |
+
+显式列表只能包含上述标准名且不能重复。`shell` 是后端无关名称；例如 Pi 将它映射为 harness 的 `bash` 工具。省略 `tools` 时由 executor binding 决定默认工具，用于高级自定义工具和渐进迁移；显式写出后，executor 必须支持标准工具选择，否则执行失败。`fork` 和 `with_memory` 保留 source Agent 的工具权限。
+
+Reference Pi executor 的 `search` 做递归字面量文本搜索，不调用 Shell，不跟随 symlink，跳过大于 2 MB 的文件，并限制单次扫描最多 10,000 个目录项和 500 条返回结果。它用于常见源码定位，不替代索引服务或项目特有的检索 capability。
 
 设置 system prompt：
 
@@ -387,7 +402,7 @@ Freedom activation 延续该 Agent 已有的 Memory 和 executor session，指�
 ## 14. 指令形式汇总
 
 ```text
-dst = agent symbol [, [workspace: value, memory: memory]]
+dst = agent symbol [, [workspace: value, memory: memory, tools: profile-or-list]]
 agent.system_prompt prompt
 dst = agent.do frag [, [role: role, schema: schema]]
 

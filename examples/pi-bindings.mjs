@@ -1,18 +1,14 @@
 import {
-  PiAgentExecutorBackend,
-  createPiCodingAgentBinding,
+  defineBindings,
+  pi,
 } from "@afl-lang/core";
 
 const provider = requiredEnvironment("AFL_PI_PROVIDER");
 const model = requiredEnvironment("AFL_PI_MODEL");
 
-export default {
-  agentExecutor: new PiAgentExecutorBackend({
-    defaultBinding: createPiCodingAgentBinding({
-      model: { provider, id: model },
-    }),
-  }),
-};
+export default defineBindings({
+  agents: pi({ model: `${provider}/${model}` }),
+});
 
 function requiredEnvironment(name) {
   const value = process.env[name];
