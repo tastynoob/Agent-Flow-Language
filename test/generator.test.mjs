@@ -132,6 +132,18 @@ test("node references generate validated local calls", async () => {
   assert.deepEqual(execution.output, frag("hello"));
 });
 
+test("builder emits VM built-in compute calls", async () => {
+  const builder = new AflIrBuilder();
+  const main = builder.node("main", ["raw"]);
+  const parsed = builder.compute("@afl.parse.json", [main.params.raw], "parsed");
+  builder.ret(parsed);
+
+  const source = builder.build();
+  assert.match(source, /parsed = compute @afl\.parse\.json, raw/u);
+  const execution = await AflVm.fromSource(source, {}).run("main", [frag('{"status":"finish"}')]);
+  assert.deepEqual(execution.output, { status: "finish" });
+});
+
 test("Agent options preserve role, schema, and an explicit Memory", () => {
   const builder = new AflIrBuilder();
   builder.node("main", ["task"]);

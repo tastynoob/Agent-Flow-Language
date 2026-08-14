@@ -156,6 +156,7 @@ bdr.end();
 | `condition.not()` | `dst = oper !condition` |
 | `condition.and()`、`condition.or()` | `oper` 布尔组合 |
 | `startsWith`、`endsWith`、`includes` | 接收两个参数的 `typescript` instruction |
+| `bdr.compute(symbol, args)` | `dst = compute symbol, args` |
 
 JavaScript string、number、boolean、`null`、array 和 plain record 作为 AFL literal 编码。生成结果中 array 写作 `[value, ...]`，plain record 写作 `[key: value, ...]`，空 record 写作 `[:]`。引用已有 AFL 名称时使用 `ref()`，引用 symbol 时使用 `symbol()`；不要用普通 string 代替引用。
 
@@ -166,12 +167,12 @@ JavaScript string、number、boolean、`null`、array 和 plain record 作为 AF
 ```ts
 bdr.emit("coder.memory.append user, result");
 const reports = bdr.assign("reports", "sync jobs");
-const parsed = bdr.typescript("return JSON.parse(args[0])", [reports], "parsed");
+const parsed = bdr.compute("@afl.parse.json", [reports], "parsed");
 ```
 
 - `emit()` 只接受一行普通 instruction。
 - `assign(name, body)` 返回对应 `AflValue`。
-- `oper()` 和 `typescript()` 返回自动命名或显式命名的值。
+- `oper()`、`compute()` 和 `typescript()` 返回自动命名或显式命名的值。
 - Terminator 必须使用 `when()`、`while()`、`match()`、`ret()`、`fail()`、`break()` 和 `continue()` 表达。
 - `__afl_` 前缀保留给 generator 的 block 和临时名称。
 

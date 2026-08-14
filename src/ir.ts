@@ -146,6 +146,13 @@ export interface OperInstruction extends InstructionBase {
   readonly expression: OperExpr;
 }
 
+export interface ComputeInstruction extends InstructionBase {
+  readonly op: "compute";
+  readonly dst: string;
+  readonly function: SymbolExpr;
+  readonly args: readonly ValueExpr[];
+}
+
 export type ScriptLanguage = "python" | "typescript" | "shell";
 
 export interface ScriptInstruction extends InstructionBase {
@@ -255,6 +262,7 @@ export type AflInstruction =
   | PromptInstruction
   | InputInstruction
   | OperInstruction
+  | ComputeInstruction
   | ScriptInstruction
   | CallInstruction
   | DispatchInstruction

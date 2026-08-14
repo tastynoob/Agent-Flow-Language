@@ -35,7 +35,7 @@ bug_list_2
 @mcp.github.read_file
 ```
 
-String 使用双引号，转义规则沿用 JSON string。Boolean、number、list 和 record 字面量主要供 `oper`、script executor 和 VM option 使用。List 与 record 统一使用方括号，是否包含顶层 `:` 决定集合类型：
+String 使用双引号，转义规则沿用 JSON string。Boolean、number、list 和 record 字面量主要供 `oper`、`compute`、script executor 和 VM option 使用。List 与 record 统一使用方括号，是否包含顶层 `:` 决定集合类型：
 
 ```text
 [value0, value1]            # list
@@ -173,7 +173,7 @@ String literal 在需要 Frag 的位置自动包装成 Frag。Prompt symbol 需�
 | 类别 | 代表指令 | 返回结果 |
 | --- | --- | --- |
 | 数据指令 | `do`、`prompt`、`input`、`invoke`、`call`、`sync` | role-free Frag |
-| 计算指令 | `oper`、`python`、`typescript`、`shell` | VM compute value |
+| 计算指令 | `oper`、`compute`、`python`、`typescript`、`shell` | VM compute value |
 | 资源指令 | `agent`、Memory `copy`、`with_memory`、`dispatch`、`repeat`、`fork` | Agent、Memory、TaskGroup 等 handle |
 
 Terminator 和 `memory.append` 等 effect instruction 不需要产生结果。
@@ -250,7 +250,9 @@ answer = input question, @schema.BranchChoice
 
 `input` 不预先指定这份 Frag 将来使用的 role。Schema 可以约束输入采用 JSON 等格式，但不会把返回值改成 Core IR record。
 
-## 8. `oper`
+## 8. `oper` 与 `compute`
+
+### 8.1 `oper`
 
 `oper` 后直接书写表达式，不使用字符串包裹：
 
@@ -260,9 +262,24 @@ ready = oper accepted & tests_passed & !budget_exhausted
 retry = oper attempt < max_attempts
 ```
 
-Frag 参与 string operation 时读取其包装的字符串。`oper` 不隐式把 Frag 猜测或解析成 JSON object；需要解析 JSON 或自定义格式时使用显式 operation 或 script executor。
+Frag 参与 string operation 时读取其包装的字符串。`oper` 不隐式把 Frag 猜测或解析成 JSON object；通用模型输出使用 `compute` 显式提取，自定义格式再使用 script executor 或项目 capability。
 
 表达式支持 `!`、一元 `-`、`&`、`|`、`==`、`!=`、`<`、`<=`、`>`、`>=`、`+`、`-`、`*`、`/`、字段/索引读取和括号。`oper` 返回 compute value，不返回 Frag。
+
+### 8.2 `compute`
+
+`compute` 调用 VM 内建纯函数并返回 compute value：
+
+```text
+decision = compute @afl.parse.json, model_output
+status = compute @afl.parse.label, model_output, ["status", "statues"], ["finish", "continue"]
+```
+
+`@afl.*` 是 VM 保留的内建函数命名空间，不需要 Binding，不能被宿主覆盖，也不经过 capability policy。`compute` 不接受其他命名空间的函数，`invoke` 也不能调用 `@afl.*`。
+
+`@afl.parse.json` 先尝试解析完整文本，再依次检查 Markdown JSON fence 与文本中的完整 object/list，返回位置最后的合法 JSON compute value。它只提取语法合法的 JSON，不补字段或猜测业务含义。
+
+`@afl.parse.label` 按行查找 `label: value`。label 可以是字符串或显式别名列表；匹配忽略大小写、空白和常见 Markdown 行前缀，最后一次匹配生效。可选的最后一个参数是允许值列表，匹配时忽略大小写并返回列表中的规范写法。找不到标签或值不在 allowlist 时执行失败。
 
 ## 9. Script Executor
 
@@ -309,7 +326,7 @@ List 形式逐项启动显式写出的 flow call，可以混用不同 flow 和�
 ...
 ```
 
-`worker_count` 可以是硬编码常量，也可以是 Agent 输出经 `oper` 或 script executor 解析得到的整数。所有 instance 接收同一个 task Frag，但各自具有独立 node invocation、Agent 和 Memory。
+`worker_count` 可以是硬编码常量，也可以是 Agent 输出经 `compute` 或 script executor 解析得到的整数。所有 instance 接收同一个 task Frag，但各自具有独立 node invocation、Agent 和 Memory。
 
 从已有 Agent 派生一个并行分支：
 
@@ -338,7 +355,7 @@ reports = sync jobs, @format.json_array
 
 ## 11. Capability
 
-`invoke` 显式调用 skill、MCP method 或 VM capability，并把 capability 输出格式化为 Frag：
+`invoke` 显式调用外部 capability，并把输出格式化为 Frag：
 
 ```text
 page = invoke @skill.web.read, url
@@ -346,6 +363,8 @@ issue = invoke @mcp.github.get_issue, repository, number
 ```
 
 Symbol 的输入、输出格式和授权由 Capability binding 与 policy 提供。
+
+无论 capability symbol 是什么，`invoke` 的结果类别始终是 role-free Frag。VM 保留 `@afl.*` 给 `compute` 使用，validator 会拒绝 `invoke @afl.*`。
 
 ## 12. Memory
 
@@ -410,6 +429,7 @@ dst = prompt prompt_source [, value ...]
 dst = input prompt_source [, schema]
 
 dst = oper expression
+dst = compute builtin_symbol [, value ...]
 dst = python "script" [, value ...]
 dst = typescript "script" [, value ...]
 dst = shell "command" [, value ...]

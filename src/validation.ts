@@ -22,6 +22,7 @@ import type {
 } from "./ir.js";
 import { workspacePathOverlap } from "./workspace.js";
 import { isAgentStandardToolName } from "./standard-agent-tools.js";
+import { getAflBuiltinFunction, isAflBuiltinName } from "./builtin-functions.js";
 
 export interface ValidationSuccess {
   readonly ok: true;
@@ -406,6 +407,20 @@ function validateInstructionKinds(
     case "fork":
       expectNameKind(module, instruction.sourceAgent, kinds, ["agent", "unknown"], "fork source", diagnostics);
       break;
+    case "compute":
+      validateComputeInstruction(module, instruction, kinds, diagnostics);
+      break;
+    case "invoke":
+      if (isAflBuiltinName(instruction.capability.name)) {
+        add(
+          diagnostics,
+          module,
+          instruction.capability.span,
+          "BUILTIN_FUNCTION_CONTEXT_INVALID",
+          `AFL built-in function '${instruction.capability.name}' must use compute, not invoke`,
+        );
+      }
+      break;
     case "memory.append":
       expectNameKind(module, instruction.memory, kinds, ["memory", "unknown"], "memory.append target", diagnostics);
       break;
@@ -432,6 +447,105 @@ function validateInstructionKinds(
       break;
     default:
       break;
+  }
+}
+
+function validateComputeInstruction(
+  module: AflModule,
+  instruction: Extract<AflInstruction, { readonly op: "compute" }>,
+  kinds: ReadonlyMap<string, ValueKind>,
+  diagnostics: AflDiagnostic[],
+): void {
+  const name = instruction.function.name;
+  if (!isAflBuiltinName(name)) {
+    add(
+      diagnostics,
+      module,
+      instruction.function.span,
+      "BUILTIN_FUNCTION_UNKNOWN",
+      `compute requires a known AFL built-in function, received '${name}'`,
+    );
+    return;
+  }
+  const spec = getAflBuiltinFunction(name);
+  if (spec === undefined) {
+    add(diagnostics, module, instruction.function.span, "BUILTIN_FUNCTION_UNKNOWN", `unknown AFL built-in function '${name}'`);
+    return;
+  }
+  if (instruction.args.length < spec.minArgs || instruction.args.length > spec.maxArgs) {
+    const expected = spec.minArgs === spec.maxArgs ? String(spec.minArgs) : `${spec.minArgs}-${spec.maxArgs}`;
+    add(
+      diagnostics,
+      module,
+      instruction.span,
+      "BUILTIN_FUNCTION_ARITY",
+      `'${name}' expects ${expected} arguments, received ${instruction.args.length}`,
+    );
+    return;
+  }
+  validateBuiltinTextArgument(module, instruction.args[0]!, kinds, name, 1, diagnostics);
+  if (name !== "@afl.parse.label") return;
+  validateBuiltinStringListArgument(module, instruction.args[1]!, kinds, name, 2, true, diagnostics);
+  if (instruction.args[2] !== undefined) {
+    validateBuiltinStringListArgument(module, instruction.args[2], kinds, name, 3, false, diagnostics);
+  }
+}
+
+function validateBuiltinTextArgument(
+  module: AflModule,
+  expression: ValueExpr,
+  kinds: ReadonlyMap<string, ValueKind>,
+  name: string,
+  position: number,
+  diagnostics: AflDiagnostic[],
+): void {
+  if (expression.kind === "literal" && typeof expression.value !== "string") {
+    add(diagnostics, module, expression.span, "BUILTIN_FUNCTION_ARGUMENT_INVALID", `argument ${position} of '${name}' must be a string or Frag`);
+    return;
+  }
+  expectKind(module, expression, kinds, ["frag", "compute", "unknown"], `argument ${position} of '${name}'`, diagnostics);
+}
+
+function validateBuiltinStringListArgument(
+  module: AflModule,
+  expression: ValueExpr,
+  kinds: ReadonlyMap<string, ValueKind>,
+  name: string,
+  position: number,
+  allowScalar: boolean,
+  diagnostics: AflDiagnostic[],
+): void {
+  const validLiteral = expression.kind === "literal" && allowScalar &&
+    typeof expression.value === "string" && expression.value.trim().length > 0;
+  const validList = expression.kind === "list" && expression.items.length > 0 &&
+    expression.items.every((item) => item.kind === "name" ||
+      item.kind === "literal" && typeof item.value === "string" && item.value.trim().length > 0);
+  if (expression.kind === "name") {
+    expectNameKind(
+      module,
+      expression,
+      kinds,
+      allowScalar ? ["frag", "compute", "unknown"] : ["compute", "unknown"],
+      `argument ${position} of '${name}'`,
+      diagnostics,
+    );
+    return;
+  }
+  if (validList && expression.kind === "list") {
+    for (const item of expression.items) {
+      if (item.kind === "name") {
+        expectNameKind(module, item, kinds, ["compute", "unknown"], `argument ${position} item of '${name}'`, diagnostics);
+      }
+    }
+  }
+  if (!validLiteral && !validList) {
+    add(
+      diagnostics,
+      module,
+      expression.span,
+      "BUILTIN_FUNCTION_ARGUMENT_INVALID",
+      `argument ${position} of '${name}' must be ${allowScalar ? "a label or non-empty label list" : "a non-empty string list"}`,
+    );
   }
 }
 
@@ -868,6 +982,7 @@ function instructionResultKind(instruction: AflInstruction): ValueKind {
     case "agent.route":
       return "taskGroup";
     case "oper":
+    case "compute":
     case "script":
       return "compute";
     default:

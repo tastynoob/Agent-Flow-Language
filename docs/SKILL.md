@@ -138,8 +138,17 @@ node_name(arg_a, arg_b):
 - 使用 `!`、一元 `-`、`&`、`|`、`==`、`!=`、比较运算、`+`、`-`、`*`、`/`、路径和括号。
 - 只对布尔值使用 `&` 和 `|`，并依赖其短路语义。
 - 只对数字做算术；`+` 也可连接两个字符串。拒绝除零和非有限数字。
-- 不把 Frag 内容隐式解析为 JSON。需要结构化数据时，通过 schema、binding 或明确的 script/capability 生成 compute value。
+- 不把 Frag 内容隐式解析为 JSON。通用模型 JSON 用 `compute @afl.parse.json` 显式转成 compute；更复杂的结构化转换再通过明确的 script 或项目 capability 完成。
 - 返回 compute value。
+
+### `compute`
+
+形式：`parsed = compute @afl.parse.json, raw`；`status = compute @afl.parse.label, raw, labels, allowed`。
+
+- 只调用 `@afl.*` VM 内建纯函数，不查询 Binding 或 capability policy。
+- 参数只能是 Frag 或 compute value，结果始终是 compute value。
+- 未知函数、参数数量或类型错误、解析失败都作为稳定 VM 错误报告。
+- `invoke` 不能调用 `@afl.*`；不要让目标 symbol 改变指令的结果类别。
 
 ### `python`、`typescript`、`shell`
 

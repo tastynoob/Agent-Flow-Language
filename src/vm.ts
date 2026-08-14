@@ -41,6 +41,7 @@ import {
   WorkspaceLocks,
 } from "./concurrency.js";
 import { buildInstructionDependencies, instructionDestination } from "./dependencies.js";
+import { computeAflBuiltinFunction, type AflBuiltinArgument } from "./builtin-functions.js";
 import {
   asAgent,
   asCompute,
@@ -646,6 +647,11 @@ export class AflVm {
       }
       case "oper":
         return evaluateOper(instruction.expression, frame);
+      case "compute": {
+        const args = instruction.args.map((argument) =>
+          this.toBuiltinArgument(evaluateValue(argument, frame), argument.span));
+        return computeAflBuiltinFunction(instruction.function.name, args, instruction.span);
+      }
       case "script": {
         if (this.bindings.scripts === undefined) {
           throw new AflVmError("SCRIPT_ADAPTER_MISSING", `${instruction.language} requires a Script binding`, {
@@ -805,13 +811,15 @@ export class AflVm {
             span: instruction.span,
           });
         }
+        const args = instruction.args.map((argument) =>
+          this.toPromptArgument(evaluateValue(argument, frame), argument.span));
         const request = {
           runId: context.runId,
           node: location.node,
           block: location.block,
           executionRoot: context.executionRoot,
           capability: toSymbol(instruction.capability),
-          args: instruction.args.map((argument) => this.toPromptArgument(evaluateValue(argument, frame), argument.span)),
+          args,
           signal,
         };
         const approved = await this.bindings.policy?.authorizeCapability?.(request);
@@ -2569,6 +2577,11 @@ export class AflVm {
   private toPromptArgument(value: VmValue, span: SourceSpan): PromptArgument {
     if (isFrag(value) || isComputeValue(value) || isSymbolRef(value)) return clonePortable(value);
     throw new AflVmError("PROMPT_ARGUMENT_INVALID", "prompt argument cannot be a VM handle", { span });
+  }
+
+  private toBuiltinArgument(value: VmValue, span: SourceSpan): AflBuiltinArgument {
+    if (isFrag(value) || isComputeValue(value)) return clonePortable(value);
+    throw new AflVmError("COMPUTE_ARGUMENT_INVALID", "compute argument cannot be a VM handle or symbol", { span });
   }
 
   private toVmArgument(value: VmValue, span: SourceSpan): VmArgument {

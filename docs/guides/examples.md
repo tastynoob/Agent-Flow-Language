@@ -155,7 +155,7 @@ structured_review(code):
         ret report
 ```
 
-`@schema.ReviewReport` 由 Schema binding 校验，但 `report` 仍是 role-free Frag，其 content 是 JSON 字符串。解析、转换或复杂判断交给 script binding。
+`@schema.ReviewReport` 由 Schema binding 校验，但 `report` 仍是 role-free Frag，其 content 是 JSON 字符串。通用模型 JSON 可由 `parsed = compute @afl.parse.json, report` 显式转为 compute；业务 schema 规则仍由 flow 或项目 capability 校验，复杂转换再交给 script binding。
 
 ## 9. `oper` 与 Script Executor
 
@@ -168,7 +168,7 @@ review_decision(review, tests, policy):
         ret finish
 ```
 
-Frag 在 `oper` 和 script 中作为 content string 使用。`oper` 与 script 返回本地 compute value，不会把结果自动加入 Agent Memory。
+Frag 在 `oper`、`compute` 和 script 中作为显式输入使用。三者返回本地 compute value，不会把结果自动加入 Agent Memory。
 
 ## 10. 显式 Capability 调用
 

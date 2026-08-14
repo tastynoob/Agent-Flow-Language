@@ -33,7 +33,7 @@ VM 处理四类值：
 | 类别 | 表示 | 用途 |
 | --- | --- | --- |
 | Frag | `{ kind: "frag", content: string }` | Agent、Prompt、Input 和 Flow 的业务文本 |
-| Compute value | null、boolean、有限 number、string、list、record | `oper`、script、条件和宿主数据 |
+| Compute value | null、boolean、有限 number、string、list、record | `oper`、`compute`、script、条件和宿主数据 |
 | Symbol | 以 `@` 开头的引用 | Agent、Prompt、Schema、Capability、Flow 等 binding key |
 | Handle | Agent、Memory、TaskGroup | 当前 VM 运行中的状态资源 |
 
@@ -46,7 +46,8 @@ Frag 不携带 role。Frag 进入 Agent 或 Memory 时才确定 role。Handle �
 | 类别 | 指令 |
 | --- | --- |
 | Agent | `agent`、`agent.system_prompt`、`agent.do` |
-| 数据与输入 | `prompt`、`input`、`oper` |
+| 数据与输入 | `prompt`、`input` |
+| 计算 | `oper`、`compute` |
 | Script | `python`、`typescript`、`shell` |
 | Flow | `call`、`dispatch`、`repeat`、`sync`、`fork` |
 | Capability | `invoke` |

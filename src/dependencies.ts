@@ -83,6 +83,8 @@ export function instructionReferences(instruction: AflInstruction): NameExpr[] {
       return valueReferences(instruction.prompt);
     case "oper":
       return valueReferences(instruction.expression);
+    case "compute":
+      return instruction.args.flatMap(valueReferences);
     case "script":
       return instruction.args.flatMap(valueReferences);
     case "call":

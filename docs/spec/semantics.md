@@ -79,7 +79,7 @@ Memory handle 还记录 VM 内部 identity 和可选 owner，用于资源依赖�
 指令结果分为三类：
 
 - 数据结果：`do`、`prompt`、`input`、`invoke`、`call`、`sync` 等返回 Frag；
-- 计算结果：`oper` 与 script executor 返回 bool、number、string 或宿主结构等本地 compute value；
+- 计算结果：`oper`、`compute` 与 script executor 返回 bool、number、string 或宿主结构等本地 compute value；
 - 资源结果：`agent`、Memory `copy`、`with_memory`、`dispatch`、`repeat`、`fork` 返回 VM handle。
 
 资源 handle 不会包装成 Frag，也不能作为 Agent message、Prompt 参数、Capability 参数或外部 Flow 参数发送。
@@ -180,9 +180,9 @@ review_result = reviewer.do review_prompt
 finish = oper review_result == "finish"
 ```
 
-比较按 Frag 的原始字符串执行，不自动 trim、忽略大小写或解析自然语言。需要其他规则时使用 script binding 显式转换。
+比较按 Frag 的原始字符串执行，不自动 trim、忽略大小写或解析自然语言。模型输出中的行级控制标签可以先由 `compute @afl.parse.label` 显式提取，其他规则使用 script binding 显式转换。
 
-## 8. `oper` 与 Script Executor
+## 8. `oper`、`compute` 与 Script Executor
 
 ### 8.1 `oper`
 
@@ -194,7 +194,13 @@ finish = oper review_result == "finish"
 
 `oper` 返回本地 compute value，通常用于 `jump` 或后续计算。它不把输入或结果自动加入任何 Memory，也不隐式解析 JSON。
 
-### 8.2 `python`、`typescript`、`shell`
+### 8.2 `compute`
+
+`compute` 只调用 VM 注册的 `@afl.*` 纯函数，参数求值为 Frag 或 compute value，结果始终是 compute value。它不查询 Binding、不执行 capability policy，也不占用外部执行 permit。未知函数、错误参数和函数自身的解析失败都会终止当前 instruction。
+
+`@afl.parse.json` 与 `@afl.parse.label` 只负责通用文本提取，不承担业务 schema 校验。前者选择文本中位置最后的完整合法 JSON，后者按行匹配显式 label、可选别名与 allowlist。
+
+### 8.3 `python`、`typescript`、`shell`
 
 Script executor 把显式 operand 交给对应 VM binding。Frag 以 content string 传入，脚本结果作为 compute value 返回。
 
@@ -278,7 +284,7 @@ VM 为每个 list item 创建一次 child invocation。不同 item 可以调用�
 repeat count, flow(task)
 ```
 
-`count` 必须求值为非负整数 compute value。Agent 输出是 Frag，需要先由 script binding 转换为 number。VM 创建 `count` 次相同的 flow call；每个 child 拥有独立 node invocation，并接收各参数值的副本。
+`count` 必须求值为非负整数 compute value。Agent 输出是 Frag，需要先由 `compute @afl.parse.json` 或 script binding 转换为 number。VM 创建 `count` 次相同的 flow call；每个 child 拥有独立 node invocation，并接收各参数值的副本。
 
 VM 默认允许一次 dispatch 创建最多 10,000 个 task，并最多同时运行 16 个 worker。`VmPolicy.maxDispatchTasks` 和 `maxDispatchWorkers` 可以修改这两个限制，但不会改变声明的 `count`。
 
@@ -316,7 +322,7 @@ Basic block 中互不依赖且 Workspace 不冲突的普通 Agent 指令可以�
 
 ## 12. `invoke`
 
-`invoke` 调用已绑定的 skill、MCP method 或 capability。Binding 负责把外部输出格式化成 role-free Frag。
+`invoke` 调用已绑定的 skill、MCP method 或 capability。Binding 负责把外部输出格式化成 role-free Frag，并由 capability policy 授权。无论目标 symbol 是什么，结果类别始终是 Frag；validator 拒绝保留给 `compute` 的 `@afl.*` 命名空间。
 
 Agent 在 `do` 内部自行使用 tool，与 flow 显式执行 `invoke` 是两种语义：前者由 Agent 决策，后者由 AFL flow 决策。
 

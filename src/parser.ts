@@ -408,6 +408,17 @@ function parseAssignedInstruction(
     return { op: "oper", dst, expression: parseOper(rhs.slice(5), line, sourceName), span: line.span };
   }
 
+  if (rhs.startsWith("compute ")) {
+    const operands = splitRequiredItems(rhs.slice(8), line, sourceName, "compute");
+    return {
+      op: "compute",
+      dst,
+      function: parseSymbol(operands[0]!, line, sourceName),
+      args: operands.slice(1).map((item) => parseValue(item, line, sourceName)),
+      span: line.span,
+    };
+  }
+
   for (const language of ["python", "typescript", "shell"] as const) {
     const prefix = `${language} `;
     if (rhs.startsWith(prefix)) {

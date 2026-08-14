@@ -434,6 +434,17 @@ export class AflIrBuilder {
     return new AflValue(this, this._currentScope(), destination);
   }
 
+  compute(functionName: string, args: readonly AflOperand[] = [], name?: string): AflValue {
+    requireSymbol(functionName, "compute function");
+    const destination = name === undefined ? this.allocateValue("value") : this.claimName(name);
+    const operands = args.map((argument) => this._operandSource(argument));
+    this._emitAssignment(
+      destination,
+      `compute ${functionName}${operands.length === 0 ? "" : `, ${operands.join(", ")}`}`,
+    );
+    return new AflValue(this, this._currentScope(), destination);
+  }
+
   typescript(source: string, args: readonly AflOperand[] = [], name?: string): AflValue {
     const destination = name === undefined ? this.allocateValue("value") : this.claimName(name);
     const operands = args.map((argument) => this._operandSource(argument));
