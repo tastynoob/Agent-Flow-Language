@@ -219,7 +219,9 @@ Fork 完成后：
 
 实验格式固定使用 `version: 0`。默认文件布局为 `.afl/memory/afl-<YYYYMMDD-HHmmss>-<short-id>/program.jsons` 加同目录下的 `<memory-label>.jsons`。文件不是 JSONL，也不是单个 JSON array，而是两空格缩进、对象间空行分隔的顶层 JSON object stream。每个真正进入过 `agent.do` 的稳定 Memory slot 使用一份文件；仅声明 Agent、Memory `copy`、`fork`、`with_memory` 或首次使用前的 `append` 都不会单独物化文件。
 
-Memory 文件依次保存 `memory` header、`do.begin`、连续的 `user`/`assistant`/`tool.result` 等浅层 records，以及正常结束或可控错误时的可选 `do.end`；错误 tail 使用浅层 `error_code`/`error_message`。Pi 在每个完整语义消息形成后 append 并 sync，因此 thinking、tool call 和 tool result 不必等整次 `do` 完成才落盘。每个完整 JSON object 本身就是可恢复状态；缺少 `do.end` 表示进程可能直接中断，但不撤销此前完整 records。EOF 处不完整的最后一个 object 会截断到上一个完整 object 的结束字节，文件中部损坏则显式失败。
+Memory 文件依次保存 `memory` header、`do.begin`、连续的 `user`/`assistant`/`tool.result` 等浅层 records，以及可选 `do.end`。Tail 的 `status` 为 `ok`、`error`、`interrupted` 或 `cancelled`；失败保留浅层 `error_code`/`error_message`，意外中断还保留 Agent、executor、activation、Memory slot/revision、Workspace 和调用位置。Pi 在每个完整语义消息形成后 append 并 sync，因此 thinking、tool call 和 tool result 不必等整次 `do` 完成才落盘。每个完整 JSON object 本身就是可恢复状态；缺少 `do.end` 表示进程可能在整理退出前直接崩溃，但不撤销此前完整 records。EOF 处不完整的最后一个 object 会截断到上一个完整 object 的结束字节，文件中部损坏则显式失败。
+
+VM 完成并发任务收敛与 Memory flush 后，会在 `program.jsons` 追加 `program.interrupted`。它记录原始错误和上述恢复定位信息，不声明外部工具是否产生副作用，也不包含 snapshot。自定义 `MemoryStateStore` 可以实现可选的 `recordRunInterruption` hook，将同一事件写入自己的事务或事件存储。
 
 `memory.copy` 和 `fork` 的新 slot header 使用 source file/revision 作为 base，只保存自身后续增量，不复制 canonical Message 或 Pi continuation 前缀；源尚未物化时会先递归物化源引用。逻辑加载结果仍是完整 Memory。持久化不包含 VM instruction pointer、TaskGroup、外部工具进程或 Workspace 文件 snapshot；再次运行仍从 flow entry 开始。
 

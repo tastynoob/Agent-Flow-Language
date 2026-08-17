@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   AflVm,
   FileMemoryStateStore,
+  MemoryTraceSink,
   MockAgentAdapter,
   RunMemoryPersistence,
   canonicalModuleDigest,
@@ -408,29 +409,157 @@ test("a partial final object is truncated while complete records remain recovera
   assert.equal(Object.values(state.memories)[0].revision, 4);
 });
 
-test("a controlled agent error writes a shallow optional do.end tail", async (t) => {
+test("an executor interruption preserves recovery context in Memory and Trace", async (t) => {
   const root = await temporaryRoot(t);
   const agents = new MockAgentAdapter().on("@agent.worker", () => {
     throw new Error("model unavailable");
   });
-  const vm = AflVm.fromSource(SINGLE_AGENT_FLOW, { agents });
+  const trace = new MemoryTraceSink();
+  const vm = AflVm.fromSource(SINGLE_AGENT_FLOW, { agents, trace });
 
+  let interruption;
   await assert.rejects(
     vm.run("main", [], { runId: "error-tail", executionRoot: root }),
-    { code: "ADAPTER_ERROR" },
-  );
-  const [journal] = await readRawJournals(root);
-  const tail = journal.records.at(-1);
-  assert.deepEqual(
-    { type: tail.type, status: tail.status, code: tail.error_code, message: tail.error_message },
-    {
-      type: "do.end",
-      status: "error",
-      code: "ADAPTER_ERROR",
-      message: "model unavailable",
+    (error) => {
+      assert.equal(error.code, "ADAPTER_ERROR");
+      interruption = error.details.interruption;
+      return true;
     },
   );
+  assert.equal(interruption.agent, "@agent.worker");
+  assert.equal(interruption.executor, "agent-adapter");
+  assert.equal(interruption.activation, "root");
+  assert.equal(interruption.location, "main:entry:1");
+  assert.equal(interruption.memoryRevision, 1);
+  assert.equal(
+    interruption.workspace.startsWith(`${await realpath(join(root, ".afl", "tmpworkspace", "error-tail"))}/`),
+    true,
+  );
+  assert.deepEqual(interruption.readOnlyWorkspaces, []);
+
+  const [journal] = await readRawJournals(root);
+  const tail = journal.records.at(-1);
+  assert.equal(tail.type, "do.end");
+  assert.equal(tail.status, "interrupted");
+  assert.equal(tail.error_code, "ADAPTER_ERROR");
+  assert.equal(tail.error_message, "model unavailable");
+  assert.equal(tail.memory_slot, interruption.memorySlot);
+  assert.equal(tail.memory_revision, 1);
   assert.equal("error" in tail, false);
+
+  const program = await readProgramRecords(root);
+  assert.equal(program.at(-1).type, "program.interrupted");
+  assert.equal(program.at(-1).error_code, "ADAPTER_ERROR");
+  assert.equal(program.at(-1).memory_slot, interruption.memorySlot);
+  assert.equal((await readOnlyState(root)).memories[interruption.memorySlot].revision, 1);
+  assert.deepEqual(
+    trace.events.filter((event) => event.type === "agent.interrupted" || event.type === "run.interrupted")
+      .map((event) => event.type),
+    ["agent.interrupted", "run.interrupted"],
+  );
+  assert.equal(trace.events.some((event) => event.type === "run.failed"), false);
+});
+
+test("post-execution validation failures remain ordinary errors", async (t) => {
+  const root = await temporaryRoot(t);
+  const agents = new MockAgentAdapter().on("@agent.worker", () => ({ output: 42 }));
+  const trace = new MemoryTraceSink();
+  const vm = AflVm.fromSource(SINGLE_AGENT_FLOW, { agents, trace });
+
+  await assert.rejects(
+    vm.run("main", [], { runId: "invalid-output", executionRoot: root }),
+    { code: "AGENT_OUTPUT_INVALID" },
+  );
+  const [journal] = await readRawJournals(root);
+  assert.equal(journal.records.at(-1).status, "error");
+  assert.deepEqual((await readProgramRecords(root)).map((record) => record.type), ["program.begin"]);
+  assert.equal(trace.events.some((event) => event.type === "run.failed"), true);
+  assert.equal(trace.events.some((event) => event.type === "run.interrupted"), false);
+});
+
+test("an interruption keeps its root error when the recovery marker cannot be saved", async (t) => {
+  const root = await temporaryRoot(t);
+  const store = {
+    async loadRun() {
+      return undefined;
+    },
+    async saveRun() {},
+    async beginMemoryDo() {},
+    async endMemoryDo() {
+      throw new Error("disk unavailable");
+    },
+  };
+  const agents = new MockAgentAdapter().on("@agent.worker", () => {
+    throw new Error("provider unavailable");
+  });
+  const vm = AflVm.fromSource(SINGLE_AGENT_FLOW, {
+    agents,
+    memoryPersistence: { store },
+  });
+
+  await assert.rejects(
+    vm.run("main", [], { runId: "interruption-save-failure", executionRoot: root }),
+    (error) => {
+      assert.equal(error.code, "ADAPTER_ERROR");
+      assert.equal(error.message, "provider unavailable");
+      assert.equal(error.details.interruption.agent, "@agent.worker");
+      assert.equal(error.details.interruptionPersistenceError.code, "MEMORY_STATE_SAVE_FAILED");
+      return true;
+    },
+  );
+});
+
+test("dispatch waits for cancelled siblings and reports the interruption root cause", async (t) => {
+  const root = await temporaryRoot(t);
+  let markWaitingStarted;
+  const waitingStarted = new Promise((resolve) => {
+    markWaitingStarted = resolve;
+  });
+  let waitingSettled = false;
+  const agents = new MockAgentAdapter().on("@agent.worker", async (request) => {
+    const task = request.messages.at(-1).content;
+    if (task === "fail") {
+      await waitingStarted;
+      throw new Error("provider unavailable");
+    }
+    markWaitingStarted();
+    try {
+      await new Promise((_, reject) => {
+        const cancel = () => reject(request.signal.reason);
+        if (request.signal.aborted) cancel();
+        else request.signal.addEventListener("abort", cancel, { once: true });
+      });
+    } finally {
+      waitingSettled = true;
+    }
+    return "unreachable";
+  });
+  const trace = new MemoryTraceSink();
+  const vm = AflVm.fromSource(`
+worker(task):
+    entry:
+        runner = agent @agent.worker
+        result = runner.do task
+        ret result
+
+main():
+    entry:
+        jobs = dispatch [worker("wait"), worker("fail")]
+        results = sync jobs
+        ret results
+`, { agents, trace });
+
+  await assert.rejects(
+    vm.run("main", [], { runId: "parallel-interruption", executionRoot: root }),
+    (error) => error.code === "ADAPTER_ERROR" && error.details.interruption !== undefined,
+  );
+  assert.equal(waitingSettled, true);
+  const statuses = (await readRawJournals(root))
+    .map((journal) => journal.records.at(-1).status)
+    .sort();
+  assert.deepEqual(statuses, ["cancelled", "interrupted"]);
+  assert.equal((await readProgramRecords(root)).at(-1).type, "program.interrupted");
+  assert.equal(trace.events.filter((event) => event.type === "run.interrupted").length, 1);
 });
 
 test("Workspace paths are canonical and hierarchical write conflicts are serialized", async (t) => {
@@ -591,6 +720,12 @@ async function readRawJournals(root) {
     const values = parsePrettyJsonStream(await readFile(join(runPath, filename), "utf8"));
     return { filename, header: values[0], records: values.slice(1) };
   }));
+}
+
+async function readProgramRecords(root) {
+  const directory = join(root, ".afl", "memory");
+  const [runDirectory] = await readdir(directory);
+  return parsePrettyJsonStream(await readFile(join(directory, runDirectory, "program.jsons"), "utf8"));
 }
 
 function parsePrettyJsonStream(text) {

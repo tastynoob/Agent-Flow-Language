@@ -6,6 +6,7 @@ import { isDeepStrictEqual } from "node:util";
 import { AflVmError } from "./errors.js";
 import {
   AFL_MESSAGE_ROLE_SCHEMA,
+  type AgentInterruptionContext,
   type BackendSessionJournalDelta,
   type BackendSessionJournalPayload,
   type BackendSessionRecord,
@@ -13,6 +14,7 @@ import {
   type MemoryDoBeginRequest,
   type MemoryDoEndRequest,
   type MemoryPersistenceBinding,
+  type MemoryRunInterruptionRequest,
   type MemorySaveContext,
   type MemoryStateStore,
   type Message,
@@ -33,6 +35,21 @@ interface ProgramBeginRecord {
   readonly run_id: string;
   readonly module: string;
   readonly started_at: string;
+}
+
+interface ProgramInterruptedRecord {
+  readonly type: "program.interrupted";
+  readonly finished_at: string;
+  readonly error_code: string;
+  readonly error_message: string;
+  readonly agent: string;
+  readonly executor: string;
+  readonly activation: string;
+  readonly location: string;
+  readonly memory_slot: string;
+  readonly memory_revision: number;
+  readonly workspace: string;
+  readonly readonly_workspaces: readonly string[];
 }
 
 interface MemoryHeaderRecord {
@@ -309,6 +326,7 @@ export class FileMemoryStateStore implements MemoryStateStore {
         error_code: request.error.code,
         error_message: request.error.message,
       }),
+      ...(request.interruption === undefined ? {} : interruptionRecordFields(request.interruption)),
     });
     await appendPretty(this.memoryPath(request.runId, request.slot), records);
     const nextState: PersistedRunMemoryState = {
@@ -318,6 +336,23 @@ export class FileMemoryStateStore implements MemoryStateStore {
     this.states.set(request.runId, cloneState(nextState));
     this.rememberSlot(request.runId, request.slot, resolved);
     this.activeDos.delete(doKey(request.runId, request.slot));
+  }
+
+  async recordRunInterruption(
+    request: MemoryRunInterruptionRequest,
+    signal: AbortSignal,
+  ): Promise<void> {
+    throwIfAborted(signal);
+    validateStateShape(request.state);
+    const directory = await this.ensureProgram(request.state);
+    const record: ProgramInterruptedRecord = {
+      type: "program.interrupted",
+      finished_at: request.finishedAt,
+      error_code: request.error.code,
+      error_message: request.error.message,
+      ...interruptionRecordFields(request.interruption),
+    };
+    await appendPretty(join(directory, "program.jsons"), [record]);
   }
 
   private async findRunDirectory(runId: string): Promise<string | undefined> {
@@ -486,6 +521,12 @@ export interface MemoryPersistenceAttempt {
   readonly attemptId: string;
 }
 
+export interface AgentAttemptEnd {
+  readonly status: "error" | "interrupted" | "cancelled";
+  readonly error?: { readonly code: string; readonly message: string };
+  readonly interruption?: AgentInterruptionContext;
+}
+
 export interface AgentDoPersistenceRequest {
   readonly slot: string;
   readonly moduleDigest: string;
@@ -609,6 +650,10 @@ export class RunMemoryPersistence {
     return this.state.memories[slot] !== undefined;
   }
 
+  currentRevision(slot: string): number | undefined {
+    return this.state.memories[slot]?.revision;
+  }
+
   async beginAgentAttempt(
     request: AgentDoPersistenceRequest,
     signal: AbortSignal,
@@ -680,7 +725,7 @@ export class RunMemoryPersistence {
 
   async abortAgentAttempt(
     attempt: MemoryPersistenceAttempt,
-    error?: { readonly code: string; readonly message: string },
+    outcome: AgentAttemptEnd,
   ): Promise<void> {
     if (this.attempts.get(attempt.slot)?.attemptId !== attempt.attemptId) return;
     const signal = new AbortController().signal;
@@ -690,14 +735,32 @@ export class RunMemoryPersistence {
           state: cloneState(this.state),
           runId: this.runId,
           ...attempt,
-          status: "error",
+          status: outcome.status,
           finishedAt: new Date().toISOString(),
-          ...(error === undefined ? {} : { error }),
+          ...(outcome.error === undefined ? {} : { error: outcome.error }),
+          ...(outcome.interruption === undefined ? {} : { interruption: outcome.interruption }),
         }, signal);
       }, signal);
     } finally {
       this.attempts.delete(attempt.slot);
     }
+  }
+
+  async recordRunInterruption(
+    error: { readonly code: string; readonly message: string },
+    interruption: AgentInterruptionContext,
+  ): Promise<void> {
+    const signal = new AbortController().signal;
+    const snapshot = cloneState(this.state);
+    await this.enqueue(async () => {
+      await this.store.recordRunInterruption?.({
+        state: snapshot,
+        runId: this.runId,
+        finishedAt: new Date().toISOString(),
+        error,
+        interruption,
+      }, signal);
+    }, signal);
   }
 
   async save(
@@ -1175,11 +1238,48 @@ function parseProgram(values: readonly unknown[], runId: string, path: string): 
     throw invalidState(`Memory program '${path}' is invalid`);
   }
   for (const value of values.slice(1)) {
-    if (!isRecord(value) || (value.type !== "program.begin" && value.type !== "program.end")) {
+    if (!isRecord(value) || (
+      value.type !== "program.begin" &&
+      value.type !== "program.end" &&
+      !isProgramInterruptedRecord(value)
+    )) {
       throw invalidState(`Memory program '${path}' has an invalid record`);
     }
   }
   return first as unknown as ProgramBeginRecord;
+}
+
+function isProgramInterruptedRecord(value: Record<string, unknown>): boolean {
+  return value.type === "program.interrupted" &&
+    typeof value.finished_at === "string" &&
+    typeof value.error_code === "string" &&
+    typeof value.error_message === "string" &&
+    typeof value.agent === "string" &&
+    typeof value.executor === "string" &&
+    typeof value.activation === "string" &&
+    typeof value.location === "string" &&
+    typeof value.memory_slot === "string" &&
+    Number.isInteger(value.memory_revision) &&
+    (value.memory_revision as number) >= 0 &&
+    typeof value.workspace === "string" &&
+    Array.isArray(value.readonly_workspaces) &&
+    value.readonly_workspaces.every((item) => typeof item === "string");
+}
+
+function interruptionRecordFields(interruption: AgentInterruptionContext): Omit<
+  ProgramInterruptedRecord,
+  "type" | "finished_at" | "error_code" | "error_message"
+> {
+  return {
+    agent: interruption.agent,
+    executor: interruption.executor,
+    activation: interruption.activation,
+    location: interruption.location,
+    memory_slot: interruption.memorySlot,
+    memory_revision: interruption.memoryRevision,
+    workspace: interruption.workspace,
+    readonly_workspaces: [...interruption.readOnlyWorkspaces],
+  };
 }
 
 function parseMemoryHeader(value: unknown, path: string): MemoryHeaderRecord {

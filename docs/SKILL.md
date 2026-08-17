@@ -463,7 +463,7 @@ executeControlTool(request) -> {content: string, details?: compute}
 
 ### Trace
 
-实现 `trace.emit(event)` 时保留单调递增 sequence、timestamp、runId、event type 和可用的 node、block、instruction、details、error。接受 `run.started`、`run.completed`、`run.failed`、`node.started`、`node.completed`、`node.failed`、`block.started`、`block.completed`、`instruction.started`、`instruction.completed`、`instruction.failed`、`agent.started`、`agent.completed`、`agent.failed`、`agent.event`、`dispatch.started`、`dispatch.completed`、`fork.started`、`fork.completed`、`freedom.started`、`freedom.tool` 和 `freedom.completed`。让 sink 处理背压或快速落盘，但不要改变 VM 行为；对敏感字段做最小化或脱敏。
+实现 `trace.emit(event)` 时保留单调递增 sequence、timestamp、runId、event type 和可用的 node、block、instruction、details、error。接受 `run.started`、`run.completed`、`run.interrupted`、`run.failed`、`node.started`、`node.completed`、`node.failed`、`block.started`、`block.completed`、`instruction.started`、`instruction.completed`、`instruction.failed`、`agent.started`、`agent.completed`、`agent.interrupted`、`agent.failed`、`agent.event`、`dispatch.started`、`dispatch.completed`、`fork.started`、`fork.completed`、`freedom.started`、`freedom.tool` 和 `freedom.completed`。让 sink 处理背压或快速落盘，但不要改变 VM 行为；对敏感字段做最小化或脱敏。
 
 ### Memory 持久化
 
@@ -479,11 +479,13 @@ optional streaming hooks:
 beginMemoryDo(...)
 appendMemoryContinuation(...)
 endMemoryDo(...)
+recordRunInterruption(...)
 ```
 
 - 保存格式版本、role schema、runId、root module digest，以及每个 Memory 的 module digest、消息、revision、continuation 和可选 base reference。
 - 保持 revision 单调和消息追加语义；原子提交可见状态，并在取消或崩溃后拒绝半条消息。
 - 用相同 runId 和 root module digest 从 `entry` 重放已持久化 Memory；不要声称恢复 VM 栈、局部变量、TaskGroup 或 instruction pointer。
+- 将 executor 或模型基础设施的意外退出标为 `interrupted`，保留原始错误与恢复定位信息；不要推断外部工具副作用或自动切换 executor。
 - 限制同一 store namespace 内同一顶层 runId 的并发执行，避免两个写者破坏 append-only 历史。
 
 ## 验证工作流

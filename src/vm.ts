@@ -80,10 +80,15 @@ import {
   type ValueExpr,
 } from "./ir.js";
 import { parseAfl } from "./parser.js";
-import { RunMemoryPersistence, type MemoryPersistenceAttempt } from "./memory-store.js";
+import {
+  RunMemoryPersistence,
+  type AgentAttemptEnd,
+  type MemoryPersistenceAttempt,
+} from "./memory-store.js";
 import {
   AFL_MESSAGE_ROLE_SCHEMA,
   canonicalModuleDigest,
+  type AgentInterruptionContext,
   type Message,
   type PersistedMemoryContinuation,
 } from "./memory.js";
@@ -292,8 +297,34 @@ export class AflVm {
       await this.trace(context, "run.completed", {}, { entry });
       return { runId: context.runId, output };
     } catch (error) {
-      const vmError = normalizeVmError(error);
-      await this.trace(context, "run.failed", {}, undefined, vmError);
+      let vmError = normalizeVmError(error);
+      const interruption = interruptionContext(vmError);
+      if (interruption === undefined) {
+        await this.trace(context, "run.failed", {}, undefined, vmError);
+      } else {
+        linked.controller.abort(vmError);
+        let shutdownError: unknown;
+        try {
+          await persistence.recordRunInterruption(
+            { code: vmError.code, message: vmError.message },
+            interruption,
+          );
+        } catch (persistenceError) {
+          shutdownError = persistenceError;
+        }
+        try {
+          await persistence.close();
+        } catch (persistenceError) {
+          shutdownError ??= persistenceError;
+        }
+        if (shutdownError !== undefined) {
+          vmError = withInterruptionShutdownError(vmError, shutdownError);
+        }
+        await this.trace(context, "run.interrupted", {}, {
+          entry,
+          interruption: interruptionDetails(interruption),
+        }, vmError).catch(() => {});
+      }
       throw vmError;
     } finally {
       await persistence.close().catch(() => {});
@@ -728,7 +759,7 @@ export class AflVm {
         frame.taskGroups.delete(group);
         const settled = await Promise.allSettled(group.tasks);
         group.dispose();
-        const failure = settled.find((item): item is PromiseRejectedResult => item.status === "rejected");
+        const failure = selectTaskGroupFailure(settled);
         if (failure !== undefined) throw failure.reason;
         const values = settled.map((item) => (item as PromiseFulfilledResult<Frag>).value);
         const content = instruction.formatter === undefined
@@ -963,6 +994,7 @@ export class AflVm {
           let externalLease: SuspendableSemaphoreLease | undefined;
           let returnedSession: BackendSessionRef | undefined;
           let persistenceAttempt: MemoryPersistenceAttempt | undefined;
+          let executorRunning = false;
           try {
             this.validateWorkspaceCapabilities(agent.workspace, executor);
             this.validateContinuationBackend(agent, executor);
@@ -1035,7 +1067,9 @@ export class AflVm {
                 sandboxEnforcement: executor.capabilities.sandboxEnforcement,
               },
             });
+            executorRunning = true;
             const result = await executor.execute(request, host);
+            executorRunning = false;
             await externalLease.close();
             externalLease = undefined;
             returnedSession = result.session;
@@ -1051,17 +1085,47 @@ export class AflVm {
             await this.trace(context, "agent.completed", location, { agent: agent.id });
             return frag(result.output);
           } catch (error) {
-            const vmError = error instanceof AgentExecutorError
+            let vmError = error instanceof AgentExecutorError
               ? new AflVmError(error.code, error.message, { cause: error })
               : normalizeVmError(error);
+            const status = agentAttemptStatus(error, vmError, executorRunning, signal);
+            if (status === "cancelled" && vmError.code !== "AGENT_CANCELLED") {
+              vmError = new AflVmError("AGENT_CANCELLED", "Agent execution was cancelled", {
+                cause: vmError,
+              });
+            }
+            const interruption = status === "interrupted"
+              ? createInterruptionContext(
+                  agent,
+                  executor.name,
+                  location,
+                  context.persistence.currentRevision(agent.memory.slot),
+                )
+              : undefined;
+            if (interruption !== undefined) vmError = withInterruptionContext(vmError, interruption);
             if (persistenceAttempt !== undefined) {
-              await context.persistence.abortAgentAttempt(persistenceAttempt, {
-                code: vmError.code,
-                message: vmError.message,
-              }).catch(() => {});
+              const outcome: AgentAttemptEnd = {
+                status,
+                error: { code: vmError.code, message: vmError.message },
+                ...(interruption === undefined ? {} : { interruption }),
+              };
+              await context.persistence.abortAgentAttempt(persistenceAttempt, outcome).catch(() => {});
             }
             await this.invalidateAgentSession(agent, executor, returnedSession);
-            await this.trace(context, "agent.failed", location, { agent: agent.id }, vmError);
+            const failureTrace = this.trace(
+              context,
+              interruption === undefined ? "agent.failed" : "agent.interrupted",
+              location,
+              {
+                agent: agent.id,
+                ...(interruption === undefined ? {} : {
+                  interruption: interruptionDetails(interruption),
+                }),
+              },
+              vmError,
+            );
+            if (interruption === undefined) await failureTrace;
+            else await failureTrace.catch(() => {});
             throw vmError;
           } finally {
             await externalLease?.close();
@@ -3130,6 +3194,136 @@ function requireNonEmptyTransactionText(value: string, field: string): string {
     );
   }
   return value;
+}
+
+const INTERRUPTING_AGENT_ERROR_CODES = new Set([
+  "AGENT_EXECUTOR_UNAVAILABLE",
+  "AGENT_SANDBOX_INIT_FAILED",
+  "AGENT_SANDBOX_TERMINATED",
+  "AGENT_EXECUTION_FAILED",
+]);
+
+function agentAttemptStatus(
+  error: unknown,
+  vmError: AflVmError,
+  executorRunning: boolean,
+  signal: AbortSignal,
+): AgentAttemptEnd["status"] {
+  if (signal.aborted || vmError.code === "AGENT_CANCELLED") return "cancelled";
+  if (!executorRunning) return "error";
+  if (INTERRUPTING_AGENT_ERROR_CODES.has(vmError.code)) return "interrupted";
+  if (error instanceof AgentExecutorError || error instanceof AflVmError) return "error";
+  return "interrupted";
+}
+
+function createInterruptionContext(
+  agent: AgentHandle,
+  executor: string,
+  location: Required<TraceLocation>,
+  persistedRevision?: number,
+): AgentInterruptionContext {
+  return {
+    agent: agent.agent.name,
+    executor,
+    activation: agent.origin.activationPath,
+    location: `${location.node}:${location.block}:${location.instruction}`,
+    memorySlot: agent.memory.slot,
+    memoryRevision: persistedRevision ?? agent.memory.revision,
+    workspace: agent.workspace.primary.root,
+    readOnlyWorkspaces: agent.workspace.readOnly.map((item) => item.root),
+  };
+}
+
+function withInterruptionContext(
+  error: AflVmError,
+  interruption: AgentInterruptionContext,
+): AflVmError {
+  return new AflVmError(error.code, error.message, {
+    ...(error.span === undefined ? {} : { span: error.span }),
+    details: mergeErrorDetails(error.details, {
+      interruption: interruptionDetails(interruption),
+    }),
+    cause: error,
+  });
+}
+
+function interruptionContext(error: AflVmError): AgentInterruptionContext | undefined {
+  if (!isComputeRecord(error.details)) return undefined;
+  const value = error.details.interruption;
+  if (!isComputeRecord(value) ||
+      typeof value.agent !== "string" ||
+      typeof value.executor !== "string" ||
+      typeof value.activation !== "string" ||
+      typeof value.location !== "string" ||
+      typeof value.memorySlot !== "string" ||
+      !Number.isInteger(value.memoryRevision) ||
+      (value.memoryRevision as number) < 0 ||
+      typeof value.workspace !== "string" ||
+      !Array.isArray(value.readOnlyWorkspaces) ||
+      !value.readOnlyWorkspaces.every((item) => typeof item === "string")) {
+    return undefined;
+  }
+  return {
+    agent: value.agent,
+    executor: value.executor,
+    activation: value.activation,
+    location: value.location,
+    memorySlot: value.memorySlot,
+    memoryRevision: value.memoryRevision as number,
+    workspace: value.workspace,
+    readOnlyWorkspaces: [...value.readOnlyWorkspaces] as string[],
+  };
+}
+
+function interruptionDetails(
+  interruption: AgentInterruptionContext,
+): { readonly [key: string]: ComputeValue } {
+  return {
+    agent: interruption.agent,
+    executor: interruption.executor,
+    activation: interruption.activation,
+    location: interruption.location,
+    memorySlot: interruption.memorySlot,
+    memoryRevision: interruption.memoryRevision,
+    workspace: interruption.workspace,
+    readOnlyWorkspaces: [...interruption.readOnlyWorkspaces],
+  };
+}
+
+function withInterruptionShutdownError(error: AflVmError, shutdownError: unknown): AflVmError {
+  const normalized = normalizeVmError(shutdownError);
+  return new AflVmError(error.code, error.message, {
+    ...(error.span === undefined ? {} : { span: error.span }),
+    details: mergeErrorDetails(error.details, {
+      interruptionPersistenceError: {
+        code: normalized.code,
+        message: normalized.message,
+      },
+    }),
+    cause: error,
+  });
+}
+
+function mergeErrorDetails(
+  details: ComputeValue | undefined,
+  additions: { readonly [key: string]: ComputeValue },
+): { readonly [key: string]: ComputeValue } {
+  if (details === undefined) return additions;
+  if (isComputeRecord(details)) return { ...details, ...additions };
+  return { originalDetails: details, ...additions };
+}
+
+function isComputeRecord(value: ComputeValue | undefined): value is { readonly [key: string]: ComputeValue } {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function selectTaskGroupFailure(
+  settled: readonly PromiseSettledResult<Frag>[],
+): PromiseRejectedResult | undefined {
+  const failures = settled.filter((item): item is PromiseRejectedResult => item.status === "rejected");
+  return failures.find((item) => interruptionContext(normalizeVmError(item.reason)) !== undefined)
+    ?? failures.find((item) => normalizeVmError(item.reason).code !== "AGENT_CANCELLED")
+    ?? failures[0];
 }
 
 function createRunId(): string {

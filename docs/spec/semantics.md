@@ -163,6 +163,10 @@ Backend 只返回最终 `output`，VM 将其追加一次 `assistant` Message。�
 
 支持原生 session 的 backend 可以返回 session ref。VM 记录该 session 已同步的 Memory revision，并把运行中的文本、工具和 usage 事件转交 Trace 与可选 `agentHost`。这些事件不自动变成 AFL Message；支持 continuation codec 的 backend 在完整原生消息形成后，通过 executor host 把 tool call、tool result、thinking、compaction 等语义 records 流式追加到当前 Memory 文件。每个完整 record 都会推进可恢复 continuation，不等待最终 assistant 或 `do.end`。
 
+`execute` 已经开始后，如果 executor、模型服务或沙箱以基础设施错误意外退出，VM 将该次 `do` 标记为 `interrupted`，并保留原始错误以及 Agent、executor、activation、Memory slot/revision、Workspace 和调用位置。模型输出校验失败、schema 不匹配等确定性 VM 错误仍是普通 `error`；由父级或兄弟失败终止的调用标记为 `cancelled`。VM 不根据错误猜测工具副作用，也不会静默切换模型厂商或 executor。
+
+中断会停止后续调度，取消并等待同一并发作用域内的其他任务，随后刷完 Memory 持久化队列、记录 run 级中断标记并关闭 run。并行 TaskGroup 同时包含根因与连带取消时，`sync` 优先传播带中断上下文的根因。当前标记只为外部恢复逻辑提供证据，不是 snapshot；VM 尚不保存 instruction pointer、外部进程或 Workspace 文件状态。
+
 ### 7.6 输出格式约束
 
 Agent 调用可以带 schema symbol：

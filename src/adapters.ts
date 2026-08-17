@@ -158,6 +158,7 @@ export interface VmPolicy {
 export type TraceEventType =
   | "run.started"
   | "run.completed"
+  | "run.interrupted"
   | "run.failed"
   | "node.started"
   | "node.completed"
@@ -169,6 +170,7 @@ export type TraceEventType =
   | "instruction.failed"
   | "agent.started"
   | "agent.completed"
+  | "agent.interrupted"
   | "agent.failed"
   | "agent.event"
   | "dispatch.started"

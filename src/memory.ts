@@ -83,6 +83,7 @@ export interface MemoryStateStore {
   beginMemoryDo?(request: MemoryDoBeginRequest, signal: AbortSignal): Promise<void>;
   appendMemoryContinuation?(request: MemoryContinuationAppendRequest, signal: AbortSignal): Promise<void>;
   endMemoryDo?(request: MemoryDoEndRequest, signal: AbortSignal): Promise<void>;
+  recordRunInterruption?(request: MemoryRunInterruptionRequest, signal: AbortSignal): Promise<void>;
 }
 
 export interface MemorySaveContext {
@@ -111,12 +112,35 @@ export interface MemoryContinuationAppendRequest extends MemoryDoRequest {
 
 export interface MemoryDoEndRequest extends MemoryDoRequest {
   readonly state: PersistedRunMemoryState;
-  readonly status: "ok" | "error";
+  readonly status: "ok" | "error" | "interrupted" | "cancelled";
   readonly finishedAt: string;
   readonly error?: {
     readonly code: string;
     readonly message: string;
   };
+  readonly interruption?: AgentInterruptionContext;
+}
+
+export interface AgentInterruptionContext {
+  readonly agent: string;
+  readonly executor: string;
+  readonly activation: string;
+  readonly location: string;
+  readonly memorySlot: string;
+  readonly memoryRevision: number;
+  readonly workspace: string;
+  readonly readOnlyWorkspaces: readonly string[];
+}
+
+export interface MemoryRunInterruptionRequest {
+  readonly state: PersistedRunMemoryState;
+  readonly runId: string;
+  readonly finishedAt: string;
+  readonly error: {
+    readonly code: string;
+    readonly message: string;
+  };
+  readonly interruption: AgentInterruptionContext;
 }
 
 export interface MemoryPersistenceBinding {
