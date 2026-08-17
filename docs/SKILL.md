@@ -395,7 +395,8 @@ result = { output: string }
 | `structuredOutput` | 能在带内联 format 的 activation 内收集可修改的 Format Output 候选并通过 VM 校验 |
 | `interrupt` | 能在取消信号后中断进行中的执行 |
 | `dynamicControlTools` | 能在 activation 中调用 VM 提供的 Freedom control tools |
-| `standardTools` | 能按 Agent allocation 的 `tools` 字段激活 VM 标准工具 |
+| `standardTools` | 能按 Agent allocation 的 `tools` 字段激活功能等价的标准工具；模型侧调用格式可由 executor 决定 |
+| `toolAuthorization` | 能在任何外部作用工具执行前把 canonical capability、原生工具名和 effective input 交给 VM 授权 |
 | `interactiveApproval` | 能发起显式 elevation 或 transaction 审批 |
 | `sandboxEnforcement` | executor 自身确实强制执行工作区、进程、网络或工具隔离 |
 
@@ -418,12 +419,13 @@ result = {
 ```
 
 - 使用 `{ backend, id, checkpoint? }` 表示 session ref；导入导出状态使用 `{ backend, format, payload }`，不要把供应商对象直接暴露给 VM。
+- `request.tools` 是 VM 从 `AGENT_STANDARD_TOOLS` 解析出的语义 descriptor 列表。不要改变其能力含义或绕过 `authorization: "required"`；模型侧名称、参数 schema 和返回格式可以使用 executor 的原生设计。
 - 在执行前验证 canonical Memory import；不要悄悄删除未知 role。
 - 只在正常完成时返回 `completed`。把策略阻止、预算耗尽和取消分别返回对应 stop reason。
 - 让 `sessionMemoryRevision` 精确说明原生 session 已吸收的 canonical Memory revision，防止重复导入消息。
 - 如支持 continuation，实现适用的 `checkpoint`、`fork`、`exportSession`、`importSession` 和 `close`；检查 executor name、session format、Agent symbol、system prompt 和 revision 兼容性。
 - 向 `host.emit` 发送规范化 Agent event；向 `host.persistContinuation` 发送完整语义增量，不要发送无法重放的 token 碎片。
-- 仅在 `control` 存在时调用 `host.executeControlTool`，并只使用 VM 提供的 tool 名称和 schema。
+- 仅在 `control` 存在时调用 `host.executeControlTool`。executor 可以使用原生的模型侧 tool schema，但必须把调用转换成 VM descriptor 的 canonical 名称和输入后再提交给 host。
 
 使用完整的 executor host 表面：
 
@@ -438,7 +440,7 @@ submitFormattedOutput(request) -> accepted | rejected
 executeControlTool(request) -> {content: string, details?: compute}
 ```
 
-在 executor 执行任何外部作用工具前调用 `authorizeTool`。Format Output 是显式格式化 activation 内部的结果提交，不进入文件或 Shell policy；普通 reasoning activation 不应暴露它。将候选交给 `submitFormattedOutput`，并把 rejected 的 code/message 返回给模型继续修正。只有策略返回可提权的拒绝时才调用 `requestElevation`；需要宿主确认外部事务完成时调用 `requestTransaction`；需要用户或上层系统补充信息时调用 `requestInput`。Agent event 只使用 `message.delta`、`tool.requested/policy/started/updated/completed`、`transaction.state`、`elevation.state`、`usage.updated` 或 `warning`。
+在 executor 执行任何外部作用工具前调用 `authorizeTool`。Action 的 `capability` 使用稳定 AFL 名称，`toolName` 保留 executor 原生名称，`effectiveInput` 是 policy 实际判断的规范化安全视图。Format Output 是显式格式化 activation 内部的结果提交，不进入文件或 Shell policy；普通 reasoning activation 不应暴露它。将候选交给 `submitFormattedOutput`，并把 rejected 的 code/message 返回给模型继续修正。只有策略返回可提权的拒绝时才调用 `requestElevation`；需要宿主确认外部事务完成时调用 `requestTransaction`；需要用户或上层系统补充信息时调用 `requestInput`。Agent event 只使用 `message.delta`、`tool.requested/policy/started/updated/completed`、`transaction.state`、`elevation.state`、`usage.updated` 或 `warning`。
 
 按以下生命周期实现 Agent activation：追加输入消息，验证 canonical Memory，恢复兼容 session，执行 Agent 授权，持久化 attempt 起点，运行 executor，处理取消或非完成 stop reason，验证内联 format，追加 assistant 输出，更新 continuation，再提交完成状态。任何中途错误都不得伪造成功输出。
 

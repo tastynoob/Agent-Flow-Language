@@ -1,7 +1,7 @@
 import type { AgentStandardToolName, ComputeValue, PrimitiveValue } from "../ir.js";
 import { isComputeValue } from "../ir.js";
 import { parseAfl } from "../parser.js";
-import { AGENT_TOOL_PROFILES, type AgentToolProfileName } from "../standard-agent-tools.js";
+import { AGENT_TOOL_PROFILES, type AgentToolProfileName } from "../agent-tools.js";
 import { assertValidModule } from "../validation.js";
 
 const NAME = /^[A-Za-z_][A-Za-z0-9_]*$/u;

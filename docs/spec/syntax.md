@@ -254,6 +254,8 @@ reviewer = agent @agent.reviewer, [memory: review_memory]
 
 显式列表只能包含上述标准名且不能重复。`shell` 是后端无关名称；例如 Pi 将它映射为 harness 的 `bash` 工具。省略 `tools` 时由 executor binding 决定默认工具，用于高级自定义工具和渐进迁移；显式写出后，executor 必须支持标准工具选择，否则执行失败。`fork` 和 `with_memory` 保留 source Agent 的工具权限。
 
+这些名称不是绑定某个 agent SDK 调用格式的工具 schema。VM 通过公开的 `AGENT_STANDARD_TOOLS` 注册表定义标准能力的名称、语义、`provider: "executor"` 归属和 `authorization: "required"` 安全要求，并把 descriptor 交给 executor；executor 负责提供功能相近的实现，也可以使用自身原生的模型侧工具名、参数 schema、返回格式和工作区寻址方式。例如 AFL 的 `shell` 可以由 Pi 的 `bash` 实现。AFL 约束的是 flow 获得了什么能力以及调用必须先经过 VM 授权，不要求不同模型后端使用完全相同的 tool calling 协议。
+
 Reference Pi executor 的 `search` 做递归字面量文本搜索，不调用 Shell，不跟随 symlink，跳过大于 2 MB 的文件，并限制单次扫描最多 10,000 个目录项和 500 条返回结果。它用于常见源码定位，不替代索引服务或项目特有的检索 capability。
 
 设置 system prompt：

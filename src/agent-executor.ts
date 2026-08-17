@@ -1,5 +1,6 @@
 import type { AgentAdapter, AgentRunRequest } from "./adapters.js";
-import type { AgentOutputFormat, AgentStandardToolName, ComputeValue, SymbolRef } from "./ir.js";
+import type { AgentControlToolDescriptor, AgentStandardToolDescriptor } from "./agent-tools.js";
+import type { AgentOutputFormat, ComputeValue, SymbolRef } from "./ir.js";
 import {
   AFL_MESSAGE_ROLE_SCHEMA,
   type AgentMemoryContract,
@@ -24,6 +25,8 @@ export interface AgentExecutorCapabilities {
   readonly interrupt: boolean;
   readonly dynamicControlTools: boolean;
   readonly standardTools: boolean;
+  /** Every external-effect tool is authorized through AgentExecutionHost before execution. */
+  readonly toolAuthorization: boolean;
   readonly interactiveApproval: boolean;
   readonly sandboxEnforcement: boolean;
 }
@@ -51,19 +54,12 @@ export interface AgentExecutionRequest {
   readonly memory: readonly Message[];
   readonly memoryRevision: number;
   readonly workspace: AgentWorkspaceSet;
-  readonly tools?: readonly AgentStandardToolName[];
+  readonly tools?: readonly AgentStandardToolDescriptor[];
   readonly session?: BackendSessionRef;
   readonly sessionMemoryRevision?: number;
   readonly format?: AgentOutputFormat;
   readonly control?: AgentControlActivation;
   readonly signal: AbortSignal;
-}
-
-export interface AgentControlToolDescriptor {
-  readonly name: `afl.${string}`;
-  readonly label: string;
-  readonly description: string;
-  readonly inputSchema: ComputeValue;
 }
 
 export interface AgentControlActivation {
@@ -162,6 +158,7 @@ export type AgentTransactionResult =
 
 export interface AgentElevationRequest {
   readonly id: string;
+  readonly capability?: string;
   readonly toolName: string;
   readonly input: Readonly<Record<string, unknown>>;
   readonly effectiveInput: Readonly<Record<string, unknown>>;
@@ -252,6 +249,7 @@ const STATELESS_CAPABILITIES = {
   interrupt: true,
   dynamicControlTools: false,
   standardTools: false,
+  toolAuthorization: false,
   interactiveApproval: false,
   sandboxEnforcement: false,
 } as const;

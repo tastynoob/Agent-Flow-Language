@@ -982,6 +982,7 @@ test("Pi coding tools are created for each Agent primary Workspace", async (t) =
   const models = createModels();
   models.setProvider(faux.provider);
   let observedWorkingDirectory;
+  let observedCapability;
   faux.setResponses([
     fauxAssistantMessage(
       fauxToolCall("bash", { command: "pwd" }, { id: "pwd-1" }),
@@ -1003,11 +1004,23 @@ main():
         worker = agent @agent.worker, [workspace: "work/"]
         result = worker.do "report the working directory"
         ret result
-`, { agentExecutor: backend });
+`, {
+    agentExecutor: backend,
+    agentSecurity: {
+      preTool: { policies: [{
+        name: "capture-capability",
+        evaluate(action) {
+          observedCapability = action.capability;
+          return { verdict: "allow" };
+        },
+      }] },
+    },
+  });
 
   const result = await vm.run("main", [], { executionRoot: root });
   assert.equal(result.output.content, "workspace-ok");
   assert.equal(observedWorkingDirectory, await realpath(join(root, "work")));
+  assert.equal(observedCapability, "shell");
 });
 
 test("Pi activates only the AFL standard tools selected by each Agent", async (t) => {
@@ -1054,6 +1067,46 @@ main():
     ["afl_transaction_request"].toSorted(),
     ["read", "bash", "write", "afl_transaction_request"].toSorted(),
   ]);
+});
+
+test("Pi may expose its native invocation form for an AFL standard tool", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "afl-pi-tool-contract-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  faux.setResponses([
+    (context) => {
+      const read = context.tools.find((tool) => tool.name === "read");
+      assert.equal(read.label, "Provider-specific read");
+      assert.equal(read.description, "A provider-local invocation contract");
+      assert.deepEqual(read.parameters.required, ["legacy_path"]);
+      return fauxAssistantMessage("contract-ok");
+    },
+  ]);
+  const providerRead = {
+    name: "read",
+    label: "Provider-specific read",
+    description: "A provider-local invocation contract",
+    parameters: Type.Object({ legacy_path: Type.String() }),
+    async execute() {
+      return { content: [{ type: "text", text: "unused" }], details: undefined };
+    },
+  };
+  const backend = new PiAgentExecutorBackend({
+    models,
+    defaultBinding: { model: faux.getModel(), tools: [providerRead] },
+  });
+  const vm = AflVm.fromSource(`
+main():
+    entry:
+        worker = agent @agent.worker, [tools: ["read"]]
+        result = worker.do "inspect the workspace"
+        ret result
+`, { agentExecutor: backend });
+
+  const result = await vm.run("main", [], { executionRoot: root });
+  assert.equal(result.output.content, "contract-ok");
 });
 
 test("Pi standard search tool finds literal text without shell access", async (t) => {

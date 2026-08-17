@@ -19,6 +19,9 @@ export interface AgentToolAction {
   readonly agent: SymbolRef;
   readonly backend: string;
   readonly toolCallId: string;
+  /** Stable AFL capability when the executor tool implements one. */
+  readonly capability?: string;
+  /** Executor-native tool name used for invocation and diagnostics. */
   readonly toolName: string;
   readonly executionBoundary: AgentToolExecutionBoundary;
   readonly workspace: AgentWorkspaceSet;
@@ -167,6 +170,7 @@ export class AgentToolPolicyEngine {
 export function agentToolActionDigest(action: AgentToolAction): string {
   const canonical = canonicalize({
     backend: action.backend,
+    capability: action.capability,
     toolName: action.toolName,
     executionBoundary: action.executionBoundary,
     workspace: {
@@ -212,6 +216,9 @@ export function snapshotAgentToolAction(action: AgentToolAction): AgentToolActio
     agent: deepFreeze(structuredClone(action.agent)),
     backend: requireNonEmpty(action.backend, "tool action backend"),
     toolCallId: requireNonEmpty(action.toolCallId, "tool action toolCallId"),
+    ...(action.capability === undefined
+      ? {}
+      : { capability: requireNonEmpty(action.capability, "tool action capability") }),
     toolName: requireNonEmpty(action.toolName, "tool action toolName"),
     executionBoundary,
     workspace: deepFreeze(structuredClone(action.workspace)),

@@ -1,4 +1,4 @@
-import type { AgentControlToolDescriptor } from "./agent-executor.js";
+import { controlTool, type AgentControlToolDescriptor } from "./agent-tools.js";
 import { AflVmError } from "./errors.js";
 import type { ComputeValue, AgentControlMode, SourceSpan } from "./ir.js";
 
@@ -86,7 +86,7 @@ export function freedomControlTools(mode: AgentControlMode): readonly AgentContr
 }
 
 function environmentTool(): AgentControlToolDescriptor {
-  return {
+  return controlTool({
     name: "afl.environment.get",
     label: "AFL environment",
     description: "Discover unknown Nodes, Agents, controlled parameters, or route constraints visible in this Freedom activation. Do not call merely to learn how another tool works or to confirm exact Node names and refs already supplied by the user: every active AFL tool includes its own usage instructions. Omit include to return every environment section.",
@@ -102,25 +102,28 @@ function environmentTool(): AgentControlToolDescriptor {
       },
       additionalProperties: false,
     },
-  };
+    executionMode: "parallel",
+  });
 }
 
 function routeAddTool(): AgentControlToolDescriptor {
-  return {
+  return controlTool({
     name: "afl.route.add",
     label: "Add AFL route",
     description: "Queue one allowed existing AFL Node call in agent.route. The node field is the workflow function named in the allowlist, not a business object such as a partition, model, agent, or workspace. If every job uses the same allowed Node, repeat that exact Node name and select each business object through positional args. The args are positional and must exactly match the Node signature. Pass a controlled value with {\"ref\":\"param:<name>\"}, using an exact ref supplied by the user or discovered from the environment, or pass arbitrary text with {\"string\":\"...\"}. When the user already supplies the exact Node and refs, call this tool directly without afl.environment.get. A successful call counts toward min_routes/max_routes but starts only after the agent finishes: it returns registration metadata, never the child result. Call once for each desired TaskGroup job; AFL code outside the agent collects results with sync.",
     inputSchema: nodeCallSchema(),
-  };
+    executionMode: "parallel",
+  });
 }
 
 function nodeExecuteTool(): AgentControlToolDescriptor {
-  return {
+  return controlTool({
     name: "afl.node.execute",
     label: "Execute AFL Node",
     description: "Immediately execute one allowed existing Node in agent.flow and wait for its result. Set node to an allowed Node name; args are positional and must exactly match its signature. Pass a controlled or prior-result value with {\"ref\":\"<exact environment or tool-result ref>\"}, or arbitrary text with {\"string\":\"...\"}. Success returns {ok:true, ref, value}; the returned ref may be used by later control calls. The call counts toward min_routes/max_routes, and child Agent workspaces must not overlap the writer workspace.",
     inputSchema: nodeCallSchema(),
-  };
+    executionMode: "parallel",
+  });
 }
 
 function nodeCallSchema(): ComputeValue {
@@ -144,7 +147,7 @@ function nodeCallSchema(): ComputeValue {
 }
 
 function irValidateTool(): AgentControlToolDescriptor {
-  return {
+  return controlTool({
     name: "afl.ir.validate",
     label: "Validate AFL IR",
     description: "Parse and validate a complete generated AFL fragment at the current writer origin without executing it or calling bindings. entry must name a Node declared in source, and args are its positional arguments using exact refs or free strings. Success returns a digest and diagnostics; pass the unchanged source and digest to afl.ir.execute. Validation alone does not execute workflow work or satisfy min_routes. Static writer/child workspace conflicts are returned as warnings.",
@@ -170,11 +173,12 @@ function irValidateTool(): AgentControlToolDescriptor {
       required: ["source", "entry"],
       additionalProperties: false,
     },
-  };
+    executionMode: "parallel",
+  });
 }
 
 function irExecuteTool(): AgentControlToolDescriptor {
-  return {
+  return controlTool({
     name: "afl.ir.execute",
     label: "Execute AFL IR",
     description: "Revalidate and execute a complete generated AFL fragment as a child activation at the current writer origin. Use the same source, entry, and positional args accepted by afl.ir.validate; when validation returned a digest, pass it unchanged as expectedDigest to detect edits. Success returns {ok:true, digest, ref, value}; the ref may be used by later control calls. Generated Agents should omit Workspace for isolated .afl/tmpworkspace allocation or use an explicit workspace that does not overlap the writer.",
@@ -205,7 +209,8 @@ function irExecuteTool(): AgentControlToolDescriptor {
       required: ["source", "entry"],
       additionalProperties: false,
     },
-  };
+    executionMode: "parallel",
+  });
 }
 
 function controlArgumentSchema(): ComputeValue {

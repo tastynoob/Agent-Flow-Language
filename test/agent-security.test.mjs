@@ -95,12 +95,22 @@ test("tool policy block is returned to the model without an approval side effect
 });
 
 test("tool action digest is canonical and changes with effective input", () => {
-  const left = action({ effectiveInput: { command: "pwd", options: { b: 2, a: 1 } } });
-  const right = action({ effectiveInput: { options: { a: 1, b: 2 }, command: "pwd" } });
+  const left = action({
+    capability: "shell",
+    effectiveInput: { command: "pwd", options: { b: 2, a: 1 } },
+  });
+  const right = action({
+    capability: "shell",
+    effectiveInput: { options: { a: 1, b: 2 }, command: "pwd" },
+  });
   assert.equal(agentToolActionDigest(left), agentToolActionDigest(right));
   assert.notEqual(
     agentToolActionDigest(left),
-    agentToolActionDigest(action({ effectiveInput: { command: "rm -rf ." } })),
+    agentToolActionDigest(action({ capability: "shell", effectiveInput: { command: "rm -rf ." } })),
+  );
+  assert.notEqual(
+    agentToolActionDigest(left),
+    agentToolActionDigest(action({ capability: "custom-shell" })),
   );
 });
 
@@ -129,6 +139,74 @@ test("cc-safety-net policy allows ordinary shell and soft-blocks destructive sem
     code: "CC_SAFETY_NET_INPUT_INVALID",
     reason: "CC Safety Net requires 'bash' to provide a non-empty command",
   });
+  const portable = await policy.evaluate(action({
+    capability: "shell",
+    toolName: "executor_native_shell",
+    effectiveInput: { command: "git reset --hard" },
+  }));
+  assert.equal(portable.verdict, "block");
+  assert.equal(portable.code, "CC_SAFETY_NET_BLOCKED");
+});
+
+test("VM rejects unsafe tool executors instead of silently bypassing authorization", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "afl-tool-authorization-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  let executed = false;
+  const backend = {
+    name: "unsafe-tools",
+    capabilities: {
+      nativeSession: false,
+      checkpoint: false,
+      fork: false,
+      workspaceContext: true,
+      readOnlyWorkspaceContext: true,
+      structuredOutput: false,
+      interrupt: true,
+      dynamicControlTools: false,
+      standardTools: true,
+      toolAuthorization: false,
+      interactiveApproval: false,
+      sandboxEnforcement: false,
+    },
+    memory: {
+      capabilities: { roleSchemas: ["afl.message-role/v0"], importRoles: ["*"] },
+      validateImport() {},
+    },
+    async execute() {
+      executed = true;
+      return { output: "unsafe", stopReason: "completed" };
+    },
+  };
+  const vm = AflVm.fromSource(`
+main():
+    entry:
+        worker = agent @agent.worker, [tools: ["read"]]
+        result = worker.do "read"
+        ret result
+`, { agentExecutor: backend });
+
+  await assert.rejects(
+    vm.run("main", [], { executionRoot: root }),
+    { code: "AGENT_CAPABILITY_UNSUPPORTED" },
+  );
+
+  const policyVm = AflVm.fromSource(`
+main():
+    entry:
+        worker = agent @agent.worker
+        result = worker.do "read"
+        ret result
+`, {
+    agentExecutor: backend,
+    agentSecurity: {
+      preTool: { policies: [{ name: "allow", evaluate: () => ({ verdict: "allow" }) }] },
+    },
+  });
+  await assert.rejects(
+    policyVm.run("main", [], { executionRoot: root }),
+    { code: "AGENT_CAPABILITY_UNSUPPORTED" },
+  );
+  assert.equal(executed, false);
 });
 
 test("approval queue presents concurrent requests one at a time in FIFO order", async (t) => {
@@ -220,7 +298,7 @@ test("VM serializes active elevation requests from concurrent Agents without ser
       async present(request) {
         activePresenters += 1;
         maximumPresenters = Math.max(maximumPresenters, activePresenters);
-        presented.push(request.subject.toolCallId);
+        presented.push(request.subject);
         await new Promise((resolve) => setTimeout(resolve, 15));
         activePresenters -= 1;
         return request.subject.toolCallId.includes("right") ? "denied" : "approved";
@@ -240,6 +318,7 @@ test("VM serializes active elevation requests from concurrent Agents without ser
       structuredOutput: false,
       interrupt: true,
       dynamicControlTools: false,
+      toolAuthorization: true,
       interactiveApproval: true,
       sandboxEnforcement: false,
     },
@@ -251,6 +330,7 @@ test("VM serializes active elevation requests from concurrent Agents without ser
       const name = request.agent.name.includes("left") ? "left" : "right";
       const authorization = await host.requestElevation({
         id: `${name}-tool`,
+        capability: "shell",
         toolName: "bash",
         input: { command: "pwd" },
         effectiveInput: { command: "pwd", cwd: request.workspace.primary.root },
@@ -293,7 +373,11 @@ main():
   assert.equal(result.output.content.includes("left:allowed"), true);
   assert.equal(result.output.content.includes("right:denied"), true);
   assert.equal(maximumPresenters, 1);
-  assert.deepEqual(new Set(presented), new Set(["left-tool", "right-tool"]));
+  assert.deepEqual(
+    new Set(presented.map((subject) => subject.toolCallId)),
+    new Set(["left-tool", "right-tool"]),
+  );
+  assert.deepEqual(new Set(presented.map((subject) => subject.capability)), new Set(["shell"]));
   const approvalStates = trace.events
     .filter((event) => event.type === "agent.event" && event.details?.type === "elevation.state")
     .map((event) => event.details.state);

@@ -4,6 +4,12 @@ AFL v0 的 Agent 工具执行边界由 AFL 与 TypeScript bindings 共同描述�
 
 `tools` 不是 sandbox，也不替代 pre-tool policy：它决定模型在本次 Agent activation 中能看到哪些标准工具。`readonly` 不暴露写入和 Shell 工具，`none` 不暴露文件或命令工具。只有 executor 对 Workspace 和只读挂载的实际强制执行才能提供安全边界。
 
+标准工具 descriptor 不固定模型侧 tool schema，但要求 `authorization: "required"`。支持这些工具的 executor 必须声明 `toolAuthorization`，并在任何外部作用发生前调用 `AgentExecutionHost.authorizeTool`；否则 VM 拒绝运行显式选择了标准工具的 Agent。配置了 pre-tool policy 时，VM 同样拒绝不能提供该授权边界的 executor，避免安全配置静默失效。
+
+Policy action 同时保存稳定的 AFL `capability` 和 executor 原生 `toolName`。例如 Pi 的 Shell action 是 `capability: "shell"`、`toolName: "bash"`。跨 executor 的通用 policy 应优先匹配 capability，并读取 executor 规范化后的 `effectiveInput`；需要后端特有规则时仍可匹配原生 toolName。模型看到的参数可以不同，但 executor 必须先把它转换成足够进行安全判断的 effective action。
+
+Format Output、Freedom 和事务申请是 activation-scoped VM 控制工具，不是 executor 提供的文件或命令能力，因此不进入普通 pre-tool policy。它们只能调用各自的 `AgentExecutionHost` 入口：Format Output 只提交候选值，事务申请进入人工请求队列，Freedom 只执行当前 activation 允许的控制操作。Freedom 启动的子 Agent 工具仍逐次经过 `authorizeTool`；生成 IR 中的 script、capability 和外部 Flow 仍经过各自的 VM policy，不能借控制工具绕过原有安全边界。
+
 这些能力只覆盖 `AgentExecutorBackend` 内的工具调用。AFL `script`、`capability`、外部 Flow adapter 和其他宿主扩展仍使用各自的 binding/`VmPolicy` 边界。
 
 ## Pre-tool policy
@@ -120,14 +126,14 @@ Sandbox 内的稳定视图为：
 
 ## cc-safety-net
 
-`createCCSafetyNetPolicy()` 只处理默认名为 `bash` 的 Shell action，其他工具返回 `abstain`。它复用固定依赖 `cc-safety-net@1.0.6` 的公开插件入口，安全命令返回 `allow`，破坏性 Git/文件命令、nested shell 和 interpreter 语义返回 `block`，让模型先寻找替代方案。格式错误的 Shell input 和 analyzer failure 仍按 hard `deny` 处理。
+`createCCSafetyNetPolicy()` 处理 AFL `shell` capability，并兼容默认原生名为 `bash` 的 Shell action，其他工具返回 `abstain`。它复用固定依赖 `cc-safety-net@1.0.6` 的公开插件入口，安全命令返回 `allow`，破坏性 Git/文件命令、nested shell 和 interpreter 语义返回 `block`，让模型先寻找替代方案。格式错误的 Shell effective input 和 analyzer failure 仍按 hard `deny` 处理。
 
 当前 adapter 在宿主进程中分析 `effectiveInput.command`，并以 Agent primary Workspace 的宿主路径初始化上游插件。它不观察 bubblewrap 内的 mount namespace 或 `/workspace` 路径映射，因此不能替代 sandbox 的文件系统边界。
 
-Strict、paranoid 和 worktree mode 使用 cc-safety-net 的 `CC_SAFETY_NET_*` 环境变量，并应在创建 policy 前由宿主固定。可以用 `toolNames` 指定其他具有同一 command 字段契约的 Shell tool 名称。当前适配不会自动打开审批，也不会写 AFL 自己的第二份命令审计日志。
+Strict、paranoid 和 worktree mode 使用 cc-safety-net 的 `CC_SAFETY_NET_*` 环境变量，并应在创建 policy 前由宿主固定。未知 capability 的自定义工具仍可用 `toolNames` 指定具有同一 canonical `command` security view 的原生名称。当前适配不会自动打开审批，也不会写 AFL 自己的第二份命令审计日志。
 
 cc-safety-net 保护工作区内部仍然危险但 sandbox 允许的操作；bubblewrap 负责阻止跨 Workspace 访问。两者不能互相替代。
 
 ## 可观测性
 
-`agent.started` trace 会记录当前是否启用 pre-tool policy、人工请求队列和 backend-wide sandbox enforcement。工具 trace 使用 `tool.requested`、`tool.policy`、`elevation.state`/`transaction.state`、`tool.started` 和 `tool.completed`，不会把“已请求”误记为“已开始产生副作用”。审批 display 和 policy reason 经过统一脱敏；完整工具消息是否进入 Memory 仍由 executor continuation 契约决定。
+`agent.started` trace 会记录当前是否启用 pre-tool policy、人工请求队列、executor tool authorization 和 backend-wide sandbox enforcement。工具 trace 使用 `tool.requested`、`tool.policy`、`elevation.state`/`transaction.state`、`tool.started` 和 `tool.completed`，不会把“已请求”误记为“已开始产生副作用”。审批 display 和 policy reason 经过统一脱敏；完整工具消息是否进入 Memory 仍由 executor continuation 契约决定。

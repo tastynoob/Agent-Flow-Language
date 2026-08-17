@@ -34,7 +34,9 @@ export function createCCSafetyNetPolicy(options: CCSafetyNetPolicyOptions = {}):
   return Object.freeze({
     name: options.name ?? "cc-safety-net",
     async evaluate(action: AgentToolAction): Promise<AgentToolPolicyDecision> {
-      if (!toolNames.has(action.toolName)) return { verdict: "abstain" };
+      if (action.capability !== "shell" && !toolNames.has(action.toolName)) {
+        return { verdict: "abstain" };
+      }
       const command = action.effectiveInput.command;
       if (typeof command !== "string" || command.trim().length === 0) {
         return {

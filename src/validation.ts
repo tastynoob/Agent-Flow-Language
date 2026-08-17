@@ -21,7 +21,7 @@ import type {
   ValueExpr,
 } from "./ir.js";
 import { workspacePathOverlap } from "./workspace.js";
-import { isAgentStandardToolName } from "./standard-agent-tools.js";
+import { isAgentStandardToolName } from "./agent-tools.js";
 import { getAflBuiltinFunction, isAflBuiltinName } from "./builtin-functions.js";
 
 export interface ValidationSuccess {

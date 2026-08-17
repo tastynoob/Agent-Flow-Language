@@ -22,7 +22,7 @@ import {
   expandAgentToolProfile,
   isAgentStandardToolName,
   isAgentToolProfileName,
-} from "./standard-agent-tools.js";
+} from "./agent-tools.js";
 
 interface SourceLine {
   readonly number: number;

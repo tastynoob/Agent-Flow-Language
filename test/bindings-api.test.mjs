@@ -53,6 +53,7 @@ test("pi accepts provider/model shorthand", () => {
   const backend = pi({ model: "deepseek/deepseek-v4-pro", sandbox: "bubblewrap", thinking: "high" });
   assert.equal(backend.name, "pi");
   assert.equal(backend.capabilities.standardTools, true);
+  assert.equal(backend.capabilities.toolAuthorization, true);
   assert.equal(backend.capabilities.sandboxEnforcement, true);
 });
 

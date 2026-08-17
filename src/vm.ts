@@ -8,6 +8,7 @@ import type {
   TraceEvent,
   TraceEventType,
 } from "./adapters.js";
+import { agentStandardTool } from "./agent-tools.js";
 import {
   AgentAdapterExecutorBackend,
   type AgentControlActivation,
@@ -983,6 +984,18 @@ export class AflVm {
         `Agent executor '${executor.name}' does not support AFL standard tool selection`,
       );
     }
+    if ((agent.tools?.length ?? 0) > 0 && !executor.capabilities.toolAuthorization) {
+      throw new AflVmError(
+        "AGENT_CAPABILITY_UNSUPPORTED",
+        `Agent executor '${executor.name}' cannot route standard tool calls through AFL VM authorization`,
+      );
+    }
+    if (this.agentToolPolicy !== undefined && !executor.capabilities.toolAuthorization) {
+      throw new AflVmError(
+        "AGENT_CAPABILITY_UNSUPPORTED",
+        `Agent executor '${executor.name}' cannot enforce the configured AFL pre-tool policy`,
+      );
+    }
     if (format !== undefined && !executor.capabilities.structuredOutput) {
       throw new AflVmError(
         "AGENT_CAPABILITY_UNSUPPORTED",
@@ -1035,7 +1048,9 @@ export class AflVm {
               memory: cloneMessages(agent.memory.messages),
               memoryRevision: agent.memory.revision,
               workspace: agent.workspace,
-              ...(agent.tools === undefined ? {} : { tools: agent.tools }),
+              ...(agent.tools === undefined
+                ? {}
+                : { tools: agent.tools.map((name) => agentStandardTool(name)) }),
               ...(agent.session === undefined ? {} : { session: agent.session }),
               ...(agent.sessionMemoryRevision === undefined
                 ? {}
@@ -1073,6 +1088,7 @@ export class AflVm {
                 preToolPolicy: this.agentToolPolicy !== undefined,
                 humanRequestQueue: this.bindings.agentSecurity?.approvalQueue !== undefined &&
                   this.bindings.agentSecurity.approvalQueue !== false,
+                toolAuthorization: executor.capabilities.toolAuthorization,
                 sandboxEnforcement: executor.capabilities.sandboxEnforcement,
               },
             });
@@ -1504,6 +1520,7 @@ export class AflVm {
             agent: bound.agent.name,
             backend: bound.backend,
             toolCallId: bound.toolCallId,
+            ...(bound.capability === undefined ? {} : { capability: bound.capability }),
             toolName: bound.toolName,
             executionBoundary: bound.executionBoundary,
             workspace: bound.display.details?.workspace ?? bound.workspace.primary.root,
@@ -1565,6 +1582,7 @@ export class AflVm {
       agent: executionRequest.agent,
       backend,
       toolCallId: request.id,
+      ...(request.capability === undefined ? {} : { capability: request.capability }),
       toolName: request.toolName,
       executionBoundary: request.executionBoundary,
       workspace: executionRequest.workspace,

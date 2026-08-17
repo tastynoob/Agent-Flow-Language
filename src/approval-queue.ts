@@ -14,6 +14,7 @@ export interface AgentApprovalSubject {
   readonly agent: string;
   readonly backend: string;
   readonly toolCallId: string;
+  readonly capability?: string;
   readonly toolName: string;
   readonly executionBoundary: AgentToolExecutionBoundary;
   readonly workspace: string;
@@ -284,7 +285,9 @@ function formatStdioRequest(request: AgentApprovalRequest): string {
     `kind: ${request.kind}`,
     `location: ${request.subject.node}:${request.subject.block}`,
     `agent: ${request.subject.agent}`,
-    `tool: ${request.subject.toolName} (${request.subject.executionBoundary})`,
+    `tool: ${request.subject.toolName}${request.subject.capability === undefined
+      ? ""
+      : ` [AFL: ${request.subject.capability}]`} (${request.subject.executionBoundary})`,
     `workspace: ${request.subject.workspace}`,
     `title: ${request.subject.display.title}`,
     `summary: ${request.subject.display.summary}`,

@@ -166,7 +166,7 @@ Backend 只返回最终 `output`，VM 将其追加一次 `assistant` Message。�
 
 Reference Pi executor 只在带 `format` 的 activation 中临时提供 `afl_format_output` tool，其 canonical 名称为 `afl.format_output`。普通 `do`、Freedom activation 和未声明格式的 Agent 不会看到该 tool。它独立于文件、Shell 工具 profile，也不授予 Freedom 控制权限。
 
-Pi 为该 activation 动态生成一个只含 `value` 参数的工具 schema：枚举 format 将 `value` 限定为声明值；对象 format 将其限定为所有声明字段必填、禁止额外字段的 JSON object，字段描述直接附着在对应参数上。工具描述简短注明结束前必须提交；VM 不修改 system prompt，也不插入隐藏 Message。模型可以反复提交；通过校验的新候选替换旧候选，未通过的候选只返回具体错误。调用 tool 不提前结束推理，activation 正常结束时自动采用最后一个有效候选。
+VM 为该 activation 提供一个只含 `value` 的规范化提交契约，Reference Pi executor 将它直接适配成模型工具：枚举 format 将 `value` 限定为声明值；对象 format 将其限定为所有声明字段必填、禁止额外字段的 JSON object，字段描述直接附着在对应参数上。其他 executor 可以暴露功能等价的原生调用形式，但提交到 `AgentExecutionHost` 的候选仍须满足同一 output format。工具描述简短注明结束前必须提交；VM 不修改 system prompt，也不插入隐藏 Message。模型可以反复提交；通过校验的新候选替换旧候选，未通过的候选只返回具体错误。调用 tool 不提前结束推理，activation 正常结束时自动采用最后一个有效候选。
 
 未指定 `format` 时产生 `output: reasoning` Frag。指定 `format` 时必须取得至少一个有效候选，否则以 `AGENT_FORMAT_OUTPUT_MISSING` 失败并产生 `output: formatted` Frag。每次候选通过 `AgentExecutionHost.submitFormattedOutput` 请求 VM 校验，最终返回前 VM 再按同一内联契约复核，不能由 executor 绕过。
 
