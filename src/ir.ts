@@ -11,9 +11,24 @@ export type ComputeValue =
   | ComputeValue[]
   | { readonly [key: string]: ComputeValue };
 
+export type FragOutput = "reasoning" | "formatted";
+
+export interface AgentEnumOutputFormat {
+  readonly kind: "enum";
+  readonly values: readonly string[];
+}
+
+export interface AgentObjectOutputFormat {
+  readonly kind: "object";
+  readonly fields: Readonly<Record<string, string>>;
+}
+
+export type AgentOutputFormat = AgentEnumOutputFormat | AgentObjectOutputFormat;
+
 export interface Frag {
   readonly kind: "frag";
   readonly content: string;
+  readonly output: FragOutput;
 }
 
 export interface SymbolRef {
@@ -123,7 +138,7 @@ export interface AgentWorkInstruction extends InstructionBase {
   readonly agent: NameExpr;
   readonly role?: string;
   readonly input: ValueExpr;
-  readonly schema?: SymbolExpr;
+  readonly format?: AgentOutputFormat;
 }
 
 export interface PromptInstruction extends InstructionBase {
@@ -194,7 +209,7 @@ export interface SyncInstruction extends InstructionBase {
 export interface ForkAction {
   readonly role?: string;
   readonly input: ValueExpr;
-  readonly schema?: SymbolExpr;
+  readonly format?: AgentOutputFormat;
   readonly span: SourceSpan;
 }
 
@@ -337,12 +352,13 @@ export interface AflModule {
   readonly sourceName?: string;
 }
 
-export function frag(content: string): Frag {
-  return { kind: "frag", content };
+export function frag(content: string, output: FragOutput = "reasoning"): Frag {
+  return { kind: "frag", content, output };
 }
 
 export function isFrag(value: unknown): value is Frag {
-  return isObject(value) && value.kind === "frag" && typeof value.content === "string";
+  return isObject(value) && value.kind === "frag" && typeof value.content === "string" &&
+    (value.output === "reasoning" || value.output === "formatted");
 }
 
 export function symbol(name: string): SymbolRef {

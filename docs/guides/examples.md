@@ -29,7 +29,7 @@ coder_review(task):
         ret code
 ```
 
-`review_result` 始终是 role-free Frag。它包含精确的 `finish` 或文本缺陷列表，不需要为了这个分支定义 JSON BugList。`fix_prompt` 也是 Frag；传给 `coder.do` 时默认以 `user` role 加入 Coder Memory。
+`review_result` 始终是 role-free Frag。这里没有声明格式，因此它标记为 `output: reasoning`，包含模型最终返回的 `finish` 或文本缺陷列表；不需要为了这个分支定义 JSON BugList。`fix_prompt` 也是 Frag；传给 `coder.do` 时默认以 `user` role 加入 Coder Memory。
 
 每次进入 `review` 都从最新 Coder Memory 创建独立 copy。Reviewer 可以看到完整上下文，但其审查过程不会改写 Coder Memory。
 
@@ -94,7 +94,7 @@ full_review(code):
         ret reports
 ```
 
-`dispatch` 返回 TaskGroup handle；这些 child flow 不继承某个已有 Agent 的 Memory。省略 formatter 的 `sync` 将多个 Frag content 编码成 JSON string array，并包装为一个 Frag。
+`dispatch` 返回 TaskGroup handle；这些 child flow 不继承某个已有 Agent 的 Memory。省略 formatter 的 `sync` 将多个 Frag content 编码成 JSON string array，并包装为 `output: formatted` Frag。
 
 ## 6. Fork Agent Branches
 
@@ -150,12 +150,16 @@ guided_work(task):
 structured_review(code):
     entry:
         reviewer = agent @agent.reviewer
-        review_prompt = prompt "Return the review as JSON", code
-        report = reviewer.do review_prompt, [schema: @schema.ReviewReport]
+        review_prompt = prompt "Review the code and explain how each result field should be derived", code
+        report = reviewer.do review_prompt,
+            [format: [
+                status: "Review status",
+                issues: "Discovered issues"
+            ]]
         ret report
 ```
 
-`@schema.ReviewReport` 由 Schema binding 校验，但 `report` 仍是 role-free Frag，其 content 是 JSON 字符串。通用模型 JSON 可由 `parsed = compute @afl.parse.json, report` 显式转为 compute；业务 schema 规则仍由 flow 或项目 capability 校验，复杂转换再交给 script binding。
+内联 record 让 Pi 只在这次 activation 暴露 Format Output，并要求结果包含且只包含 `status` 和 `issues`。字段描述进入工具参数 schema，但如何判定 status、issues 应填写什么仍由 `review_prompt` 说明。`report` 是 role-free、`output: formatted` Frag，其 content 是 JSON 字符串；可由 `parsed = compute @afl.parse.json, report` 显式转为 compute。
 
 ## 9. `oper` 与 Script Executor
 

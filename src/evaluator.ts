@@ -1,5 +1,6 @@
 import { AflVmError } from "./errors.js";
 import {
+  frag,
   isComputeValue,
   isFrag,
   type ComputeValue,
@@ -104,7 +105,7 @@ export function evaluateOper(expression: OperExpr, environment: ValueEnvironment
 
 export function asFrag(value: VmValue, span: SourceSpan, label = "value"): Frag {
   if (isFrag(value)) return value;
-  if (typeof value === "string") return { kind: "frag", content: value };
+  if (typeof value === "string") return frag(value);
   throw vmType("FRAG_REQUIRED", `${label} must be a Frag or string`, span);
 }
 

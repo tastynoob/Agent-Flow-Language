@@ -7,7 +7,7 @@ import {
   symbol,
 } from "../dist/src/index.js";
 
-test("OpenAI-compatible adapter maps Agent Memory and schema to chat completion", async () => {
+test("OpenAI-compatible adapter maps Agent Memory to chat completion", async () => {
   let captured;
   const adapter = new OpenAICompatibleAgentAdapter({
     baseUrl: "https://provider.example/v1/",
@@ -36,7 +36,6 @@ test("OpenAI-compatible adapter maps Agent Memory and schema to chat completion"
     agent: symbol("@agent.coder"),
     systemPrompt: "system",
     messages: [{ role: "user", content: "task" }],
-    schema: symbol("@schema.Result"),
     signal: controller.signal,
   });
 

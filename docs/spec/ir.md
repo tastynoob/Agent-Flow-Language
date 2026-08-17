@@ -32,12 +32,12 @@ VM 处理四类值：
 
 | 类别 | 表示 | 用途 |
 | --- | --- | --- |
-| Frag | `{ kind: "frag", content: string }` | Agent、Prompt、Input 和 Flow 的业务文本 |
+| Frag | `{ kind: "frag", content: string, output: reasoning \| formatted }` | Agent、Prompt、Input 和 Flow 的业务文本 |
 | Compute value | null、boolean、有限 number、string、list、record | `oper`、`compute`、script、条件和宿主数据 |
 | Symbol | 以 `@` 开头的引用 | Agent、Prompt、Schema、Capability、Flow 等 binding key |
 | Handle | Agent、Memory、TaskGroup | 当前 VM 运行中的状态资源 |
 
-Frag 不携带 role。Frag 进入 Agent 或 Memory 时才确定 role。Handle 不能作为 Prompt、外部 Flow 或 Capability 的可移植参数。
+Frag 不携带 role。`output` 只区分自然推理文本与显式格式化结果；Frag 进入 Agent 或 Memory 时才确定 role。Handle 不能作为 Prompt、外部 Flow 或 Capability 的可移植参数。
 
 ## 4. 指令集合
 
@@ -58,6 +58,8 @@ Frag 不携带 role。Frag 进入 Agent 或 Memory 时才确定 role。Handle �
 完整操作数格式见[文本语法](syntax.md)，运行行为见[执行语义](semantics.md)。
 
 Core IR opcode 与 AFL 表层操作保持一一对应。接收者语法会在 IR 中展开为显式字段，例如 `target.append` 对应 `memory.append`，`planner.route` 对应 `agent.route`；`jump`、`branch` 和 `match` 是三种独立 terminator，不共用兼容形状。
+
+`afl.format_output` 是 executor 只在带内联 `format` 的 activation 中提供的运行时工具，不是 IR opcode。枚举 list 或字段描述 record 直接保存在 Agent work IR 中，同时驱动工具参数 schema 与 VM 校验。该工具只决定既有 `agent.do` 最终返回哪个格式化候选，不创建新的 flow 节点或控制边；普通 `do` 仍采用模型最终 assistant 文本。
 
 ## 5. Dependency 调度
 

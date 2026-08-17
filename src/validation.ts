@@ -397,6 +397,7 @@ function validateInstructionKinds(
       break;
     case "agent.do":
       expectNameKind(module, instruction.agent, kinds, ["agent", "unknown"], "Agent work receiver", diagnostics);
+      if (instruction.format !== undefined) validateAgentOutputFormat(module, instruction.format, instruction.span, diagnostics);
       break;
     case "repeat":
       expectKind(module, instruction.count, kinds, ["compute", "unknown"], "repeat count", diagnostics);
@@ -406,6 +407,9 @@ function validateInstructionKinds(
       break;
     case "fork":
       expectNameKind(module, instruction.sourceAgent, kinds, ["agent", "unknown"], "fork source", diagnostics);
+      if (instruction.action.format !== undefined) {
+        validateAgentOutputFormat(module, instruction.action.format, instruction.span, diagnostics);
+      }
       break;
     case "compute":
       validateComputeInstruction(module, instruction, kinds, diagnostics);
@@ -447,6 +451,33 @@ function validateInstructionKinds(
       break;
     default:
       break;
+  }
+}
+
+function validateAgentOutputFormat(
+  module: AflModule,
+  format: import("./ir.js").AgentOutputFormat,
+  span: SourceSpan,
+  diagnostics: AflDiagnostic[],
+): void {
+  if (format.kind === "enum") {
+    if (format.values.length === 0 || format.values.some((value) => typeof value !== "string" || value.length === 0)) {
+      add(diagnostics, module, span, "AGENT_FORMAT_INVALID", "Agent enum format requires non-empty string values");
+    } else if (new Set(format.values).size !== format.values.length) {
+      add(diagnostics, module, span, "AGENT_FORMAT_INVALID", "Agent enum format cannot contain duplicates");
+    }
+    return;
+  }
+  const fields = Object.entries(format.fields);
+  if (fields.length === 0 || fields.some(([name, description]) =>
+    name.length === 0 || typeof description !== "string" || description.trim().length === 0)) {
+    add(
+      diagnostics,
+      module,
+      span,
+      "AGENT_FORMAT_INVALID",
+      "Agent object format requires non-empty field names and string descriptions",
+    );
   }
 }
 

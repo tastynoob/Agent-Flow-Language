@@ -56,7 +56,7 @@ import type {
   BackendSessionRef,
 } from "./agent-executor.js";
 import { AgentExecutorError } from "./agent-executor.js";
-import type { AgentStandardToolName, SymbolRef } from "./ir.js";
+import type { AgentOutputFormat, AgentStandardToolName, SymbolRef } from "./ir.js";
 import {
   AFL_MESSAGE_ROLE_SCHEMA,
   type AgentMemoryContract,
@@ -129,6 +129,7 @@ export interface PiCodingAgentBindingOptions {
   readonly thinkingReplay?: "include" | "exclude";
   readonly streamOptions?: AgentHarnessStreamOptions;
   readonly activeToolNames?: readonly string[];
+  readonly bashTimeoutSeconds?: number;
   readonly elevation?: boolean;
   readonly sandbox?: false | PiBubblewrapSandboxOptions;
 }
@@ -156,10 +157,14 @@ interface PiSessionRecord {
 interface PiHostRouter {
   readonly pendingSandboxActions: Map<string, PendingSandboxAction>;
   readonly elevationCandidates: ElevationCandidate[];
-  activation?: {
-    readonly host: AgentExecutionHost;
-    readonly request: AgentExecutionRequest;
-  };
+  activation?: PiActivation;
+}
+
+interface PiActivation {
+  readonly host: AgentExecutionHost;
+  readonly request: AgentExecutionRequest;
+  formattedOutput?: string;
+  formatRevision: number;
 }
 
 interface PendingSandboxAction {
@@ -176,6 +181,8 @@ const PI_BACKEND_NAME = "pi";
 const PI_SESSION_FORMAT = "pi.session/v0";
 const AFL_TRANSACTION_TOOL_NAME = "afl_transaction_request";
 const AFL_TRANSACTION_CANONICAL_NAME = "afl.transaction.request";
+const AFL_FORMAT_OUTPUT_TOOL_NAME = "afl_format_output";
+const AFL_FORMAT_OUTPUT_CANONICAL_NAME = "afl.format_output";
 const AFL_ELEVATION_TOOL_NAME = "afl_elevated_tool";
 const AFL_ELEVATION_CANONICAL_NAME = "afl.elevation.execute";
 
@@ -186,6 +193,10 @@ interface PiSessionPayload {
 
 export function createPiCodingAgentBinding(options: PiCodingAgentBindingOptions): PiAgentBinding<ExecutionToolContext> {
   const sandbox = options.sandbox ?? false;
+  const bashTimeoutSeconds = options.bashTimeoutSeconds ?? 300;
+  if (!Number.isFinite(bashTimeoutSeconds) || bashTimeoutSeconds <= 0) {
+    throw new TypeError("bashTimeoutSeconds must be a positive number");
+  }
   return {
     model: options.model,
     ...(options.systemPrompt === undefined ? {} : { systemPrompt: options.systemPrompt }),
@@ -198,12 +209,12 @@ export function createPiCodingAgentBinding(options: PiCodingAgentBindingOptions)
       if (sandbox === false) {
         const env = new NodeExecutionEnv({ cwd: workspace.primary.root });
         return {
-          tools: codingTools(),
+          tools: codingTools(bashTimeoutSeconds),
           toolContext: { env },
           contextPrompt: workspaceContextPrompt(workspace),
           toolWorkspace: workspace.primary.root,
           toolBoundaries: codingToolBoundaries("host"),
-          normalizeToolAction: createCodingToolActionNormalizer(env),
+          normalizeToolAction: createCodingToolActionNormalizer(env, bashTimeoutSeconds),
         };
       }
       if (sandbox.backend !== "bubblewrap") {
@@ -216,19 +227,19 @@ export function createPiCodingAgentBinding(options: PiCodingAgentBindingOptions)
       const hostEnv = new NodeExecutionEnv({ cwd: workspace.primary.root });
       const elevationAvailable = options.elevation !== false;
       return {
-        tools: codingTools(),
+        tools: codingTools(bashTimeoutSeconds),
         toolContext: { env },
         contextPrompt: sandboxWorkspaceContextPrompt(workspace, elevationAvailable),
         toolWorkspace: env.cwd,
         toolBoundaries: codingToolBoundaries("sandbox"),
-        normalizeToolAction: createCodingToolActionNormalizer(env),
+        normalizeToolAction: createCodingToolActionNormalizer(env, bashTimeoutSeconds),
         ...(elevationAvailable
           ? {
               elevation: {
-                tools: codingTools(),
+                tools: codingTools(bashTimeoutSeconds),
                 toolContext: { env: hostEnv },
                 toolWorkspace: workspace.primary.root,
-                normalizeToolAction: createCodingToolActionNormalizer(hostEnv),
+                normalizeToolAction: createCodingToolActionNormalizer(hostEnv, bashTimeoutSeconds),
               },
             }
           : {}),
@@ -285,7 +296,7 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
       fork: true,
       workspaceContext: true,
       readOnlyWorkspaceContext: true,
-      structuredOutput: false,
+      structuredOutput: true,
       interrupt: true,
       dynamicControlTools: true,
       standardTools: true,
@@ -298,12 +309,6 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
   async execute(request: AgentExecutionRequest, host: AgentExecutionHost): Promise<AgentExecutionResult> {
     throwIfAborted(request.signal);
     await this.memory.validateImport(request.agent, AFL_MESSAGE_ROLE_SCHEMA, request.memory);
-    if (request.schema !== undefined) {
-      throw new AgentExecutorError(
-        "AGENT_CAPABILITY_UNSUPPORTED",
-        "Pi AgentHarness does not provide native structured output",
-      );
-    }
     if (request.memoryRevision !== request.memory.length) {
       throw new AgentExecutorError(
         "AGENT_MEMORY_REVISION_INVALID",
@@ -355,6 +360,7 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     try {
       await this.importMessages(record, pending.slice(0, -1));
       const unsubscribe = this.bindEvents(record, host);
+      let restoreFormatOutput: (() => Promise<void>) | undefined;
       let restoreStandardTools: (() => Promise<void>) | undefined;
       let restoreControlTools: (() => Promise<void>) | undefined;
       let removeAuthorization: (() => void) | undefined;
@@ -365,20 +371,23 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
       try {
         record.hostRouter.pendingSandboxActions.clear();
         record.hostRouter.elevationCandidates.splice(0);
-        record.hostRouter.activation = { host, request };
+        const activation: PiActivation = { host, request, formatRevision: 0 };
+        record.hostRouter.activation = activation;
+        restoreFormatOutput = await this.configureFormatOutput(record, request);
         restoreStandardTools = await this.configureStandardTools(record, request);
         restoreControlTools = await this.configureControlTools(record, request, host);
         removeAuthorization = this.bindAuthorization(record, request, host);
         request.signal.addEventListener("abort", abort, { once: true });
         result = request.signal.aborted
           ? await this.cancelledResult(record)
-          : await this.toResult(record, await record.harness.prompt(prompt.content));
+          : await this.toResult(record, await record.harness.prompt(prompt.content), activation);
       } finally {
         delete record.hostRouter.activation;
         request.signal.removeEventListener("abort", abort);
         removeAuthorization?.();
         await restoreControlTools?.();
         await restoreStandardTools?.();
+        await restoreFormatOutput?.();
         unsubscribe();
       }
       if (result.stopReason !== "completed") {
@@ -598,6 +607,8 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     const reservedNames = new Set([
       AFL_TRANSACTION_TOOL_NAME,
       AFL_TRANSACTION_CANONICAL_NAME,
+      AFL_FORMAT_OUTPUT_TOOL_NAME,
+      AFL_FORMAT_OUTPUT_CANONICAL_NAME,
       AFL_ELEVATION_TOOL_NAME,
       AFL_ELEVATION_CANONICAL_NAME,
     ]);
@@ -630,9 +641,12 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     ];
     const tools = [...configuredTools, ...builtInTools];
     const configuredActiveNames = executionContext.activeToolNames ?? binding.activeToolNames;
-    const activeToolNames = configuredActiveNames === undefined
-      ? undefined
-      : [...new Set([...configuredActiveNames, ...builtInTools.map((tool) => tool.name)])];
+    const activeToolNames = [...new Set([
+      ...(configuredActiveNames ?? configuredTools.map((tool) => tool.name))
+        .filter((name) => name !== AFL_FORMAT_OUTPUT_TOOL_NAME),
+      AFL_TRANSACTION_TOOL_NAME,
+      ...(executionContext.elevation === undefined ? [] : [AFL_ELEVATION_TOOL_NAME]),
+    ])];
     const harness = new AgentHarness<any, Skill, PromptTemplate, AgentHarnessTool<any>>({
       session,
       models: this.models,
@@ -642,7 +656,7 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
       ...((executionContext.toolContext ?? binding.toolContext) === undefined
         ? {}
         : { toolContext: executionContext.toolContext ?? binding.toolContext }),
-      ...(activeToolNames === undefined ? {} : { activeToolNames }),
+      activeToolNames,
       ...(binding.thinkingLevel === undefined ? {} : { thinkingLevel: binding.thinkingLevel }),
       ...(binding.streamOptions === undefined ? {} : { streamOptions: binding.streamOptions }),
       ...((executionContext.resources ?? binding.resources) === undefined
@@ -677,6 +691,22 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
       : resolved;
   }
 
+  private async configureFormatOutput(
+    record: PiSessionRecord,
+    request: AgentExecutionRequest,
+  ): Promise<(() => Promise<void>) | undefined> {
+    if (request.format === undefined) return undefined;
+    const baselineTools = record.harness.getTools();
+    const baselineActiveNames = record.harness.getActiveTools().map((tool) => tool.name);
+    await record.harness.setTools(
+      [...baselineTools, createFormatOutputTool(record.hostRouter, request.format)],
+      baselineActiveNames,
+    );
+    return async () => {
+      await record.harness.setTools(baselineTools, baselineActiveNames);
+    };
+  }
+
   private async configureControlTools(
     record: PiSessionRecord,
     request: AgentExecutionRequest,
@@ -689,6 +719,7 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     const reserved = baselineTools.find((tool) =>
       (tool.name.startsWith("afl.") &&
         tool.name !== AFL_TRANSACTION_CANONICAL_NAME &&
+        tool.name !== AFL_FORMAT_OUTPUT_CANONICAL_NAME &&
         tool.name !== AFL_ELEVATION_CANONICAL_NAME) ||
       aliases.has(tool.name));
     if (reserved !== undefined) {
@@ -720,6 +751,7 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
       [...baselineTools, ...controlTools],
       [
         AFL_TRANSACTION_TOOL_NAME,
+        ...(request.format === undefined ? [] : [AFL_FORMAT_OUTPUT_TOOL_NAME]),
         ...(record.executionContext.elevation === undefined ? [] : [AFL_ELEVATION_TOOL_NAME]),
         ...controlTools.map((tool) => tool.name),
       ],
@@ -733,8 +765,12 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     record: PiSessionRecord,
     request: AgentExecutionRequest,
   ): Promise<(() => Promise<void>) | undefined> {
-    if (request.tools === undefined) return undefined;
     const baselineActiveNames = record.harness.getActiveTools().map((tool) => tool.name);
+    if (request.tools === undefined) {
+      if (request.format === undefined) return undefined;
+      await record.harness.setActiveTools([...baselineActiveNames, AFL_FORMAT_OUTPUT_TOOL_NAME]);
+      return () => record.harness.setActiveTools(baselineActiveNames);
+    }
     const availableNames = new Set(record.harness.getTools().map((tool) => tool.name));
     const requestedNames = request.tools.map(piStandardToolName);
     const missing = requestedNames.find((name) => !availableNames.has(name));
@@ -746,6 +782,7 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     }
     await record.harness.setActiveTools([
       AFL_TRANSACTION_TOOL_NAME,
+      ...(request.format === undefined ? [] : [AFL_FORMAT_OUTPUT_TOOL_NAME]),
       ...(record.executionContext.elevation === undefined || requestedNames.length === 0
         ? []
         : [AFL_ELEVATION_TOOL_NAME]),
@@ -822,7 +859,10 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
       if (isSessionDurabilityEvent(event)) {
         const entries = await record.session.getEntries({ afterEntrySeq: record.sourceEntryCount });
         if (entries.length > 0) {
-          const records = sessionEntriesToRecords(entries);
+          const records = markFormattedOutputRecords(
+            sessionEntriesToRecords(entries),
+            record.hostRouter.activation?.formattedOutput !== undefined,
+          );
           if (records.length > 0) {
             await host.persistContinuation({
               backend: this.name,
@@ -847,6 +887,7 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
   ): () => void {
     const controlNames = new Set(request.control?.tools.map((tool) => piControlToolName(tool.name)) ?? []);
     controlNames.add(AFL_TRANSACTION_TOOL_NAME);
+    if (request.format !== undefined) controlNames.add(AFL_FORMAT_OUTPUT_TOOL_NAME);
     if (record.executionContext.elevation !== undefined) controlNames.add(AFL_ELEVATION_TOOL_NAME);
     return record.harness.on("tool_call", async (event) => {
       this.toolRequestSequence += 1;
@@ -909,7 +950,11 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     });
   }
 
-  private async toResult(record: PiSessionRecord, response: AssistantMessage): Promise<AgentExecutionResult> {
+  private async toResult(
+    record: PiSessionRecord,
+    response: AssistantMessage,
+    activation: PiActivation,
+  ): Promise<AgentExecutionResult> {
     const metadata = await record.session.getMetadata();
     const checkpoint = await record.session.getLeafId();
     const session = {
@@ -923,15 +968,25 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
         response.errorMessage ?? "Pi model execution failed",
       );
     }
-    return {
-      output: contentText(response.content),
-      stopReason: response.stopReason === "length"
+    const stopReason = response.stopReason === "length"
         ? "budget_exhausted"
         : response.stopReason === "aborted"
         ? "cancelled"
         : response.stopReason === "toolUse"
         ? "blocked"
-        : "completed",
+        : "completed";
+    if (stopReason === "completed" && activation.request.format !== undefined &&
+        activation.formattedOutput === undefined) {
+      throw new AgentExecutorError(
+        "AGENT_FORMAT_OUTPUT_MISSING",
+        `Agent '${activation.request.agent.name}' completed without submitting a valid AFL formatted output`,
+      );
+    }
+    return {
+      output: stopReason === "completed" && activation.formattedOutput !== undefined
+        ? activation.formattedOutput
+        : contentText(response.content),
+      stopReason,
       session,
       usage: usageRecord(response.usage),
     };
@@ -956,6 +1011,85 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
   private async deleteRawSession(session: Session): Promise<void> {
     await this.sessionRepo.delete(await session.getMetadata());
   }
+}
+
+function createFormatOutputTool(
+  hostRouter: PiHostRouter,
+  format: AgentOutputFormat,
+): AgentHarnessTool<any> {
+  return {
+    name: AFL_FORMAT_OUTPUT_TOOL_NAME,
+    label: "Format Output",
+    description: "Before finishing, submit the result for this step. You may resubmit; the last accepted value is returned.",
+    parameters: Type.Object({
+      value: formatOutputValueSchema(format),
+    }),
+    executionMode: "sequential",
+    execute: async (toolCallId, params, signal) => {
+      const activation = hostRouter.activation;
+      if (activation === undefined) {
+        throw new AgentExecutorError(
+          "AGENT_CAPABILITY_UNSUPPORTED",
+          "AFL formatted output submission is only available during an active Agent execution",
+        );
+      }
+      const value = (params as { readonly value: unknown }).value;
+      const content = serializeOutputValue(value);
+      const result = await activation.host.submitFormattedOutput({
+        id: toolCallId,
+        content,
+        signal: signal ?? activation.request.signal,
+      });
+      if (result.status === "rejected") {
+        return {
+          content: [{
+            type: "text",
+            text: `Rejected [${result.code}]: ${result.message}. Submit again.`,
+          }],
+          details: { ...result, revision: activation.formatRevision },
+        };
+      }
+      activation.formattedOutput = content;
+      activation.formatRevision += 1;
+      return {
+        content: [{
+          type: "text",
+          text: `Accepted (revision ${activation.formatRevision}).`,
+        }],
+        details: { status: "accepted", revision: activation.formatRevision },
+      };
+    },
+  };
+}
+
+function formatOutputValueSchema(format: AgentOutputFormat): TSchema {
+  if (format.kind === "enum") {
+    const values = format.values.map((value) => Type.Literal(value));
+    return values.length === 1 ? values[0]! : Type.Union(values);
+  }
+  return Type.Object(
+    Object.fromEntries(Object.entries(format.fields).map(([name, description]) => [
+      name,
+      Type.Unknown({ description }),
+    ])),
+    { additionalProperties: false },
+  );
+}
+
+function serializeOutputValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  let serialized: string | undefined;
+  try {
+    serialized = JSON.stringify(value);
+  } catch (error) {
+    throw new AgentExecutorError("AGENT_EXECUTION_FAILED", "AFL formatted output value is not JSON serializable", {
+      cause: error,
+    });
+  }
+  if (serialized === undefined) {
+    throw new AgentExecutorError("AGENT_EXECUTION_FAILED", "AFL formatted output value is not JSON serializable");
+  }
+  return serialized;
 }
 
 function createTransactionRequestTool(hostRouter: PiHostRouter): AgentHarnessTool<any> {
@@ -1206,6 +1340,16 @@ function withoutHistoricalThinking(messages: readonly AgentMessage[]): AgentMess
 function sessionEntriesToRecords(entries: readonly SessionTreeEntry[]): BackendSessionRecord[] {
   const records = entries.flatMap(sessionEntryToRecords);
   return jsonRoundTrip(records) as BackendSessionRecord[];
+}
+
+function markFormattedOutputRecords(
+  records: readonly BackendSessionRecord[],
+  outputSubmitted: boolean,
+): BackendSessionRecord[] {
+  if (!outputSubmitted) return [...records];
+  return records.map((record) => record.type === "assistant" && record.final !== false
+    ? { ...record, canonical: false }
+    : record);
 }
 
 function sessionEntryToRecords(entry: SessionTreeEntry): BackendSessionRecord[] {
@@ -1760,15 +1904,35 @@ function sandboxWorkspaceContextPrompt(workspace: AgentWorkspaceSet, elevationAv
   return lines.join("\n");
 }
 
-function codingTools(): AgentHarnessTool<ExecutionToolContext>[] {
+function codingTools(bashTimeoutSeconds: number): AgentHarnessTool<ExecutionToolContext>[] {
   return [
     createReadTool(),
     createListTool(),
     createSearchTool(),
-    createBashTool(),
+    createBoundedBashTool(bashTimeoutSeconds),
     createEditTool(),
     createWriteTool(),
   ];
+}
+
+function createBoundedBashTool(
+  defaultTimeoutSeconds: number,
+): AgentHarnessTool<ExecutionToolContext> {
+  const base = createBashTool();
+  return {
+    ...base,
+    description: `${base.description} Commands time out after ${defaultTimeoutSeconds} seconds unless a shorter timeout is supplied.`,
+    execute(toolCallId, params, signal, onUpdate, context) {
+      const input = params as Parameters<typeof base.execute>[1];
+      return base.execute(
+        toolCallId,
+        input.timeout === undefined ? { ...input, timeout: defaultTimeoutSeconds } : input,
+        signal,
+        onUpdate,
+        context,
+      );
+    },
+  };
 }
 
 const LIST_TOOL_SCHEMA = Type.Object({
@@ -1877,13 +2041,21 @@ function codingToolBoundaries(
   return { read: boundary, list: boundary, search: boundary, bash: boundary, edit: boundary, write: boundary };
 }
 
-function createCodingToolActionNormalizer(env: ExecutionToolContext["env"]): (
+function createCodingToolActionNormalizer(env: ExecutionToolContext["env"], bashTimeoutSeconds: number): (
   toolName: string,
   input: Readonly<Record<string, unknown>>,
   signal: AbortSignal,
 ) => Promise<Readonly<Record<string, unknown>>> {
   return async (toolName, input, signal) => {
-    if (toolName === "bash") return { ...input, cwd: env.cwd, env: {}, inheritEnv: true };
+    if (toolName === "bash") {
+      return {
+        ...input,
+        timeout: input.timeout ?? bashTimeoutSeconds,
+        cwd: env.cwd,
+        env: {},
+        inheritEnv: true,
+      };
+    }
     if (toolName !== "read" && toolName !== "list" && toolName !== "search" &&
       toolName !== "edit" && toolName !== "write") return input;
     if (typeof input.path !== "string") return input;

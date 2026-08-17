@@ -5,6 +5,7 @@ import type {
   AflModule,
   AflNode,
   AflTerminator,
+  AgentOutputFormat,
   FlowCallExpr,
   FlowTarget,
   ForkAction,
@@ -188,7 +189,8 @@ function prepareLines(
   diagnostics: AflDiagnostic[],
 ): SourceLine[] {
   const result: SourceLine[] = [];
-  source.replace(/\r\n?/gu, "\n").split("\n").forEach((raw, index) => {
+  const rawLines = source.replace(/\r\n?/gu, "\n").split("\n");
+  rawLines.forEach((raw, index) => {
     const lineNumber = index + 1;
     if (raw.includes("\t")) {
       diagnostics.push({
@@ -197,11 +199,14 @@ function prepareLines(
         span: { line: lineNumber, column: 1, endColumn: raw.length + 1 },
         ...(sourceName === undefined ? {} : { sourceName }),
       });
-      return;
     }
-    const withoutComment = stripComment(raw).trimEnd();
+  });
+  for (let index = 0; index < rawLines.length; index += 1) {
+    const raw = rawLines[index]!;
+    const lineNumber = index + 1;
+    const withoutComment = stripComments(raw).trimEnd();
     if (withoutComment.trim().length === 0) {
-      return;
+      continue;
     }
     const indent = withoutComment.length - withoutComment.trimStart().length;
     if (indent % 4 !== 0) {
@@ -211,34 +216,176 @@ function prepareLines(
         span: { line: lineNumber, column: 1, endColumn: indent + 1 },
         ...(sourceName === undefined ? {} : { sourceName }),
       });
-      return;
+      continue;
     }
+    let logical = withoutComment.slice(indent);
+    let structure = analyzeStructure(logical);
+    const mayContinue = indent >= 8 && structure.quote === undefined &&
+      structure.depth === 0 && logical.trimEnd().endsWith(",");
+    if (structure.quote === "'''" || mayContinue) {
+      while (index + 1 < rawLines.length) {
+        index += 1;
+        logical += `\n${rawLines[index]!}`;
+        const uncommented = stripComments(logical).trimEnd();
+        structure = analyzeStructure(uncommented);
+        if (structure.quote === "'''" || structure.depth > 0) continue;
+        logical = uncommented;
+        if (structure.quote === undefined && logical.trimEnd().endsWith(",")) continue;
+        break;
+      }
+    }
+    logical = collapseStructuralNewlines(stripComments(logical).trimEnd());
     result.push({
       number: lineNumber,
       indent,
-      text: withoutComment.slice(indent),
-      span: { line: lineNumber, column: indent + 1, endColumn: withoutComment.length + 1 },
+      text: logical,
+      span: { line: lineNumber, column: indent + 1, endColumn: raw.length + 1 },
     });
-  });
+  }
   return result;
 }
 
-function stripComment(line: string): string {
-  let quoted = false;
+type QuoteKind = "\"" | "'" | "'''";
+
+interface StructureState {
+  readonly quote?: QuoteKind;
+  readonly depth: number;
+}
+
+function stripComments(text: string): string {
+  let quote: QuoteKind | undefined;
   let escaped = false;
-  for (let index = 0; index < line.length; index += 1) {
-    const char = line[index]!;
+  let commenting = false;
+  let result = "";
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]!;
+    if (commenting) {
+      if (char === "\n") {
+        commenting = false;
+        result += char;
+      }
+      continue;
+    }
     if (escaped) {
       escaped = false;
-    } else if (char === "\\" && quoted) {
+      result += char;
+      continue;
+    }
+    if (quote !== undefined && char === "\\") {
       escaped = true;
-    } else if (char === '"') {
-      quoted = !quoted;
-    } else if (char === "#" && !quoted) {
-      return line.slice(0, index);
+      result += char;
+      continue;
+    }
+    if (quote === "'''" && text.startsWith("'''", index)) {
+      quote = undefined;
+      result += "'''";
+      index += 2;
+      continue;
+    }
+    if (quote === char && quote !== "'''") {
+      quote = undefined;
+      result += char;
+      continue;
+    }
+    if (quote === undefined && text.startsWith("'''", index)) {
+      quote = "'''";
+      result += "'''";
+      index += 2;
+      continue;
+    }
+    if (quote === undefined && (char === '"' || char === "'")) {
+      quote = char;
+      result += char;
+      continue;
+    }
+    if (quote === undefined && char === "#") {
+      commenting = true;
+      continue;
+    }
+    result += char;
+  }
+  return result;
+}
+
+function analyzeStructure(text: string): StructureState {
+  let quote: QuoteKind | undefined;
+  let escaped = false;
+  let depth = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]!;
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (quote !== undefined && char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (quote === "'''" && text.startsWith("'''", index)) {
+      quote = undefined;
+      index += 2;
+      continue;
+    }
+    if (quote === char && quote !== "'''") {
+      quote = undefined;
+      continue;
+    }
+    if (quote !== undefined) continue;
+    if (text.startsWith("'''", index)) {
+      quote = "'''";
+      index += 2;
+    } else if (char === '"' || char === "'") {
+      quote = char;
+    } else if ("([{".includes(char)) {
+      depth += 1;
+    } else if (")]}".includes(char)) {
+      depth -= 1;
     }
   }
-  return line;
+  return { ...(quote === undefined ? {} : { quote }), depth };
+}
+
+function collapseStructuralNewlines(text: string): string {
+  let quote: QuoteKind | undefined;
+  let escaped = false;
+  let result = "";
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]!;
+    if (escaped) {
+      escaped = false;
+      result += char;
+      continue;
+    }
+    if (quote !== undefined && char === "\\") {
+      escaped = true;
+      result += char;
+      continue;
+    }
+    if (quote === "'''" && text.startsWith("'''", index)) {
+      quote = undefined;
+      result += "'''";
+      index += 2;
+      continue;
+    }
+    if (quote === char && quote !== "'''") {
+      quote = undefined;
+      result += char;
+      continue;
+    }
+    if (quote === undefined && text.startsWith("'''", index)) {
+      quote = "'''";
+      result += "'''";
+      index += 2;
+      continue;
+    }
+    if (quote === undefined && (char === '"' || char === "'")) {
+      quote = char;
+      result += char;
+      continue;
+    }
+    result += char === "\n" && quote !== "'''" ? " " : char;
+  }
+  return result;
 }
 
 function parseStatement(line: SourceLine, sourceName?: string): AflInstruction | AflTerminator {
@@ -304,7 +451,7 @@ function parseStatement(line: SourceLine, sourceName?: string): AflInstruction |
     };
   }
 
-  const memoryAppend = /^(.+)\.append\s+(.+)$/u.exec(line.text);
+  const memoryAppend = /^(.+)\.append\s+([\s\S]+)$/u.exec(line.text);
   if (memoryAppend !== null) {
     const operands = requireOperandCount(
       splitRequiredItems(memoryAppend[2]!, line, sourceName, "Memory append"),
@@ -324,7 +471,7 @@ function parseStatement(line: SourceLine, sourceName?: string): AflInstruction |
     };
   }
 
-  const systemPrompt = /^([A-Za-z_][A-Za-z0-9_]*)\.system_prompt\s+(.+)$/u.exec(line.text);
+  const systemPrompt = /^([A-Za-z_][A-Za-z0-9_]*)\.system_prompt\s+([\s\S]+)$/u.exec(line.text);
   if (systemPrompt !== null) {
     return {
       op: "agent.system_prompt",
@@ -368,7 +515,7 @@ function parseAssignedInstruction(
     };
   }
 
-  const agentWork = /^([A-Za-z_][A-Za-z0-9_]*)\.do\s+(.+)$/u.exec(rhs);
+  const agentWork = /^([A-Za-z_][A-Za-z0-9_]*)\.do\s+([\s\S]+)$/u.exec(rhs);
   if (agentWork !== null) {
     return {
       op: "agent.do",
@@ -481,7 +628,7 @@ function parseAssignedInstruction(
     };
   }
 
-  const fork = /^([A-Za-z_][A-Za-z0-9_]*)\.fork\s+(.+)$/u.exec(rhs);
+  const fork = /^([A-Za-z_][A-Za-z0-9_]*)\.fork\s+([\s\S]+)$/u.exec(rhs);
   if (fork !== null) {
     const action: ForkAction = {
       ...parseAgentWorkOperands(fork[2]!, line, sourceName, "Agent fork"),
@@ -537,7 +684,7 @@ function parseAssignedInstruction(
     };
   }
 
-  const agentControl = /^([A-Za-z_][A-Za-z0-9_]*)\.(route|flow)\s+(.+)$/u.exec(rhs);
+  const agentControl = /^([A-Za-z_][A-Za-z0-9_]*)\.(route|flow)\s+([\s\S]+)$/u.exec(rhs);
   if (agentControl !== null) {
     return parseAgentControlInstruction(
       dst,
@@ -599,24 +746,84 @@ function parseAgentWorkOperands(
   line: SourceLine,
   sourceName: string | undefined,
   label: string,
-): { role?: string; input: ValueExpr; schema?: SymbolExpr } {
+): { role?: string; input: ValueExpr; format?: AgentOutputFormat } {
   const operands = splitRequiredItems(text, line, sourceName, label);
   if (operands.length < 1 || operands.length > 2) {
     throw parseError("PARSE_AGENT_WORK", `${label} expects input and optional options`, line, sourceName);
   }
   const options = operands[1] === undefined
     ? new Map<string, string>()
-    : parseOptions(operands[1], line, sourceName, `${label} options`, ["role", "schema"]);
+    : parseOptions(operands[1], line, sourceName, `${label} options`, ["role", "format"]);
   const role = options.get("role")?.trim();
   if (role !== undefined) requireRole(role, line, sourceName);
-  const schema = options.get("schema") === undefined
+  const format = options.get("format") === undefined
     ? undefined
-    : parseSchema(options.get("schema")!, line, sourceName);
+    : parseAgentOutputFormat(options.get("format")!, line, sourceName, label);
   return {
     ...(role === undefined ? {} : { role }),
     input: parseValue(operands[0]!, line, sourceName),
-    ...(schema === undefined ? {} : { schema }),
+    ...(format === undefined ? {} : { format }),
   };
+}
+
+function parseAgentOutputFormat(
+  text: string,
+  line: SourceLine,
+  sourceName: string | undefined,
+  label: string,
+): AgentOutputFormat {
+  const value = parseValue(text, line, sourceName);
+  if (value.kind === "list") {
+    if (value.items.length === 0) {
+      throw parseError("PARSE_AGENT_FORMAT", `${label} enum format cannot be empty`, line, sourceName);
+    }
+    const values = value.items.map((item) => {
+      if (item.kind !== "literal" || typeof item.value !== "string" || item.value.length === 0) {
+        throw parseError(
+          "PARSE_AGENT_FORMAT",
+          `${label} enum format must contain only non-empty string literals`,
+          line,
+          sourceName,
+        );
+      }
+      return item.value;
+    });
+    if (new Set(values).size !== values.length) {
+      throw parseError("PARSE_AGENT_FORMAT", `${label} enum format cannot contain duplicate values`, line, sourceName);
+    }
+    return { kind: "enum", values };
+  }
+  if (value.kind === "record") {
+    const entries = Object.entries(value.entries);
+    if (entries.length === 0) {
+      throw parseError("PARSE_AGENT_FORMAT", `${label} object format cannot be empty`, line, sourceName);
+    }
+    const fields: Record<string, string> = {};
+    for (const [name, description] of entries) {
+      if (name.length === 0 || description.kind !== "literal" ||
+          typeof description.value !== "string" || description.value.trim().length === 0) {
+        throw parseError(
+          "PARSE_AGENT_FORMAT",
+          `${label} object format requires non-empty field names and string descriptions`,
+          line,
+          sourceName,
+        );
+      }
+      Object.defineProperty(fields, name, {
+        value: description.value,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    }
+    return { kind: "object", fields };
+  }
+  throw parseError(
+    "PARSE_AGENT_FORMAT",
+    `${label} format must be a string enum list or a field-description record`,
+    line,
+    sourceName,
+  );
 }
 
 function parseAgentControlInstruction(
@@ -866,9 +1073,9 @@ function parsePath(text: string, line: SourceLine, sourceName?: string): Array<s
       rest = field[2]!;
       continue;
     }
-    const index = /^\[(\d+|"(?:[^"\\]|\\.)*")\](.*)$/u.exec(rest);
+    const index = /^\[(\d+|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')\](.*)$/u.exec(rest);
     if (index !== null) {
-      path.push(index[1]!.startsWith('"') ? JSON.parse(index[1]!) as string : Number(index[1]));
+      path.push(/^['"]/u.test(index[1]!) ? parseStringLiteral(index[1]!, line, sourceName) : Number(index[1]));
       rest = index[2]!;
       continue;
     }
@@ -879,7 +1086,7 @@ function parsePath(text: string, line: SourceLine, sourceName?: string): Array<s
 
 function parseValue(text: string, line: SourceLine, sourceName?: string): ValueExpr {
   const value = text.trim();
-  if (value.startsWith('"')) {
+  if (value.startsWith('"') || value.startsWith("'")) {
     return { kind: "literal", value: parseStringLiteral(value, line, sourceName), span: line.span };
   }
   if (value === "true" || value === "false") {
@@ -912,7 +1119,7 @@ function parseValue(text: string, line: SourceLine, sourceName?: string): ValueE
       for (const item of items) {
         const colon = findTopLevelCharacter(item, ":");
         const rawKey = item.slice(0, colon).trim();
-        const quotedKey = rawKey.startsWith('"');
+        const quotedKey = rawKey.startsWith('"') || rawKey.startsWith("'");
         const key = quotedKey ? parseStringLiteral(rawKey, line, sourceName) : rawKey;
         if (!quotedKey) requireName(key, line, sourceName, "record key");
         if (Object.hasOwn(entries, key)) {
@@ -938,6 +1145,21 @@ function parseValue(text: string, line: SourceLine, sourceName?: string): ValueE
 
 function parseStringLiteral(text: string, line: SourceLine, sourceName?: string): string {
   const value = text.trim();
+  if (value.startsWith("'''")) {
+    const end = stringLiteralEnd(value, 0);
+    if (end !== value.length) {
+      throw parseError("PARSE_STRING", "invalid triple-quoted string literal", line, sourceName);
+    }
+    const content = normalizeTripleString(value.slice(3, -3), line.indent);
+    return decodeSingleQuotedContent(content, line, sourceName);
+  }
+  if (value.startsWith("'")) {
+    const end = stringLiteralEnd(value, 0);
+    if (end !== value.length) {
+      throw parseError("PARSE_STRING", "invalid single-quoted string literal", line, sourceName);
+    }
+    return decodeSingleQuotedContent(value.slice(1, -1), line, sourceName);
+  }
   try {
     const parsed: unknown = JSON.parse(value);
     if (typeof parsed !== "string") {
@@ -947,6 +1169,70 @@ function parseStringLiteral(text: string, line: SourceLine, sourceName?: string)
   } catch (error) {
     throw parseError("PARSE_STRING", `invalid JSON string literal '${value}'`, line, sourceName, error);
   }
+}
+
+function normalizeTripleString(content: string, alignment: number): string {
+  const lines = content.split("\n");
+  for (let index = 1; index < lines.length; index += 1) {
+    lines[index] = stripAlignedIndent(lines[index]!, alignment);
+  }
+  if (lines[0] === "") lines.shift();
+  if (lines.at(-1) === "") lines.pop();
+  return lines.join("\n");
+}
+
+function stripAlignedIndent(text: string, alignment: number): string {
+  let index = 0;
+  while (index < text.length && index < alignment && text[index] === " ") {
+    index += 1;
+  }
+  return text.slice(index);
+}
+
+function decodeSingleQuotedContent(
+  content: string,
+  line: SourceLine,
+  sourceName?: string,
+): string {
+  let result = "";
+  for (let index = 0; index < content.length; index += 1) {
+    const char = content[index]!;
+    if (char !== "\\") {
+      result += char;
+      continue;
+    }
+    const escaped = content[index + 1];
+    if (escaped === undefined) {
+      throw parseError("PARSE_STRING", "string literal ends with an incomplete escape", line, sourceName);
+    }
+    const simple: Record<string, string> = {
+      "\\": "\\",
+      "'": "'",
+      '"': '"',
+      "/": "/",
+      b: "\b",
+      f: "\f",
+      n: "\n",
+      r: "\r",
+      t: "\t",
+    };
+    if (simple[escaped] !== undefined) {
+      result += simple[escaped];
+      index += 1;
+      continue;
+    }
+    if (escaped === "u") {
+      const digits = content.slice(index + 2, index + 6);
+      if (!/^[0-9a-fA-F]{4}$/u.test(digits)) {
+        throw parseError("PARSE_STRING", "string literal has an invalid Unicode escape", line, sourceName);
+      }
+      result += String.fromCharCode(Number.parseInt(digits, 16));
+      index += 5;
+      continue;
+    }
+    throw parseError("PARSE_STRING", `string literal has an unknown escape '\\${escaped}'`, line, sourceName);
+  }
+  return result;
 }
 
 function parseOper(text: string, line: SourceLine, sourceName?: string): OperExpr {
@@ -974,21 +1260,13 @@ function tokenizeOper(text: string, line: SourceLine, sourceName?: string): Oper
       index += 1;
       continue;
     }
-    if (char === '"') {
-      let end = index + 1;
-      let escaped = false;
-      while (end < text.length) {
-        const current = text[end]!;
-        if (escaped) escaped = false;
-        else if (current === "\\") escaped = true;
-        else if (current === '"') break;
-        end += 1;
-      }
-      if (end >= text.length) {
+    if (char === '"' || char === "'") {
+      const end = stringLiteralEnd(text, index);
+      if (end < 0) {
         throw parseError("PARSE_OPER_STRING", "unterminated string in oper expression", line, sourceName);
       }
-      tokens.push({ type: "literal", value: text.slice(index, end + 1) });
-      index = end + 1;
+      tokens.push({ type: "literal", value: text.slice(index, end) });
+      index = end;
       continue;
     }
     const operator = ["==", "!=", "<=", ">=", "|", "&", "!", "<", ">", "+", "-", "*", "/"]
@@ -1014,7 +1292,7 @@ function tokenizeOper(text: string, line: SourceLine, sourceName?: string): Oper
       index += number[0].length;
       continue;
     }
-    const name = /^[A-Za-z_][A-Za-z0-9_]*(?:(?:\.[A-Za-z_][A-Za-z0-9_]*)|(?:\[(?:\d+|"(?:[^"\\]|\\.)*")\]))*/u.exec(text.slice(index));
+    const name = /^[A-Za-z_][A-Za-z0-9_]*(?:(?:\.[A-Za-z_][A-Za-z0-9_]*)|(?:\[(?:\d+|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')\]))*/u.exec(text.slice(index));
     if (name !== null) {
       const type = new Set(["true", "false", "null"]).has(name[0]) ? "literal" : "name";
       tokens.push({ type, value: name[0] });
@@ -1113,44 +1391,36 @@ function precedenceOf(operator: string): number {
 }
 
 function splitAssignment(text: string): [string, string] | undefined {
-  let quoted = false;
-  let escaped = false;
   let depth = 0;
-  for (let index = 0; index < text.length; index += 1) {
-    const char = text[index]!;
-    if (escaped) escaped = false;
-    else if (char === "\\" && quoted) escaped = true;
-    else if (char === '"') quoted = !quoted;
-    else if (!quoted && "([{ ".includes(char) && char !== " ") depth += 1;
-    else if (!quoted && ")] }".includes(char) && char !== " ") depth -= 1;
+  let assignment: [string, string] | undefined;
+  forEachUnquoted(text, (index, char) => {
+    if ("([{".includes(char)) depth += 1;
+    else if (")]}".includes(char)) depth -= 1;
     else if (
-      !quoted && depth === 0 && char === "=" &&
+      depth === 0 && char === "=" &&
       text[index - 1] !== "=" && text[index + 1] !== "="
     ) {
-      return [text.slice(0, index).trim(), text.slice(index + 1).trim()];
+      assignment = [text.slice(0, index).trim(), text.slice(index + 1).trim()];
+      return false;
     }
-  }
-  return undefined;
+    return true;
+  });
+  return assignment;
 }
 
 export function splitTopLevel(text: string): string[] {
   const values: string[] = [];
-  let quoted = false;
-  let escaped = false;
   let depth = 0;
   let start = 0;
-  for (let index = 0; index < text.length; index += 1) {
-    const char = text[index]!;
-    if (escaped) escaped = false;
-    else if (char === "\\" && quoted) escaped = true;
-    else if (char === '"') quoted = !quoted;
-    else if (!quoted && "([{ ".includes(char) && char !== " ") depth += 1;
-    else if (!quoted && ")] }".includes(char) && char !== " ") depth -= 1;
-    else if (!quoted && depth === 0 && char === ",") {
+  forEachUnquoted(text, (index, char) => {
+    if ("([{".includes(char)) depth += 1;
+    else if (")]}".includes(char)) depth -= 1;
+    else if (depth === 0 && char === ",") {
       values.push(text.slice(start, index).trim());
       start = index + 1;
     }
-  }
+    return true;
+  });
   values.push(text.slice(start).trim());
   return values;
 }
@@ -1169,17 +1439,53 @@ function splitRequiredItems(
 }
 
 function findTopLevelCharacter(text: string, target: string): number {
-  let quoted = false;
-  let escaped = false;
   let depth = 0;
+  let found = -1;
+  forEachUnquoted(text, (index, char) => {
+    if (depth === 0 && char === target) {
+      found = index;
+      return false;
+    }
+    if ("([{".includes(char)) depth += 1;
+    else if (")]}".includes(char)) depth -= 1;
+    return true;
+  });
+  return found;
+}
+
+function forEachUnquoted(
+  text: string,
+  visit: (index: number, char: string) => boolean,
+): void {
   for (let index = 0; index < text.length; index += 1) {
     const char = text[index]!;
-    if (escaped) escaped = false;
-    else if (char === "\\" && quoted) escaped = true;
-    else if (char === '"') quoted = !quoted;
-    else if (!quoted && depth === 0 && char === target) return index;
-    else if (!quoted && "([{ ".includes(char) && char !== " ") depth += 1;
-    else if (!quoted && ")] }".includes(char) && char !== " ") depth -= 1;
+    if (char === '"' || char === "'") {
+      const end = stringLiteralEnd(text, index);
+      if (end < 0) return;
+      index = end - 1;
+      continue;
+    }
+    if (!visit(index, char)) return;
+  }
+}
+
+function stringLiteralEnd(text: string, start: number): number {
+  const triple = text.startsWith("'''", start);
+  const quote = text[start];
+  if (quote !== '"' && quote !== "'") return -1;
+  let escaped = false;
+  for (let index = start + (triple ? 3 : 1); index < text.length; index += 1) {
+    const char = text[index]!;
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (triple && text.startsWith("'''", index)) return index + 3;
+    if (!triple && char === quote) return index + 1;
   }
   return -1;
 }

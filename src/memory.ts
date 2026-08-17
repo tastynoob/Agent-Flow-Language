@@ -179,5 +179,6 @@ function childCanonicalContext(
   if (key === "documentation" && "blocks" in parent && "parameters" in parent) return "data";
   if (key === "value" && "kind" in parent && parent.kind === "literal") return "data";
   if (key === "entries" && "kind" in parent && parent.kind === "record") return "recordEntries";
+  if (key === "fields" && "kind" in parent && parent.kind === "object") return "data";
   return "ir";
 }

@@ -50,7 +50,7 @@ worker(task):
         agent = agent @agent.worker
         agent.system_prompt "work"
         request = prompt @prompt.task, task
-        result = agent.do request, [role: user, schema: @schema.Result]
+        result = agent.do request, [role: user, format: [status: "Completion state", value: "Result payload"]]
         ret result
 
 main(task):
@@ -79,6 +79,208 @@ main(task):
   assert.deepEqual(module.nodes.map((node) => node.name), ["worker", "main"]);
   assert.equal(module.nodes[1].blocks[0].instructions[2].op, "dispatch");
   assert.equal(module.nodes[1].blocks[1].instructions[1].op, "fork");
+});
+
+test("single and triple-quoted strings preserve useful text without JSON escapes", async () => {
+  const vm = AflVm.fromSource(`
+main():
+    entry:
+        label = prompt 'can\\'t # stop'
+        record = oper ['dash-key': 'value']
+        matches = oper record['dash-key'] == 'value'
+        text = prompt '''
+        first line
+            indented line
+        # literal comment
+        '''
+        ret text
+`, {});
+
+  const result = await vm.run();
+  assert.equal(result.output.content, "first line\n    indented line\n# literal comment");
+  const module = vm.module;
+  assert.equal(module.nodes[0].blocks[0].instructions[0].source.value, "can't # stop");
+  assert.equal(module.nodes[0].blocks[0].instructions[2].expression.kind, "binary");
+});
+
+test("tabs are rejected even inside triple-quoted strings", () => {
+  assert.throws(() => parseAfl(`
+main():
+    entry:
+        text = prompt '''
+\tcontent
+        '''
+        ret text
+`), (error) => error instanceof AflParseError &&
+    error.diagnostics.some((item) => item.code === "PARSE_TAB_INDENT"));
+});
+
+test("a top-level trailing comma opens an indented instruction continuation", () => {
+  const module = parseAfl(`
+worker(task):
+    entry:
+        ret task
+
+main(task):
+    entry:
+        planner = agent @agent.planner
+        jobs = planner.route 'route work',
+            [nodes: [
+                worker
+            ],
+            params: [
+                task: task,
+                config: [
+                    mode: 'fast',
+                    labels: ['a', 'b']
+                ]
+            ],
+            min_routes: 1,
+            max_routes: 2]
+        ret jobs
+`);
+
+  const route = module.nodes[1].blocks[0].instructions[1];
+  assert.equal(route.op, "agent.route");
+  assert.equal(route.prompt.value, "route work");
+  assert.equal(route.nodes[0].name, "worker");
+  assert.equal(route.params.entries.config.kind, "record");
+  assert.equal(route.params.entries.config.entries.labels.kind, "list");
+  assert.equal(route.minRoutes.value, 1);
+  assert.equal(route.maxRoutes.value, 2);
+});
+
+test("an open collection does not enable instruction continuation without a trailing comma", () => {
+  assert.throws(() => parseAfl(`
+main():
+    entry:
+        value = prompt [
+            'one',
+            'two'
+        ]
+        ret value
+`), (error) => {
+    assert.equal(error instanceof AflParseError, true);
+    return true;
+  });
+});
+
+test("Agent work accepts inline enum and object formats", () => {
+  const module = parseAfl(`
+main():
+    entry:
+        reviewer = agent @agent.reviewer
+        status = reviewer.do 'review', [format: ['finish', 'error']]
+        report = reviewer.do 'report',
+            [format: [
+                type: 'Result type',
+                value: 'Result payload'
+            ]]
+        ret report
+`);
+  assert.deepEqual(module.nodes[0].blocks[0].instructions[1].format, {
+    kind: "enum",
+    values: ["finish", "error"],
+  });
+  assert.deepEqual(module.nodes[0].blocks[0].instructions[2].format, {
+    kind: "object",
+    fields: { type: "Result type", value: "Result payload" },
+  });
+
+  assert.throws(() => parseAfl(`
+main():
+    entry:
+        reviewer = agent @agent.reviewer
+        result = reviewer.do 'review', [format: []]
+        ret result
+`), (error) => error instanceof AflParseError &&
+    error.diagnostics.some((item) => item.code === "PARSE_AGENT_FORMAT"));
+
+  assert.throws(() => parseAfl(`
+main():
+    entry:
+        reviewer = agent @agent.reviewer
+        result = reviewer.do 'review', [format: [finish, 'error']]
+        ret result
+`), (error) => error instanceof AflParseError &&
+    error.diagnostics.some((item) => item.code === "PARSE_AGENT_FORMAT"));
+
+  assert.throws(() => parseAfl(`
+main():
+    entry:
+        reviewer = agent @agent.reviewer
+        result = reviewer.do 'review', [schema: @schema.Result]
+        ret result
+`), (error) => error instanceof AflParseError &&
+    error.diagnostics.some((item) => item.code === "PARSE_OPTIONS_FIELD"));
+});
+
+test("inline output format data participates fully in the module digest", () => {
+  const source = (description) => parseAfl(`
+main():
+    entry:
+        reviewer = agent @agent.reviewer
+        result = reviewer.do 'review', [format: [span: '${description}']]
+        ret result
+`);
+  assert.notEqual(canonicalModuleDigest(source("first")), canonicalModuleDigest(source("second")));
+});
+
+test("VM validates formatted candidates against the inline object contract", async () => {
+  const backend = {
+    name: "format-test",
+    capabilities: {
+      nativeSession: false,
+      checkpoint: false,
+      fork: false,
+      workspaceContext: true,
+      readOnlyWorkspaceContext: true,
+      structuredOutput: true,
+      interrupt: true,
+      dynamicControlTools: false,
+      standardTools: false,
+      interactiveApproval: false,
+      sandboxEnforcement: false,
+    },
+    memory: {
+      capabilities: { roleSchemas: ["afl.message-role/v0"], importRoles: ["*"] },
+      validateImport() {},
+    },
+    async execute(request, host) {
+      assert.deepEqual(request.format, {
+        kind: "object",
+        fields: { type: "Result type", value: "Result payload" },
+      });
+      const rejected = await host.submitFormattedOutput({
+        id: "bad",
+        content: '{"type":"finish","extra":true}',
+        signal: request.signal,
+      });
+      assert.equal(rejected.status, "rejected");
+      assert.equal(rejected.code, "AGENT_FORMAT_OBJECT_INVALID");
+      const output = '{"type":"finish","value":42}';
+      assert.deepEqual(await host.submitFormattedOutput({
+        id: "good",
+        content: output,
+        signal: request.signal,
+      }), { status: "accepted" });
+      return { output, stopReason: "completed" };
+    },
+  };
+  const vm = AflVm.fromSource(`
+main():
+    entry:
+        worker = agent @agent.worker
+        result = worker.do 'work', [format: [type: 'Result type', value: 'Result payload']]
+        ret result
+`, { agentExecutor: backend });
+
+  const result = await vm.run();
+  assert.deepEqual(result.output, {
+    kind: "frag",
+    content: '{"type":"finish","value":42}',
+    output: "formatted",
+  });
 });
 
 test("parser uses bracket literals for both lists and records", async () => {

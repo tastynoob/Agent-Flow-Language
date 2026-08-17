@@ -1,5 +1,5 @@
 import type { AgentAdapter, AgentRunRequest } from "./adapters.js";
-import type { AgentStandardToolName, ComputeValue, SymbolRef } from "./ir.js";
+import type { AgentOutputFormat, AgentStandardToolName, ComputeValue, SymbolRef } from "./ir.js";
 import {
   AFL_MESSAGE_ROLE_SCHEMA,
   type AgentMemoryContract,
@@ -54,7 +54,7 @@ export interface AgentExecutionRequest {
   readonly tools?: readonly AgentStandardToolName[];
   readonly session?: BackendSessionRef;
   readonly sessionMemoryRevision?: number;
-  readonly schema?: SymbolRef;
+  readonly format?: AgentOutputFormat;
   readonly control?: AgentControlActivation;
   readonly signal: AbortSignal;
 }
@@ -81,6 +81,16 @@ export interface AgentControlToolResult {
   readonly content: string;
   readonly details?: ComputeValue;
 }
+
+export interface AgentFormatOutputSubmissionRequest {
+  readonly id: string;
+  readonly content: string;
+  readonly signal: AbortSignal;
+}
+
+export type AgentFormatOutputSubmissionResult =
+  | { readonly status: "accepted" }
+  | { readonly status: "rejected"; readonly code: string; readonly message: string };
 
 export type AgentExecutionStopReason =
   | "completed"
@@ -168,6 +178,9 @@ export interface AgentExecutionHost {
   requestElevation(request: AgentElevationRequest): Promise<AgentToolAuthorization>;
   requestTransaction(request: AgentTransactionRequest): Promise<AgentTransactionResult>;
   requestInput(request: AgentInputRequest): Promise<string>;
+  submitFormattedOutput(
+    request: AgentFormatOutputSubmissionRequest,
+  ): Promise<AgentFormatOutputSubmissionResult>;
   executeControlTool(request: AgentControlToolRequest): Promise<AgentControlToolResult>;
 }
 
@@ -206,6 +219,7 @@ export type AgentExecutorErrorCode =
   | "AGENT_CAPABILITY_UNSUPPORTED"
   | "AGENT_SESSION_INVALID"
   | "AGENT_MEMORY_REVISION_INVALID"
+  | "AGENT_FORMAT_OUTPUT_MISSING"
   | "AGENT_MEMORY_ROLE_UNSUPPORTED"
   | "AGENT_TOOL_POLICY_DENIED"
   | "AGENT_TOOL_POLICY_FAILED"
@@ -280,7 +294,7 @@ export class AgentAdapterExecutorBackend implements AgentExecutorBackend {
       ...(request.systemPrompt === undefined ? {} : { systemPrompt: request.systemPrompt }),
       workspace: request.workspace,
       messages: request.memory,
-      ...(request.schema === undefined ? {} : { schema: request.schema }),
+      ...(request.format === undefined ? {} : { format: request.format }),
       signal: request.signal,
     };
     const result = await this.adapter.run(adapterRequest);

@@ -311,7 +311,10 @@ export class FileMemoryStateStore implements MemoryStateStore {
     let resolved: PersistedMemorySlot;
     const records: BackendSessionRecord[] = [];
     if (isMessagePrefix(current.messages, requested.messages)) {
-      records.push(...requested.messages.slice(current.revision).map((message) => outputRecord(message)));
+      records.push(...requested.messages.slice(current.revision).map((message, index) => outputRecord(
+        message,
+        (requested.continuation?.memoryRevision ?? 0) >= current.revision + index + 1,
+      )));
       resolved = cloneSlot(requested);
     } else if (isMessagePrefix(requested.messages, current.messages)) {
       resolved = cloneSlot(current);
@@ -1018,7 +1021,9 @@ function parseMemoryStream(
       continue;
     }
     if (raw.type === "assistant") {
-      slot = appendContinuationRecord(slot, raw as BackendSessionRecord, executor, format, header.key);
+      if (raw.continuation !== false) {
+        slot = appendContinuationRecord(slot, raw as BackendSessionRecord, executor, format, header.key);
+      }
       if (isFinalAssistantRecord(raw)) {
         slot = appendSlotMessage(slot, { role: "assistant", content: assistantRecordText(raw, header.key) });
         if (slot.continuation !== undefined) {
@@ -1168,6 +1173,7 @@ function projectCanonicalRecord(
 }
 
 function isFinalAssistantRecord(record: Record<string, unknown>): boolean {
+  if (record.canonical === false) return false;
   if (record.final === true) return true;
   return "text" in record && !("content" in record) && record.final !== false;
 }
@@ -1203,9 +1209,13 @@ function inputRecord(message: Message): BackendSessionRecord {
     : { type: "input", role: message.role, text: encodeText(message.content) };
 }
 
-function outputRecord(message: Message): BackendSessionRecord {
+function outputRecord(message: Message, continuationSynchronized = false): BackendSessionRecord {
   return message.role === "assistant"
-    ? { type: "assistant", text: encodeText(message.content) }
+    ? {
+        type: "assistant",
+        text: encodeText(message.content),
+        ...(continuationSynchronized ? { continuation: false } : {}),
+      }
     : { type: "append", role: message.role, text: encodeText(message.content) };
 }
 

@@ -163,7 +163,7 @@ test("builder emits VM built-in compute calls", async () => {
   assert.deepEqual(execution.output, { status: "finish" });
 });
 
-test("Agent options preserve role, schema, and an explicit Memory", () => {
+test("Agent options preserve role, inline formats, and an explicit Memory", () => {
   const builder = new AflIrBuilder();
   builder.node("main", ["task"]);
   const seed = builder.agent("@agent.seed", { name: "seed" });
@@ -175,20 +175,26 @@ test("Agent options preserve role, schema, and an explicit Memory", () => {
   const result = reviewer.do(builder.ref("task"), {
     name: "result",
     role: "@role.review",
-    schema: "@schema.Review",
+    format: { type: "Result type", value: "Result payload" },
   });
+  reviewer.do("summarize", { name: "status", format: ["finish", "error"] });
   builder.ret(result);
 
   const source = builder.build();
   assert.match(source, /reviewer = agent @agent\.reviewer, \[memory: review_memory\]/u);
-  assert.match(source, /result = reviewer\.do task, \[role: @role\.review, schema: @schema\.Review\]/u);
+  assert.match(source, /result = reviewer\.do task, \[role: @role\.review, format: \[type: "Result type", value: "Result payload"\]\]/u);
+  assert.match(source, /status = reviewer\.do "summarize", \[format: \["finish", "error"\]\]/u);
 
   const invalid = new AflIrBuilder();
   invalid.node("main");
   const coder = invalid.agent("@agent.coder");
   assert.throws(
-    () => coder.do("review", { schema: "@prompt.not_a_schema" }),
-    /must start with '@schema\.'/u,
+    () => coder.do("review", { format: [] }),
+    /one or more non-empty strings/u,
+  );
+  assert.throws(
+    () => coder.do("review", { format: { result: "" } }),
+    /non-empty field names and string descriptions/u,
   );
 });
 

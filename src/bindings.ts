@@ -30,6 +30,7 @@ export interface PiRuntimeProfile {
   readonly maxRetries?: number;
   readonly maxRetryDelayMs?: number;
   readonly cacheRetention?: NonNullable<PiCodingAgentBindingOptions["streamOptions"]>["cacheRetention"];
+  readonly bashTimeoutSeconds?: number;
   readonly elevation?: boolean;
   readonly sandbox?: false | "bubblewrap" | PiBubblewrapSandboxOptions;
 }
@@ -132,7 +133,7 @@ export function defineCapabilities(definitions: CapabilityDefinitions): Capabili
       if (!isComputeValue(result)) {
         throw new TypeError(`Capability '${request.capability.name}' returned a non-portable value`);
       }
-      return typeof result === "string" ? result : frag(JSON.stringify(result));
+      return typeof result === "string" ? result : frag(JSON.stringify(result), "formatted");
     },
   };
 }
@@ -170,6 +171,7 @@ function piBinding(profile: PiRuntimeProfile, fallbackModel: string | PiModelSel
       ? {}
       : { thinkingReplay: profile.replayThinking ? "include" : "exclude" }),
     ...(streamOptions === undefined ? {} : { streamOptions }),
+    ...(profile.bashTimeoutSeconds === undefined ? {} : { bashTimeoutSeconds: profile.bashTimeoutSeconds }),
     ...(profile.elevation === undefined ? {} : { elevation: profile.elevation }),
     ...(sandbox === undefined ? {} : { sandbox }),
   });

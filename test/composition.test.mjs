@@ -133,7 +133,7 @@ main():
         ret result
 `, { agents });
   const result = await vm.run();
-  assert.deepEqual(result.output, { kind: "frag", content: "42" });
+  assert.deepEqual(result.output, { kind: "frag", content: "42", output: "formatted" });
 });
 
 test("dispatch enforces the configured total task limit", async () => {

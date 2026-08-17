@@ -72,6 +72,7 @@ import {
   type FlowTarget,
   type AgentControlInstruction,
   type AgentControlMode,
+  type AgentOutputFormat,
   type AgentStandardToolName,
   type Frag,
   type SourceSpan,
@@ -643,7 +644,7 @@ export class AflVm {
           agent,
           instruction.role ?? "user",
           input,
-          instruction.schema,
+          instruction.format,
           context,
           location,
           signal,
@@ -674,7 +675,7 @@ export class AflVm {
           });
         }
         await this.validateSchema(content, instruction.schema, signal);
-        return frag(content);
+        return frag(content, instruction.schema === undefined ? "reasoning" : "formatted");
       }
       case "oper":
         return evaluateOper(instruction.expression, frame);
@@ -775,7 +776,7 @@ export class AflVm {
           });
         }
         await this.trace(context, "dispatch.completed", location, { taskGroup: group.id, count: values.length });
-        return frag(content);
+        return frag(content, "formatted");
       }
       case "fork": {
         const source = asAgent(evaluateValue(instruction.sourceAgent, frame), instruction.sourceAgent.span);
@@ -826,7 +827,7 @@ export class AflVm {
           branch,
           instruction.action.role ?? "user",
           input,
-          instruction.action.schema,
+          instruction.action.format,
           context,
           location,
           signal,
@@ -946,13 +947,14 @@ export class AflVm {
     agent: AgentHandle,
     role: string,
     input: Frag,
-    schema: SymbolExpr | undefined,
+    format: AgentOutputFormat | undefined,
     context: VmRunContext,
     location: Required<TraceLocation>,
     signal: AbortSignal,
     control?: FreedomRuntime,
     forbiddenWriterWorkspace?: AgentWorkspaceSet,
   ): Promise<Frag> {
+    const fragOutput = format === undefined ? "reasoning" : "formatted";
     const executor = this.agentExecutor;
     if (executor === undefined) {
       throw new AflVmError(
@@ -979,6 +981,12 @@ export class AflVm {
       throw new AflVmError(
         "AGENT_CAPABILITY_UNSUPPORTED",
         `Agent executor '${executor.name}' does not support AFL standard tool selection`,
+      );
+    }
+    if (format !== undefined && !executor.capabilities.structuredOutput) {
+      throw new AflVmError(
+        "AGENT_CAPABILITY_UNSUPPORTED",
+        `Agent executor '${executor.name}' does not support AFL Format Output`,
       );
     }
     return context.locks.use(
@@ -1010,7 +1018,7 @@ export class AflVm {
               workspace: agent.workspace,
               ...(agent.tools === undefined ? {} : { tools: agent.tools }),
               messages: cloneMessages(agent.memory.messages),
-              ...(schema === undefined ? {} : { schema: toSymbol(schema) }),
+              ...(format === undefined ? {} : { format }),
               ...(control === undefined ? {} : { control: control.activation }),
               signal,
             };
@@ -1032,7 +1040,7 @@ export class AflVm {
               ...(agent.sessionMemoryRevision === undefined
                 ? {}
                 : { sessionMemoryRevision: agent.sessionMemoryRevision }),
-              ...(schema === undefined ? {} : { schema: toSymbol(schema) }),
+              ...(format === undefined ? {} : { format }),
               ...(control === undefined ? {} : { control: control.activation }),
               signal,
             };
@@ -1056,6 +1064,7 @@ export class AflVm {
               externalLease,
               request,
               executor.name,
+              format,
               control,
             );
             await this.trace(context, "agent.started", location, {
@@ -1077,13 +1086,13 @@ export class AflVm {
               throw new AflVmError("AGENT_OUTPUT_INVALID", "Agent executor output must be a string");
             }
             this.requireCompleted(result.stopReason);
-            await this.validateSchema(result.output, schema, signal);
+            validateAgentOutputContent(result.output, format);
             appendMemoryMessage(agent.memory, { role: "assistant", content: result.output });
             await this.updateAgentSession(agent, executor, result.session, context, signal);
             await this.persistMemory(context, agent.memory, signal, persistenceAttempt);
             persistenceAttempt = undefined;
             await this.trace(context, "agent.completed", location, { agent: agent.id });
-            return frag(result.output);
+            return frag(result.output, fragOutput);
           } catch (error) {
             let vmError = error instanceof AgentExecutorError
               ? new AflVmError(error.code, error.message, { cause: error })
@@ -1319,6 +1328,7 @@ export class AflVm {
     externalLease: SuspendableSemaphoreLease,
     executionRequest: AgentExecutionRequest,
     backend: string,
+    format: AgentOutputFormat | undefined,
     control?: FreedomRuntime,
   ): AgentExecutionHost {
     const emit = async (event: Parameters<AgentExecutionHost["emit"]>[0]) => {
@@ -1360,6 +1370,27 @@ export class AflVm {
         }
         return this.bindings.agentHost.requestInput(request);
       },
+      submitFormattedOutput: async (request) => externalLease.suspend(async () => {
+        throwIfAborted(request.signal);
+        if (format === undefined) {
+          return {
+            status: "rejected",
+            code: "AGENT_CAPABILITY_UNSUPPORTED",
+            message: "this Agent activation did not request formatted output",
+          };
+        }
+        try {
+          validateAgentOutputContent(request.content, format);
+          return { status: "accepted" };
+        } catch (error) {
+          const vmError = normalizeVmError(error);
+          return {
+            status: "rejected",
+            code: vmError.code,
+            message: vmError.message,
+          };
+        }
+      }),
       executeControlTool: async (request) => {
         if (control === undefined) {
           throw new AgentExecutorError(
@@ -2551,24 +2582,6 @@ export class AflVm {
               ));
             }
             break;
-          case "agent.do":
-            if (instruction.schema !== undefined) {
-              diagnostics.push(generatedDiagnostic(
-                "FREEDOM_IR_SYMBOL_DENIED",
-                "Generated IR cannot use an external Schema symbol in v0",
-                instruction.schema.span,
-              ));
-            }
-            break;
-          case "fork":
-            if (instruction.action.schema !== undefined) {
-              diagnostics.push(generatedDiagnostic(
-                "FREEDOM_IR_SYMBOL_DENIED",
-                "Generated IR cannot use an external Schema symbol in v0",
-                instruction.action.schema.span,
-              ));
-            }
-            break;
           case "sync":
             if (instruction.formatter !== undefined) {
               diagnostics.push(generatedDiagnostic(
@@ -2908,7 +2921,7 @@ class SuspendableSemaphoreLease {
 
 function normalizeFlowResult(value: VmValue, span: SourceSpan): Frag {
   if (isFrag(value)) return value;
-  if (isComputeValue(value)) return frag(formatCompute(value));
+  if (isComputeValue(value)) return frag(formatCompute(value), "formatted");
   throw new AflVmError("FLOW_RESULT_INVALID", "flow result must be Frag or compute data", { span });
 }
 
@@ -2983,9 +2996,46 @@ function portableFlowResult(value: VmValue, span: SourceSpan): VmArgument {
 }
 
 function portableControlValue(value: VmArgument): ComputeValue {
-  if (isFrag(value)) return { type: "frag", content: value.content };
+  if (isFrag(value)) return { type: "frag", content: value.content, output: value.output };
   if (isSymbolRef(value)) return { type: "symbol", name: value.name };
   return structuredClone(value);
+}
+
+function validateAgentOutputContent(content: string, format: AgentOutputFormat | undefined): void {
+  if (format === undefined) return;
+  if (format.kind === "enum") {
+    if (!format.values.includes(content)) {
+      throw new AflVmError(
+        "AGENT_FORMAT_ENUM_INVALID",
+        `formatted output must be one of: ${format.values.map((value) => JSON.stringify(value)).join(", ")}`,
+        { details: { allowed: [...format.values] } },
+      );
+    }
+    return;
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(content);
+  } catch (error) {
+    throw new AflVmError("AGENT_FORMAT_OBJECT_INVALID", "formatted output must be a JSON object", { cause: error });
+  }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new AflVmError("AGENT_FORMAT_OBJECT_INVALID", "formatted output must be a JSON object");
+  }
+  const expected = Object.keys(format.fields);
+  const actual = Object.keys(value);
+  const missing = expected.filter((field) => !Object.hasOwn(value, field));
+  const extra = actual.filter((field) => !Object.hasOwn(format.fields, field));
+  if (missing.length > 0 || extra.length > 0) {
+    throw new AflVmError(
+      "AGENT_FORMAT_OBJECT_INVALID",
+      [
+        missing.length === 0 ? undefined : `missing fields: ${missing.join(", ")}`,
+        extra.length === 0 ? undefined : `unexpected fields: ${extra.join(", ")}`,
+      ].filter((item): item is string => item !== undefined).join("; "),
+      { details: { missing, extra } },
+    );
+  }
 }
 
 function portableControlKind(value: VmArgument): string {

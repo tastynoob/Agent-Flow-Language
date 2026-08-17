@@ -31,6 +31,8 @@ test("Pi backend completes a model-tool-model loop and reuses the native session
   faux.setResponses([
     (context) => {
       contexts.push(structuredClone(context.messages));
+      assert.equal(context.tools.some((tool) => tool.name === "afl_format_output"), false);
+      assert.doesNotMatch(context.systemPrompt ?? "", /afl_format_output/u);
       return fauxAssistantMessage(
         fauxToolCall("lookup", { key: "alpha" }, { id: "lookup-1" }),
         { stopReason: "toolUse" },
@@ -82,6 +84,7 @@ main():
 
   const result = await vm.run();
   assert.equal(result.output.content, "second-result");
+  assert.equal(result.output.output, "reasoning");
   assert.equal(toolCalls, 1);
   assert.equal(faux.state.callCount, 3);
   assert.equal(contexts.length, 3);
@@ -92,6 +95,143 @@ main():
   assert.equal(
     trace.events.some((event) => event.type === "agent.event" && event.details?.type === "tool.completed"),
     true,
+  );
+});
+
+test("Pi Format Output tool validates and replaces activation-scoped candidates", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "afl-pi-output-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  faux.setResponses([
+    (context) => {
+      const output = context.tools.find((tool) => tool.name === "afl_format_output");
+      assert.equal(output.description, "Before finishing, submit the result for this step. You may resubmit; the last accepted value is returned.");
+      assert.equal(output.description.length < 120, true);
+      assert.equal(output.parameters.properties.value.properties.status.description, "Completion state");
+      assert.equal(output.parameters.properties.value.properties.count.description, "Number of completed items");
+      assert.equal(output.parameters.properties.value.additionalProperties, false);
+      assert.doesNotMatch(context.systemPrompt ?? "", /afl_format_output|Completion state|Number of completed items/u);
+      return fauxAssistantMessage(
+        fauxToolCall("afl_format_output", { value: { status: "draft", count: 1 } }, { id: "output-draft" }),
+        { stopReason: "toolUse" },
+      );
+    },
+    (context) => {
+      assert.match(messageTexts(context.messages).join("\n"), /Accepted \(revision 1\)/u);
+      return fauxAssistantMessage(
+        fauxToolCall("afl_format_output", { value: { status: "finish", count: 3 } }, { id: "output-finish" }),
+        { stopReason: "toolUse" },
+      );
+    },
+    (context) => {
+      assert.match(messageTexts(context.messages).join("\n"), /Accepted \(revision 2\)/u);
+      return fauxAssistantMessage("Reasoning complete; this text is not the structured result.");
+    },
+    (context) => {
+      assert.equal(context.tools.some((tool) => tool.name === "afl_format_output"), false);
+      assert.doesNotMatch(context.systemPrompt ?? "", /afl_format_output/u);
+      return fauxAssistantMessage("plain follow-up");
+    },
+  ]);
+  const backend = new PiAgentExecutorBackend({
+    models,
+    defaultBinding: createPiCodingAgentBinding({ model: faux.getModel() }),
+  });
+  const vm = AflVm.fromSource(`
+main():
+    entry:
+        worker = agent @agent.worker
+        result = worker.do "produce a result",
+            [format: [
+                status: "Completion state",
+                count: "Number of completed items"
+            ]]
+        plain = worker.do "continue"
+        ret result
+`, { agentExecutor: backend });
+
+  const result = await vm.run("main", [], { executionRoot: root });
+  assert.equal(result.output.content, '{"status":"finish","count":3}');
+  assert.equal(result.output.output, "formatted");
+  const state = await readMemoryState(root);
+  const memory = Object.values(state.memories)[0];
+  assert.deepEqual(memory.messages, [
+    { role: "user", content: "produce a result" },
+    { role: "assistant", content: '{"status":"finish","count":3}' },
+    { role: "user", content: "continue" },
+    { role: "assistant", content: "plain follow-up" },
+  ]);
+  assert.match(JSON.stringify(memory.continuation.state.payload), /Reasoning complete/u);
+  assert.equal(memory.continuation.memoryRevision, 4);
+});
+
+test("Pi enum format accepts only declared values and marks the Frag as formatted", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "afl-pi-format-status-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  faux.setResponses([
+    (context) => {
+      const output = context.tools.find((tool) => tool.name === "afl_format_output");
+      assert.deepEqual(output.parameters.properties.value.anyOf.map((entry) => entry.const), ["finish", "error"]);
+      return fauxAssistantMessage(
+        fauxToolCall("afl_format_output", { value: "unknown" }, { id: "invalid-status" }),
+        { stopReason: "toolUse" },
+      );
+    },
+    (context) => {
+      assert.match(messageTexts(context.messages).join("\n"), /unknown/u);
+      return fauxAssistantMessage(
+        fauxToolCall("afl_format_output", { value: "finish" }, { id: "valid-status" }),
+        { stopReason: "toolUse" },
+      );
+    },
+    (context) => {
+      assert.match(messageTexts(context.messages).join("\n"), /Accepted \(revision 1\)/u);
+      return fauxAssistantMessage("The review is complete.");
+    },
+  ]);
+  const backend = new PiAgentExecutorBackend({
+    models,
+    defaultBinding: createPiCodingAgentBinding({ model: faux.getModel() }),
+  });
+  const vm = AflVm.fromSource(`
+main():
+    entry:
+        reviewer = agent @agent.reviewer
+        status = reviewer.do "review", [format: ["finish", "error"]]
+        ret status
+`, { agentExecutor: backend });
+
+  const result = await vm.run("main", [], { executionRoot: root });
+  assert.deepEqual(result.output, { kind: "frag", content: "finish", output: "formatted" });
+});
+
+test("Pi requires an accepted candidate for a formatted do", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "afl-pi-output-required-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  faux.setResponses([fauxAssistantMessage("unsubmitted final text")]);
+  const backend = new PiAgentExecutorBackend({
+    models,
+    defaultBinding: createPiCodingAgentBinding({ model: faux.getModel() }),
+  });
+  const vm = AflVm.fromSource(`
+main():
+    entry:
+        worker = agent @agent.worker
+        result = worker.do "produce a result", [format: ["finish", "error"]]
+        ret result
+`, { agentExecutor: backend });
+
+  await assert.rejects(
+    vm.run("main", [], { executionRoot: root }),
+    { code: "AGENT_FORMAT_OUTPUT_MISSING" },
   );
 });
 
@@ -120,6 +260,7 @@ test("Pi scopes AFL control tools to one Freedom activation and restores binding
       assert.match(context.tools[1].description, /Canonical AFL name: afl\.environment\.get/u);
       assert.match(context.tools[1].description, /every active AFL tool includes its own usage instructions/u);
       assert.match(context.tools[2].description, /args are positional/u);
+      assert.match(context.tools[2].description, /not a business object/u);
       assert.match(context.tools[2].description, /never the child result/u);
       assert.doesNotMatch(context.systemPrompt ?? "", /AFL Freedom Route activation/u);
       assert.equal(messageTexts(context.messages).includes("seed"), true);
@@ -910,7 +1051,7 @@ main():
   assert.equal(result.output.content, "coded");
   assert.deepEqual(seen.map((tools) => tools.toSorted()), [
     ["read", "list", "search", "afl_transaction_request"].toSorted(),
-    ["afl_transaction_request"],
+    ["afl_transaction_request"].toSorted(),
     ["read", "bash", "write", "afl_transaction_request"].toSorted(),
   ]);
 });
@@ -951,6 +1092,40 @@ main():
 
   const result = await vm.run("main", [], { executionRoot: root });
   assert.equal(result.output.content, "found");
+});
+
+test("Pi coding binding applies a default timeout to bash commands", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "afl-pi-bash-timeout-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("bash", { command: "sleep 1" }, { id: "timed-bash" }), {
+      stopReason: "toolUse",
+    }),
+    (context) => {
+      assert.match(messageTexts(context.messages).join("\n"), /timed out after 0\.05 seconds/iu);
+      return fauxAssistantMessage("timeout-observed");
+    },
+  ]);
+  const backend = new PiAgentExecutorBackend({
+    models,
+    defaultBinding: createPiCodingAgentBinding({
+      model: faux.getModel(),
+      bashTimeoutSeconds: 0.05,
+    }),
+  });
+  const vm = AflVm.fromSource(`
+main():
+    entry:
+        worker = agent @agent.worker, [workspace: "work/"]
+        result = worker.do "run bounded command"
+        ret result
+`, { agentExecutor: backend });
+
+  const result = await vm.run("main", [], { executionRoot: root });
+  assert.equal(result.output.content, "timeout-observed");
 });
 
 test("Pi coding binding executes write and GCC tools inside bubblewrap", async (t) => {
@@ -1022,6 +1197,7 @@ main():
   assert.equal(actions[0].effectiveInput.path, "/workspace/main.c");
   assert.deepEqual(actions[1].effectiveInput, {
     command: "gcc -std=c11 -Wall -Wextra -Werror main.c -o main && ./main",
+    timeout: 300,
     cwd: "/workspace",
     env: {},
     inheritEnv: true,

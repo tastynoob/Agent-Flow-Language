@@ -46,8 +46,9 @@ node_name(arg_a, arg_b):
 遵守以下格式：
 
 - 让 node、block 和局部名称以字母或下划线开头，后续只使用字母、数字或下划线。
-- 使用 4 个空格缩进 block，使用 8 个空格缩进 instruction；禁止 tab。
-- 使用 JSON 字符串转义规则；使用 `#` 写注释。
+- 使用 4 个空格缩进 block，使用 8 个空格缩进 instruction；AFL 源码全局禁止 Tab，包括三单引号内容。
+- 普通字符串可以使用 JSON 双引号或单引号；多行文本使用 `'''...'''`。三单引号按开头 delimiter 所在物理行的前导空格数对齐，内容行移除等量前导空格。
+- 使用 `#` 写字符串外的注释。较长 instruction 只在首个物理行以顶层逗号结束时续行；进入续行后可以展开嵌套 list/record，单独留下未闭合括号不构成续行许可。
 - 让每个 node 包含 `entry` block，让每个 block 以且仅以一个 terminator 结束。
 - 只在 node header 后、首个 block 前使用 `@description`、`@param` 和 `@returns`。让每个 `@param` 对应真实参数。
 - 使用至少包含两个段的 symbol，例如 `@prompt.review`、`@flow.lookup`。schema 使用 `@schema.*`，Freedom Agent allowlist 使用 `@agent.*`。
@@ -57,7 +58,7 @@ node_name(arg_a, arg_b):
 
 按以下类型推理：
 
-- `Frag`：`{ kind: "frag", content: string }`。它是无 role 的文本片段；role 只在写入 Memory 时产生。
+- `Frag`：`{ kind: "frag", content: string, output: "reasoning" | "formatted" }`。它是无 role 的文本片段；output 区分自然推理文本与显式格式化结果，role 只在写入 Memory 时产生。
 - compute value：`null`、布尔值、有限数字、字符串、list 或 record。List 写作 `[value, ...]`，record 写作 `[key: value, ...]`，空 record 写作 `[:]`；它们应可安全地跨进程序列化。
 - symbol：形如 `@namespace.name` 的符号引用，由 binding 或 VM 解释。
 - handle：Agent、Memory 或 TaskGroup 的运行时句柄。不要把它传给 prompt binding、capability、external flow 或 script，也不要把它当成可序列化数据。
@@ -102,13 +103,16 @@ node_name(arg_a, arg_b):
 
 ### `agent.do`
 
-形式：`answer = coder.do request`；`answer = coder.do request, [role: @role.reviewer]`；`answer = coder.do request, [schema: @schema.review]`。
+形式：`answer = coder.do request`；`answer = coder.do request, [role: @role.reviewer]`；`status = reviewer.do request, [format: ["finish", "error"]]`；`report = reviewer.do request, [format: [type: "结果类别", value: "结果内容"]]`。
 
 - 把一次 `do` 视为完整的 Agent activation，而不是单个模型请求。executor 可以在内部执行多轮推理和工具调用。
 - 省略 role 时使用 `user`；也可使用标准 role 或 `@role.*` 自定义 role。
 - VM 先把输入作为指定 role 的消息追加到 Agent Memory，再调用 executor。
 - 只有 `stopReason = completed` 的执行结果可作为正常输出；其他停止原因应作为失败处理。
-- 使用 schema 时把请求传给 executor，并始终提供 `schemas` binding。executor 可以原生约束输出，也可以只生成候选内容；VM 在接受输出前调用 schema validator，成功后才把 assistant 消息追加到 Memory。
+- 普通 `do` 不暴露 Format Output，直接采用模型最终 assistant 文本并返回 `output: reasoning` Frag。
+- 非空字符串 list format 表示精确枚举；非空字段描述 record format 表示所有字段必填、禁止额外字段的 JSON object。字段值允许任意 JSON value；业务含义仍由用户 prompt 说明。
+- 指定 format 时，支持该能力的 executor 临时暴露 `afl.format_output`。模型侧只提供一个 `value` 参数，工具描述简短注明结束前必须提交；不要修改 system prompt，也不要重复注入 AFL 规则、枚举或字段描述。候选通过 `host.submitFormattedOutput` 校验，拒绝不会覆盖最近一次有效候选。
+- 格式化 activation 完成时返回最后一个有效候选及 `output: formatted` Frag；没有有效候选时以 `AGENT_FORMAT_OUTPUT_MISSING` 失败。VM 接受前按同一内联 format 复核。
 - 返回 role-free Frag。后续 role 由下一次 `do` 或 `memory.append` 明确指定。
 
 ## 构造输入与数据
@@ -198,10 +202,10 @@ node_name(arg_a, arg_b):
 
 ### `fork`
 
-形式：`branch = source.fork "Explore an alternative"`；`branch = source.fork request, [role: user, schema: @schema.Result]`。
+形式：`branch = source.fork "Explore an alternative"`；`branch = source.fork request, [role: user, format: ["finish", "error"]]`。
 
 - 复制 source Agent 的 Memory 和可用 continuation checkpoint，创建具有相同 symbol、system prompt 和 workspace 的新 Agent，然后立即执行其首次 `do`。
-- options 与普通 `do` 相同，可以显式指定 role 或 schema。
+- options 与普通 `do` 相同，可以显式指定 role 或内联 format。
 - 把首次输出保留在 branch Memory 中；该 instruction 返回的是新 Agent handle，不是输出 Frag。
 - 把 branch Memory 视为独立快照；后续修改不会回流到 source。
 - 即使 Memory 独立，共享或重叠 workspace 仍会形成资源锁和潜在外部副作用。
@@ -368,7 +372,7 @@ export default defineBindings({
 request = {
   runId, node, block,
   agent, systemPrompt?, workspace,
-  messages, schema?, signal
+  messages, format?, signal
 }
 result = { output: string }
 ```
@@ -388,7 +392,7 @@ result = { output: string }
 | `fork` | 能从兼容 checkpoint 分叉独立 session |
 | `workspaceContext` | 能向 Agent 提供主读写 workspace 上下文 |
 | `readOnlyWorkspaceContext` | 能区分并提供只读 workspace 上下文 |
-| `structuredOutput` | 能接收并遵守结构化输出请求；VM 仍使用 `schemas` 复核 |
+| `structuredOutput` | 能在带内联 format 的 activation 内收集可修改的 Format Output 候选并通过 VM 校验 |
 | `interrupt` | 能在取消信号后中断进行中的执行 |
 | `dynamicControlTools` | 能在 activation 中调用 VM 提供的 Freedom control tools |
 | `standardTools` | 能按 Agent allocation 的 `tools` 字段激活 VM 标准工具 |
@@ -404,7 +408,7 @@ request = {
   memory, memoryRevision,
   workspace, tools?,
   session?, sessionMemoryRevision?,
-  schema?, control?, signal
+  format?, control?, signal
 }
 result = {
   output: string,
@@ -430,12 +434,13 @@ authorizeTool(action) -> allowed | denied
 requestElevation(request) -> allowed | denied
 requestTransaction(request) -> completed | denied | unavailable
 requestInput(request) -> string
+submitFormattedOutput(request) -> accepted | rejected
 executeControlTool(request) -> {content: string, details?: compute}
 ```
 
-在 executor 执行任何工具前调用 `authorizeTool`。只有策略返回可提权的拒绝时才调用 `requestElevation`；需要宿主确认外部事务完成时调用 `requestTransaction`；需要用户或上层系统补充信息时调用 `requestInput`。Agent event 只使用 `message.delta`、`tool.requested/policy/started/updated/completed`、`transaction.state`、`elevation.state`、`usage.updated` 或 `warning`。
+在 executor 执行任何外部作用工具前调用 `authorizeTool`。Format Output 是显式格式化 activation 内部的结果提交，不进入文件或 Shell policy；普通 reasoning activation 不应暴露它。将候选交给 `submitFormattedOutput`，并把 rejected 的 code/message 返回给模型继续修正。只有策略返回可提权的拒绝时才调用 `requestElevation`；需要宿主确认外部事务完成时调用 `requestTransaction`；需要用户或上层系统补充信息时调用 `requestInput`。Agent event 只使用 `message.delta`、`tool.requested/policy/started/updated/completed`、`transaction.state`、`elevation.state`、`usage.updated` 或 `warning`。
 
-按以下生命周期实现 Agent activation：追加输入消息，验证 canonical Memory，恢复兼容 session，执行 Agent 授权，持久化 attempt 起点，运行 executor，处理取消或非完成 stop reason，验证 schema，追加 assistant 输出，更新 continuation，再提交完成状态。任何中途错误都不得伪造成功输出。
+按以下生命周期实现 Agent activation：追加输入消息，验证 canonical Memory，恢复兼容 session，执行 Agent 授权，持久化 attempt 起点，运行 executor，处理取消或非完成 stop reason，验证内联 format，追加 assistant 输出，更新 continuation，再提交完成状态。任何中途错误都不得伪造成功输出。
 
 ### Agent Host 与安全
 

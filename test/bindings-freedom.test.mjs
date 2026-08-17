@@ -243,7 +243,7 @@ main():
     },
   });
   const result = await vm.run("main", [], { executionRoot: root, runId: "op-only-mode" });
-  assert.deepEqual(result.output, frag("[]"));
+  assert.deepEqual(result.output, frag("[]", "formatted"));
   assert.equal(authorizedMode, "route");
 });
 
@@ -369,7 +369,7 @@ test("agent.flow executes a Node immediately and returns the writer summary", as
     });
     const result = JSON.parse(executed.content);
     assert.equal(result.ok, true);
-    assert.deepEqual(result.value, { type: "frag", content: "department:job" });
+    assert.deepEqual(result.value, { type: "frag", content: "department:job", output: "reasoning" });
     assert.equal(childCompleted, true);
     return completed("flow-summary");
   });
@@ -471,7 +471,7 @@ test("agent.flow validates and executes scoped IR without leaking tools into ord
     });
     const result = JSON.parse(executed.content);
     assert.equal(result.ok, true);
-    assert.deepEqual(result.value, { type: "frag", content: "generated:job" });
+    assert.deepEqual(result.value, { type: "frag", content: "generated:job", output: "reasoning" });
     return completed("flow-complete");
   });
   const vm = AflVm.fromSource(`
@@ -617,7 +617,7 @@ main():
         ret reports
 `, { agentExecutor: controlBackend(async () => completed("unexecuted route claim")) });
   const routeResult = await route.run("main", [], { executionRoot: root, runId: "empty-route" });
-  assert.deepEqual(routeResult.output, frag("[]"));
+  assert.deepEqual(routeResult.output, frag("[]", "formatted"));
 
   const validationOnly = AflVm.fromSource(`
 main():

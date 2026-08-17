@@ -7,6 +7,7 @@
 ```text
 Frag {
     content: string
+    output: reasoning | formatted
 }
 
 Message {
@@ -19,7 +20,7 @@ Memory {
 }
 ```
 
-Frag 是不带 role 的字符串 wrapper。Memory 是按顺序保存的、带 role 字符串集合。Role 只在 Frag 被加入 Memory 时确定。
+Frag 是不带 role 的字符串 wrapper。`output` 标记它来自自然推理文本还是显式格式化结果；该标记不解析 content。Memory 是按顺序保存的、带 role 字符串集合。Role 只在 Frag 被加入 Memory 时确定，Message 不复制 Frag 的 output 标记。
 
 JSON 可以作为 Frag content 的一种格式，但 Memory 不要求内容必须是 JSON。Flow 可以自行约定纯文本、Markdown、XML 或其他字符串协议。
 
@@ -48,7 +49,7 @@ result = coder.do prompt
 1. 把 `prompt.content` 以 `user` role append 到 `coder.memory`；
 2. 执行 Coder；
 3. 把 Coder 输出以 `assistant` role append 到 `coder.memory`；
-4. 返回包装相同输出字符串的 role-free Frag `result`。
+4. 返回包装相同输出字符串的 role-free Frag `result`。普通 `do` 标为 `reasoning`；带内联 `format` 的调用标为 `formatted`。
 
 显式 role 写在 `do` options 中：
 
@@ -58,7 +59,7 @@ result = coder.do tool_result, [role: tool]
 
 Agent 输出在来源 Memory 中是 assistant Message，但返回 Frag 不带 `assistant`。因此它进入另一个 Agent 时可以重新解释为 `user`、`tool` 或其他 role。
 
-一次 `do` 可以由 Agent executor 完成多个模型或工具步骤。工具调用、thinking 和 compaction 等 backend-native entry 不进入 AFL canonical Message 序列，但会作为 opaque continuation 随同 Memory slot 持久化。Executor 只返回最终输出，VM 是唯一将它追加为 canonical `assistant` Message 的组件，并把同一字符串作为 role-free Frag 返回。
+一次 `do` 可以由 Agent executor 完成多个模型或工具步骤。工具调用、thinking 和 compaction 等 backend-native entry 不进入 AFL canonical Message 序列，但会作为 opaque continuation 随同 Memory slot 持久化。普通调用使用模型最终 assistant 文本；显式格式化调用使用最后一个有效 Format Output 候选。VM 是唯一将最终选择追加为 canonical `assistant` Message 的组件，并把同一字符串及其 output 标记包装为 role-free Frag 返回。
 
 ## 4. `memory.append`
 

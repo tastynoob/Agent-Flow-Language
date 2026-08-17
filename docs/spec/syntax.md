@@ -13,7 +13,7 @@ node_name(arg0, arg1):
         terminator
 ```
 
-缩进表示 node 和 basic block 的范围。每条指令占一行，不使用分号。`#` 后面的内容是注释。
+缩进表示 node 和 basic block 的范围。指令通常占一行，也可以在顶层逗号后显式续行；不使用分号。字符串外的 `#` 后内容是注释。
 
 ## 2. 名称、Symbol 与字面量
 
@@ -35,7 +35,38 @@ bug_list_2
 @mcp.github.read_file
 ```
 
-String 使用双引号，转义规则沿用 JSON string。Boolean、number、list 和 record 字面量主要供 `oper`、`compute`、script executor 和 VM option 使用。List 与 record 统一使用方括号，是否包含顶层 `:` 决定集合类型：
+String 支持双引号、单引号和三单引号。双引号沿用 JSON string；单引号支持相同的常用转义，且可用 `\'` 表示单引号：
+
+```text
+"JSON string"
+'single-quoted string'
+'can\'t'
+```
+
+三单引号用于多行字符串。开头 `'''` 所在物理行的前导空格数是对齐基准；后续每一行自动移除等量的前导空格，超过基准的缩进保留。紧邻 delimiter 的首尾结构空行不进入字符串，因此嵌套在 instruction 中书写不会把 AFL 缩进带入内容：
+
+```text
+main():
+    entry:
+        request = prompt '''
+        Implement the module.
+            Preserve this four-space indentation.
+        # This is string content, not an AFL comment.
+        '''
+        ret request
+```
+
+上述字符串的值是：
+
+```text
+Implement the module.
+    Preserve this four-space indentation.
+# This is string content, not an AFL comment.
+```
+
+三单引号内容使用与单引号相同的转义规则。AFL 源码全局禁止 Tab，包括三单引号内容；缩进统一使用空格。
+
+Boolean、number、list 和 record 字面量主要供 `oper`、`compute`、script executor 和 VM option 使用。List 与 record 统一使用方括号，是否包含顶层 `:` 决定集合类型：
 
 ```text
 [value0, value1]            # list
@@ -44,7 +75,7 @@ String 使用双引号，转义规则沿用 JSON string。Boolean、number、lis
 [:]                         # empty record
 ```
 
-同一层集合不能混写 list item 和 record entry。Record 的裸 key 必须是合法名称；其他字符串 key 使用双引号。
+同一层集合不能混写 list item 和 record entry。Record 的裸 key 必须是合法名称；其他字符串 key 使用单引号或双引号。
 
 Role operand 可以使用基础 role keyword，也可以引用 VM 定义的 role symbol：
 
@@ -156,15 +187,34 @@ coder.memory.append user, review_result
 
 Operand 可以是名称、字段/索引引用、字面量、role 或外部 symbol。指令自身定义 operand 的数量和含义。
 
+较长指令可以在首个物理行的顶层逗号后换行。这个逗号是显式续行标记；进入续行后，parser 会继续读取尚未闭合的 list、record 或括号，并允许后续 operand 继续以顶层逗号换行：
+
+```text
+jobs = planner.route 'route work',
+    [nodes: [research, implement, verify],
+    params: [
+        task: task,
+        config: [mode: 'thorough', retries: 2]
+    ],
+    min_routes: 1,
+    max_routes: 3]
+```
+
+只把 collection 左括号留在行尾不会隐式续行；首行必须先以顶层逗号结束。续行的排版缩进只用于可读性，不创建新的 AFL scope。
+
 ## 5. 结果类别
 
 普通业务数据使用统一的 `Frag`：
 
 ```text
-Frag = wrapper<string>
+Frag {
+    kind: "frag"
+    content: string
+    output: reasoning | formatted
+}
 ```
 
-Frag 在 IR 中表现为一个名称，字符串 wrapper 是其运行时表示。Frag 自身不带 role；JSON、XML、Markdown 或 flow 自定义格式都只是它所包装的字符串内容。
+`output` 区分自然推理文本和显式格式化结果。它是数据来源标记，不是 role，也不会把 JSON content 自动解析为 record。Frag 自身仍不带 role；JSON、XML、Markdown 或 flow 自定义格式都只是它所包装的字符串内容。
 
 String literal 在需要 Frag 的位置自动包装成 Frag。Prompt symbol 需要由 `prompt` 或 `agent.system_prompt` 交给 Prompt binding 渲染。
 
@@ -220,10 +270,22 @@ coder.system_prompt "You are responsible for implementation."
 ```text
 step = coder.do prompt
 step = coder.do prompt, [role: user]
-step = coder.do prompt, [role: user, schema: @schema.StepResult]
+status = reviewer.do prompt, [format: ["finish", "error"]]
+report = reviewer.do prompt,
+    [format: [
+        type: "结果类别",
+        value: "结果内容"
+    ]]
 ```
 
-省略 role 时使用 `user`。显式 role 和 schema 都位于 options 中；schema 校验成功后，返回结果仍然是包含格式化字符串的 Frag。
+省略 role 时使用 `user`。普通 `do` 采用模型最后的 assistant 文本，返回 `output: reasoning`。指定 `format` 时返回 `output: formatted`，并要求 executor 支持 Format Output。
+
+`format` 只能是以下两种静态内联契约：
+
+- 非空字符串 list 是枚举格式。最终 content 必须精确等于其中一个值；值不能为空或重复。
+- 非空 record 是对象格式。key 是最终 JSON object 的必填字段，字符串 value 是该字段给模型看的简短描述；最终对象不能缺字段或包含额外字段，字段值可以是任意 JSON value。
+
+`format` 只约束结果形状，不替代任务 prompt。用户仍需在 prompt 中说明如何判断枚举结果、各字段应根据什么信息填写。支持的 executor 会在该 activation 临时暴露 Format Output；工具描述简短注明结束前必须提交，格式值和字段描述只通过 tool input schema 提供。VM 不为此修改 system prompt 或插入隐藏 Message。
 
 一次 `do` 表示完整的 Agent 工作激活，可以在执行后端内部包含多个模型 turn 和工具步骤。Core IR、validator、VM 和 adapter API 不再区分单步与连续执行 mode。
 
@@ -424,7 +486,7 @@ Freedom activation 延续该 Agent 已有的 Memory 和 executor session，指�
 ```text
 dst = agent symbol [, [workspace: value, memory: memory, tools: profile-or-list]]
 agent.system_prompt prompt
-dst = agent.do frag [, [role: role, schema: schema]]
+dst = agent.do frag [, [role: role, format: string-enum-or-field-record]]
 
 dst = prompt prompt_source [, value ...]
 dst = input prompt_source [, schema]
@@ -438,7 +500,7 @@ dst = shell "command" [, value ...]
 dst = call flow(value ...)
 dst = dispatch [flow_call, flow_call, ...]
 dst = repeat count, flow(task)
-dst = source_agent.fork frag
+dst = source_agent.fork frag [, [role: role, format: string-enum-or-field-record]]
 dst = sync task_group [, formatter]
 dst = invoke symbol [, value ...]
 

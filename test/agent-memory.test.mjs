@@ -55,7 +55,7 @@ main(task):
   });
 
   const result = await vm.run("main", ["build feature"]);
-  assert.deepEqual(result.output, { kind: "frag", content: "fixed-v2" });
+  assert.deepEqual(result.output, { kind: "frag", content: "fixed-v2", output: "reasoning" });
   assert.equal(coderRuns, 2);
   assert.equal(reviewerRuns, 2);
 });

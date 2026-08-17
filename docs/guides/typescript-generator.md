@@ -87,7 +87,7 @@ const result = coder.do(main.params.task, {
 
 `name` 控制生成的 AFL 目标名称；省略时 generator 根据 Agent symbol 分配唯一名称。`workspace` 接受单个路径、包含主读写目录和只读目录的 string list，或已有 `AflValue`。跨平台代码应使用相对 `executionRoot` 的普通路径，不应嵌入盘符、用户目录或 shell 展开语法。
 
-`memory` 接受已有 Memory 的 `AflValue`。只设置 Memory 时生成 `reviewer = agent @agent.reviewer, [memory: review_memory]`。`do()` 默认使用 `user` role；显式 role 使用标准 role 或 `@role.*`，schema 必须使用 `@schema.*`。`Agent.memory` 返回可用于 Memory instruction 的 `agent.memory` 引用。
+`memory` 接受已有 Memory 的 `AflValue`。只设置 Memory 时生成 `reviewer = agent @agent.reviewer, [memory: review_memory]`。`do()` 默认使用 `user` role；显式 role 使用标准 role 或 `@role.*`，schema 必须使用 `@schema.*`。需要单 token 状态时设置 `format: "status"`。`Agent.memory` 返回可用于 Memory instruction 的 `agent.memory` 引用。
 
 ## `when` 与 `otherwise`
 
@@ -159,6 +159,20 @@ bdr.end();
 | `bdr.compute(symbol, args)` | `dst = compute symbol, args` |
 
 JavaScript string、number、boolean、`null`、array 和 plain record 作为 AFL literal 编码。生成结果中 array 写作 `[value, ...]`，plain record 写作 `[key: value, ...]`，空 record 写作 `[:]`。引用已有 AFL 名称时使用 `ref()`，引用 symbol 时使用 `symbol()`；不要用普通 string 代替引用。
+
+Agent format 也直接使用 JavaScript array 或 plain record：
+
+```ts
+reviewer.do(request, { format: ["finish", "error"] });
+reviewer.do(request, {
+  format: {
+    type: "Result type",
+    value: "Result payload",
+  },
+});
+```
+
+array 生成精确枚举，record 生成字段描述契约；两者都必须非空。
 
 ## 直接写入 AFL
 

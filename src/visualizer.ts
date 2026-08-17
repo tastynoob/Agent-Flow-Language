@@ -385,7 +385,7 @@ class VisualGraphBuilder {
         const receiver = instruction.agent.name;
         const id = this.addNode(scope, sourceNode.name, block.name, "model", {
           title: `${receiver} · model call`,
-          subtitle: [agents.get(receiver), instruction.schema?.name].filter(Boolean).join(" · "),
+          subtitle: [agents.get(receiver), formatLabel(instruction.format)].filter(Boolean).join(" · "),
           operations: [this.sourceText(instruction.span)],
           span: instruction.span,
         });
@@ -703,6 +703,13 @@ class VisualGraphBuilder {
   ): boolean {
     return (indexes.get(to) ?? Number.MAX_SAFE_INTEGER) <= (indexes.get(from) ?? -1);
   }
+}
+
+function formatLabel(format: import("./ir.js").AgentOutputFormat | undefined): string | undefined {
+  if (format === undefined) return undefined;
+  return format.kind === "enum"
+    ? `${format.values.length} output choices`
+    : `${Object.keys(format.fields).length} output fields`;
 }
 
 function formatJumpCase(value: null | boolean | number | string): string {

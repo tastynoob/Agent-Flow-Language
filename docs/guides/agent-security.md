@@ -18,7 +18,7 @@ AFL v0 的 Agent 工具执行边界由 AFL 与 TypeScript bindings 共同描述�
 
 Pre-tool policy 不直接打开人工请求队列。模型收到 `block` 后应先尝试更安全的替代方案；只有模型主动调用提权工具时才会请求用户审批。
 
-Pi 会在 schema 校验和 `prepareArguments` 完成后授权。`createPiCodingAgentBinding` 还会把 `read`、`edit`、`write` 的 path 规范化为实际 addressed path，并为 `bash` 补充实际 `cwd`、environment 和继承模式，随后才生成 immutable policy action。
+Pi 会在 schema 校验和 `prepareArguments` 完成后授权。`createPiCodingAgentBinding` 还会把 `read`、`edit`、`write` 的 path 规范化为实际 addressed path，并为 `bash` 补充实际 `cwd`、environment、继承模式和默认超时，随后才生成 immutable policy action。默认 `bashTimeoutSeconds` 为 300；binding 或 `pi()` profile 可以覆盖它，模型也可以为单次调用声明更短的 `timeout`，但不能通过省略字段获得无期限执行。
 
 ## 人工请求队列
 
@@ -91,6 +91,7 @@ import {
 
 const binding = createPiCodingAgentBinding({
   model: { provider: "deepseek", id: "deepseek-chat" },
+  bashTimeoutSeconds: 300,
   sandbox: {
     backend: "bubblewrap",
     network: "none",
@@ -110,6 +111,7 @@ Sandbox 内的稳定视图为：
 - HOME 为独立的 `/home/afl`，`/tmp` 为 tmpfs；
 - `/workspace/.afl` 被 tmpfs 遮蔽，不暴露 canonical Memory；
 - `read`、`bash`、`edit` 和 `write` 共用同一个长生命周期 `ExecutionEnv` worker；
+- `bash` 未显式给出更短超时时，使用 binding 的默认命令超时；
 - network 默认为 `none`，只有显式 `network: "host"` 才共享宿主网络 namespace。
 
 显式启用后，缺少 Linux、bubblewrap、user namespace 或 mount 能力会产生 `AGENT_SANDBOX_*` 错误，不会回退到 `NodeExecutionEnv`。当 backend 的所有已配置 binding 都声明并实际创建 sandbox context 时，`sandboxEnforcement` 才为 `true`。

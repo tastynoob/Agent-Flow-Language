@@ -36,7 +36,7 @@ export interface AflAgentOptions {
 export interface AflAgentDoOptions {
   readonly name?: string;
   readonly role?: string;
-  readonly schema?: string;
+  readonly format?: readonly string[] | Readonly<Record<string, string>>;
 }
 
 type ExpressionEmitter = (builder: AflIrBuilder, destination: string) => void;
@@ -723,11 +723,11 @@ export class AflIrBuilder {
     if (options.role !== undefined && !ROLE.test(options.role)) {
       throw new Error(`invalid Agent role '${options.role}'`);
     }
-    if (options.schema !== undefined) requireSchemaSymbol(options.schema, "Agent schema");
+    const format = options.format === undefined ? undefined : normalizeAgentOutputFormat(options.format);
     const destination = options.name === undefined ? this.allocateValue("result") : this.claimName(options.name);
     const optionEntries = [
       ...(options.role === undefined ? [] : [`role: ${options.role}`]),
-      ...(options.schema === undefined ? [] : [`schema: ${options.schema}`]),
+      ...(format === undefined ? [] : [`format: ${serializeCompute(format)}`]),
     ];
     this._emitAssignment(
       destination,
@@ -897,17 +897,30 @@ function requireSymbol(value: string, label: string): void {
   if (!SYMBOL.test(value)) throw new Error(`${label} '${value}' is not a valid AFL symbol`);
 }
 
-function requireSchemaSymbol(value: string, label: string): void {
-  requireSymbol(value, label);
-  if (!value.startsWith("@schema.")) {
-    throw new Error(`${label} '${value}' must start with '@schema.'`);
-  }
-}
-
 function requireLine(value: string, label: string): string {
   const line = value.trim();
   if (line.length === 0 || /[\r\n]/u.test(line)) throw new Error(`${label} must be one non-empty line`);
   return line;
+}
+
+function normalizeAgentOutputFormat(
+  format: readonly string[] | Readonly<Record<string, string>>,
+): ComputeValue {
+  if (Array.isArray(format)) {
+    if (format.length === 0 || format.some((value) => typeof value !== "string" || value.length === 0)) {
+      throw new TypeError("Agent enum format must contain one or more non-empty strings");
+    }
+    if (new Set(format).size !== format.length) {
+      throw new TypeError("Agent enum format cannot contain duplicate values");
+    }
+    return [...format];
+  }
+  const entries = Object.entries(format);
+  if (entries.length === 0 || entries.some(([name, description]) =>
+    name.length === 0 || typeof description !== "string" || description.trim().length === 0)) {
+    throw new TypeError("Agent object format requires non-empty field names and string descriptions");
+  }
+  return Object.fromEntries(entries);
 }
 
 function sanitizeName(value: string): string {

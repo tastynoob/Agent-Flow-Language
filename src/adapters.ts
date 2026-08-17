@@ -1,6 +1,7 @@
 import type {
   AflModule,
   AgentControlMode,
+  AgentOutputFormat,
   AgentStandardToolName,
   ComputeValue,
   Frag,
@@ -23,7 +24,7 @@ export interface AgentRunRequest {
   readonly workspace: AgentWorkspaceSet;
   readonly tools?: readonly AgentStandardToolName[];
   readonly messages: readonly Message[];
-  readonly schema?: SymbolRef;
+  readonly format?: AgentOutputFormat;
   readonly signal: AbortSignal;
 }
 

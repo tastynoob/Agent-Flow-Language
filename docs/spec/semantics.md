@@ -41,11 +41,13 @@ Frag 是普通业务数据的统一表示：
 
 ```text
 Frag {
+    kind: "frag"
     content: string
+    output: reasoning | formatted
 }
 ```
 
-Frag 的 VM 表示只包含 `kind` 和 `content`。
+`reasoning` 表示模型的自然最终文本或普通文本数据；`formatted` 表示 schema/status 明确约束的模型输出，或 `sync` 等 VM formatter 产生的确定格式。标记不负责解析 content，也不改变比较行为。
 
 Frag 不带 role。同一个 Frag 可以被多个消费者读取，也可以用不同 role 加入不同 Memory。
 
@@ -146,7 +148,7 @@ Prompt source 是 symbol 时，VM 调用 Prompt binding 的 `render`。Source �
 
 ### 7.4 `input`
 
-`input` 将 prompt Frag、可选 schema、run id 和当前位置交给 Input binding。Binding 返回字符串后，VM 执行可选 schema 校验，并将字符串包装成 role-free Frag。
+`input` 将 prompt Frag、可选 schema、run id 和当前位置交给 Input binding。Binding 返回字符串后，VM 执行可选 schema 校验，并将字符串包装成 role-free Frag；带 schema 时标为 `formatted`，否则标为 `reasoning`。
 
 ### 7.5 `do`
 
@@ -154,37 +156,47 @@ Prompt source 是 symbol 时，VM 调用 Prompt binding 的 `render`。Source �
 
 1. 将输入 Frag 以显式 role 加入 Agent Memory；省略 role 时使用 `user`；
 2. 调用一次 `AgentExecutorBackend.execute`；backend 负责在返回前完成内部需要的模型 turn 和工具步骤；
-3. 将模型可见输出以 `assistant` role 加入该 Agent Memory；
-4. 返回包含同一输出字符串、但不带 role 的 Frag。
+3. 普通 activation 直接采用模型最后的 assistant 文本；指定内联 `format` 时，executor 才允许模型提交和修改 Format Output 候选；
+4. 将采用的输出以 `assistant` role 加入该 Agent Memory；
+5. 返回包含同一输出字符串、但不带 role 的 Frag。
 
 Role-free 返回值可以被另一个 Agent 作为 `user` message 接收，也可以用其他 role 显式 append。
 
 Backend 只返回最终 `output`，VM 将其追加一次 `assistant` Message。旧 `AgentAdapter` 由无状态兼容 backend 包装，仍会收到完整 canonical Memory。
 
-支持原生 session 的 backend 可以返回 session ref。VM 记录该 session 已同步的 Memory revision，并把运行中的文本、工具和 usage 事件转交 Trace 与可选 `agentHost`。这些事件不自动变成 AFL Message；支持 continuation codec 的 backend 在完整原生消息形成后，通过 executor host 把 tool call、tool result、thinking、compaction 等语义 records 流式追加到当前 Memory 文件。每个完整 record 都会推进可恢复 continuation，不等待最终 assistant 或 `do.end`。
+Reference Pi executor 只在带 `format` 的 activation 中临时提供 `afl_format_output` tool，其 canonical 名称为 `afl.format_output`。普通 `do`、Freedom activation 和未声明格式的 Agent 不会看到该 tool。它独立于文件、Shell 工具 profile，也不授予 Freedom 控制权限。
 
-`execute` 已经开始后，如果 executor、模型服务或沙箱以基础设施错误意外退出，VM 将该次 `do` 标记为 `interrupted`，并保留原始错误以及 Agent、executor、activation、Memory slot/revision、Workspace 和调用位置。模型输出校验失败、schema 不匹配等确定性 VM 错误仍是普通 `error`；由父级或兄弟失败终止的调用标记为 `cancelled`。VM 不根据错误猜测工具副作用，也不会静默切换模型厂商或 executor。
+Pi 为该 activation 动态生成一个只含 `value` 参数的工具 schema：枚举 format 将 `value` 限定为声明值；对象 format 将其限定为所有声明字段必填、禁止额外字段的 JSON object，字段描述直接附着在对应参数上。工具描述简短注明结束前必须提交；VM 不修改 system prompt，也不插入隐藏 Message。模型可以反复提交；通过校验的新候选替换旧候选，未通过的候选只返回具体错误。调用 tool 不提前结束推理，activation 正常结束时自动采用最后一个有效候选。
+
+未指定 `format` 时产生 `output: reasoning` Frag。指定 `format` 时必须取得至少一个有效候选，否则以 `AGENT_FORMAT_OUTPUT_MISSING` 失败并产生 `output: formatted` Frag。每次候选通过 `AgentExecutionHost.submitFormattedOutput` 请求 VM 校验，最终返回前 VM 再按同一内联契约复核，不能由 executor 绕过。
+
+支持原生 session 的 backend 可以返回 session ref。VM 记录该 session 已同步的 Memory revision，并把运行中的文本、工具和 usage 事件转交 Trace 与可选 `agentHost`。这些事件不自动变成 AFL Message；支持 continuation codec 的 backend 在完整原生消息形成后，通过 executor host 把 tool call、tool result、thinking、compaction 等语义 records 流式追加到当前 Memory 文件。每个完整 record 都会推进可恢复 continuation，不等待最终 assistant 或 `do.end`。如果模型最后的原生 assistant 文本与 Format Output 候选不同，前者只保留在 executor continuation 中，后者作为 canonical Memory 的 assistant Message；恢复时不会把两者重复注入。
+
+`execute` 已经开始后，如果 executor、模型服务或沙箱以基础设施错误意外退出，VM 将该次 `do` 标记为 `interrupted`，并保留原始错误以及 Agent、executor、activation、Memory slot/revision、Workspace 和调用位置。格式校验失败等确定性 VM 错误仍是普通 `error`；由父级或兄弟失败终止的调用标记为 `cancelled`。VM 不根据错误猜测工具副作用，也不会静默切换模型厂商或 executor。
 
 中断会停止后续调度，取消并等待同一并发作用域内的其他任务，随后刷完 Memory 持久化队列、记录 run 级中断标记并关闭 run。并行 TaskGroup 同时包含根因与连带取消时，`sync` 优先传播带中断上下文的根因。当前标记只为外部恢复逻辑提供证据，不是 snapshot；VM 尚不保存 instruction pointer、外部进程或 Workspace 文件状态。
 
 ### 7.6 输出格式约束
 
-Agent 调用可以带 schema symbol：
+简单状态使用枚举 format：
 
 ```text
-report = reviewer.do prompt, [schema: @schema.Report]
+review_status = reviewer.do review_prompt, [format: ["finish", "error"]]
+finish = oper review_status == "finish"
 ```
 
-存在 schema operand 时，VM 要求 Schema binding 存在，并用它校验 Agent 输出字符串。校验后的 `report` 仍是 Frag，不会自动变成 Core IR record。
-
-简单 flow 不必使用 JSON。例如 Reviewer 可以约定：没有缺陷时精确输出 `finish`，否则输出文本缺陷列表：
+结构化结果使用字段描述 record：
 
 ```text
-review_result = reviewer.do review_prompt
-finish = oper review_result == "finish"
+report = reviewer.do review_prompt,
+    [format: [
+        type: "结果类别",
+        value: "结果内容"
+    ]]
+parsed = compute @afl.parse.json, report
 ```
 
-比较按 Frag 的原始字符串执行，不自动 trim、忽略大小写或解析自然语言。模型输出中的行级控制标签可以先由 `compute @afl.parse.label` 显式提取，其他规则使用 script binding 显式转换。
+枚举比较按 Frag 的原始字符串执行，不自动 trim 或忽略大小写。对象 format 只约束字段集合，不限制每个字段值的 JSON 类型或业务含义；这些要求留在用户 prompt 中。结构化结果仍是 Frag，访问字段前使用 `compute @afl.parse.json` 显式转换。
 
 ## 8. `oper`、`compute` 与 Script Executor
 
