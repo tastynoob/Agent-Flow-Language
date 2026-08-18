@@ -1280,6 +1280,7 @@ test("Pi sandbox can expose read-only listing without exposing elevation", async
         "afl_transaction_request",
       ]);
       assert.doesNotMatch(context.systemPrompt ?? "", /afl_elevated_tool/u);
+      assert.match(context.systemPrompt ?? "", /Do not assume host-only helpers such as apply_patch or rg/u);
       assert.equal((context.systemPrompt ?? "").includes(`${contextRoot} -> /readonly/0`), true);
       return fauxAssistantMessage(fauxToolCall("list", { path: "/readonly/0" }, { id: "readonly-list" }), {
         stopReason: "toolUse",

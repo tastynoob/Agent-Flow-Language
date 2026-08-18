@@ -2628,11 +2628,9 @@ export class AflVm {
           const workspace = literalWorkspacePaths(instruction.workspace);
           if (workspace === undefined) continue;
           const childPrimary = resolveWorkspaceLiteral(scope.context.executionRoot, workspace.primary);
-          const writerPaths = [
-            scope.planner.workspace.primary.root,
-            ...scope.planner.workspace.readOnly.map((item) => item.root),
-          ];
-          const primaryConflict = writerPaths.find((path) => workspacePathOverlap(path, childPrimary));
+          const primaryConflict = workspacePathOverlap(scope.planner.workspace.primary.root, childPrimary)
+            ? scope.planner.workspace.primary.root
+            : undefined;
           const readOnlyConflict = workspace.readOnly
             .map((path) => resolveWorkspaceLiteral(scope.context.executionRoot, path))
             .find((path) => workspacePathOverlap(path, scope.planner.workspace.primary.root));
@@ -3211,10 +3209,8 @@ function freedomWorkspaceConflict(
   child: AgentWorkspaceSet,
   writer: AgentWorkspaceSet,
 ): { readonly child: string; readonly writer: string } | undefined {
-  for (const writerPath of [writer.primary, ...writer.readOnly]) {
-    if (workspacePathOverlap(child.primary.root, writerPath.root)) {
-      return { child: child.primary.root, writer: writerPath.root };
-    }
+  if (workspacePathOverlap(child.primary.root, writer.primary.root)) {
+    return { child: child.primary.root, writer: writer.primary.root };
   }
   for (const childPath of child.readOnly) {
     if (workspacePathOverlap(childPath.root, writer.primary.root)) {

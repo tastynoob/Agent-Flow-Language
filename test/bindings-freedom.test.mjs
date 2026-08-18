@@ -506,7 +506,7 @@ main(task):
   assert.equal(irApprovals, 2);
 });
 
-test("Freedom reports static Workspace overlap and rejects it at runtime", async (t) => {
+test("Freedom allows a routed writer beneath the planner's read-only Workspace", async (t) => {
   const root = await temporaryRoot(t);
   await mkdir(join(root, "shared"), { recursive: true });
   let childExecuted = false;
@@ -526,12 +526,12 @@ main():
   const validation = validateModule(parseAfl(source));
   assert.equal(validation.ok, true);
   assert.equal(validation.diagnostics.some((item) =>
-    item.code === "FREEDOM_WORKSPACE_OVERLAP" && item.severity === "warning"), true);
+    item.code === "FREEDOM_WORKSPACE_OVERLAP" && item.severity === "warning"), false);
 
   const backend = controlBackend(async (request, host) => {
     if (request.agent.name === "@agent.department") {
       childExecuted = true;
-      return completed("unexpected");
+      return completed("child-complete");
     }
     const response = await host.executeControlTool({
       id: "overlap",
@@ -543,11 +543,54 @@ main():
     assert.equal(result.ok, true);
     return completed("overlap-handled");
   });
+  const result = await AflVm.fromSource(source, { agentExecutor: backend }).run(
+    "main",
+    [],
+    { executionRoot: root, runId: "readonly-overlap" },
+  );
+  assert.deepEqual(JSON.parse(result.output.content), ["child-complete"]);
+  assert.equal(childExecuted, true);
+});
+
+test("Freedom reports overlap with the planner's writable Workspace and rejects it", async (t) => {
+  const root = await temporaryRoot(t);
+  let childExecuted = false;
+  const source = `
+department(task):
+    entry:
+        worker = agent @agent.department, [workspace: "shared/child"]
+        result = worker.do task
+        ret result
+main():
+    entry:
+        planner = agent @agent.planner, [workspace: "shared"]
+        jobs = planner.route "plan", [nodes: [department]]
+        reports = sync jobs
+        ret reports
+`;
+  const validation = validateModule(parseAfl(source));
+  assert.equal(validation.ok, true);
+  assert.equal(validation.diagnostics.some((item) =>
+    item.code === "FREEDOM_WORKSPACE_OVERLAP" && item.severity === "warning"), true);
+
+  const backend = controlBackend(async (request, host) => {
+    if (request.agent.name === "@agent.department") {
+      childExecuted = true;
+      return completed("unexpected");
+    }
+    await host.executeControlTool({
+      id: "overlap",
+      name: "afl.route.add",
+      input: { node: "department", args: [{ string: "task" }] },
+      signal: request.signal,
+    });
+    return completed("overlap-handled");
+  });
   await assert.rejects(
     AflVm.fromSource(source, { agentExecutor: backend }).run(
       "main",
       [],
-      { executionRoot: root, runId: "overlap" },
+      { executionRoot: root, runId: "writer-overlap" },
     ),
     { code: "FREEDOM_WORKSPACE_OVERLAP" },
   );

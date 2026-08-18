@@ -1818,6 +1818,7 @@ function sandboxWorkspaceContextPrompt(workspace: AgentWorkspaceSet, elevationAv
   const lines = [
     "Primary workspace: /workspace",
     "Use /workspace as the working directory for file and command operations.",
+    "Use the exposed file tools for file changes. Do not assume host-only helpers such as apply_patch or rg are installed inside the sandbox.",
   ];
   if (elevationAvailable) {
     lines.push(

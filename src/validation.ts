@@ -821,7 +821,7 @@ function staticWorkspaceSet(expression: ValueExpr | undefined): StaticWorkspaceS
 }
 
 function staticWorkspaceConflict(child: StaticWorkspaceSet, writer: StaticWorkspaceSet): boolean {
-  if ([writer.primary, ...writer.readOnly].some((path) => workspacePathOverlap(child.primary, path))) {
+  if (workspacePathOverlap(child.primary, writer.primary)) {
     return true;
   }
   return child.readOnly.some((path) => workspacePathOverlap(path, writer.primary));
