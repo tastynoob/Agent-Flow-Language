@@ -15,6 +15,7 @@ export * from "./memory-store.js";
 export * from "./openai-compatible.js";
 export * from "./parser.js";
 export * from "./pi-agent-executor.js";
+export * from "./recovery.js";
 export * from "./vm-values.js";
 export * from "./vm.js";
 export * from "./testing.js";

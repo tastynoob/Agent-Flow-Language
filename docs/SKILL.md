@@ -435,12 +435,14 @@ persistContinuation(delta) -> void
 authorizeTool(action) -> allowed | denied
 requestElevation(request) -> allowed | denied
 requestTransaction(request) -> completed | denied | unavailable
-requestInput(request) -> string
+requestInput({id, ..., signal}) -> string
 submitFormattedOutput(request) -> accepted | rejected
 executeControlTool(request) -> {content: string, details?: compute}
 ```
 
-在 executor 执行任何外部作用工具前调用 `authorizeTool`。Action 的 `capability` 使用稳定 AFL 名称，`toolName` 保留 executor 原生名称，`effectiveInput` 是 policy 实际判断的规范化安全视图。Format Output 是显式格式化 activation 内部的结果提交，不进入文件或 Shell policy；普通 reasoning activation 不应暴露它。将候选交给 `submitFormattedOutput`，并把 rejected 的 code/message 返回给模型继续修正。只有策略返回可提权的拒绝时才调用 `requestElevation`；需要宿主确认外部事务完成时调用 `requestTransaction`；需要用户或上层系统补充信息时调用 `requestInput`。Agent event 只使用 `message.delta`、`tool.requested/policy/started/updated/completed`、`transaction.state`、`elevation.state`、`usage.updated` 或 `warning`。
+在 executor 执行任何外部作用工具前调用 `authorizeTool`。Action 的 `capability` 使用稳定 AFL 名称，`toolName` 保留 executor 原生名称，`effectiveInput` 是 policy 实际判断的规范化安全视图。Format Output 是显式格式化 activation 内部的结果提交，不进入文件或 Shell policy；普通 reasoning activation 不应暴露它。将候选交给 `submitFormattedOutput`，并把 rejected 的 code/message 返回给模型继续修正。只有策略返回可提权的拒绝时才调用 `requestElevation`。需要宿主确认外部事务完成时调用 `requestTransaction`；需要用户或上层系统补充信息时调用带稳定 `id` 的 `requestInput`。Agent event 只使用 `message.delta`、`tool.requested/policy/started/updated/completed`、`transaction.state`、`elevation.state`、`usage.updated` 或 `warning`。
+
+普通模型工具没有 VM 级 prepare/commit 恢复协议。executor 应把完整的 tool call 和 tool result 作为 continuation 语义记录持久化；中断恢复后由 Agent 根据会话和当前 Workspace 判断检查、重试或修复。安全授权、审批、提权和沙箱仍必须执行，但 AFL 不承诺回滚或 exactly-once。`invoke`、script 和 external flow 也可能在从 entry 重放时再次执行，binding 作者应优先实现为纯函数，或自行提供幂等与对账语义。
 
 按以下生命周期实现 Agent activation：追加输入消息，验证 canonical Memory，恢复兼容 session，执行 Agent 授权，持久化 attempt 起点，运行 executor，处理取消或非完成 stop reason，验证内联 format，追加 assistant 输出，更新 continuation，再提交完成状态。任何中途错误都不得伪造成功输出。
 

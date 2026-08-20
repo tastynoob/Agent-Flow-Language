@@ -15,6 +15,7 @@ import {
 import {
   AflVm,
   FileMemoryStateStore,
+  FileRecoveryStateStore,
   FifoAgentApprovalQueue,
   MemoryTraceSink,
   MockAgentAdapter,
@@ -338,7 +339,7 @@ main():
   assert.doesNotMatch(serialized, /AFL Freedom Route activation/u);
 });
 
-test("Pi session continuation persists tools and thinking and restores replay policy", async (t) => {
+test("Pi completed run IDs cannot be reused for a second Memory generation", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "afl-pi-continuation-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const faux = fauxProvider();
@@ -395,52 +396,18 @@ main():
   assert.match(serialized, /"type":"tool\.call"/u);
   assert.match(serialized, /"type":"tool\.result"/u);
 
-  faux.appendResponses([(context) => {
-    assert.equal(context.messages.some((message) => message.role === "toolResult"), true);
-    assert.equal(hasThinking(context.messages, "inspect with the lookup tool"), true);
-    return fauxAssistantMessage("second-output");
-  }]);
-  await AflVm.fromSource(source, { agentExecutor: backend("include") }).run(
-    "main",
-    [],
-    { runId: "pi-continuation", executionRoot: root },
-  );
-
-  faux.appendResponses([(context) => {
-    assert.equal(context.messages.some((message) => message.role === "toolResult"), true);
-    assert.equal(hasThinking(context.messages), false);
-    return fauxAssistantMessage("third-output");
-  }]);
-  const result = await AflVm.fromSource(source, { agentExecutor: backend("exclude") }).run(
-    "main",
-    [],
-    { runId: "pi-continuation", executionRoot: root },
-  );
-  assert.equal(result.output.content, "third-output");
-
-  const finalState = await readMemoryState(root);
-  const finalSlot = Object.values(finalState.memories)[0];
-  const finalPayload = finalSlot.continuation.state.payload;
-  assert.match(JSON.stringify(finalPayload), /inspect with the lookup tool/u);
-
-  let incompatibleExecutorCalled = false;
-  const incompatible = new MockAgentAdapter().on("@agent.worker", () => {
-    incompatibleExecutorCalled = true;
-    return "unexpected";
-  });
   await assert.rejects(
-    AflVm.fromSource(source, { agents: incompatible }).run(
+    AflVm.fromSource(source, { agentExecutor: backend("exclude") }).run(
       "main",
       [],
       { runId: "pi-continuation", executionRoot: root },
     ),
-    { code: "AGENT_SESSION_INVALID" },
+    { code: "RECOVERY_RUN_COMPLETED" },
   );
-  assert.equal(incompatibleExecutorCalled, false);
-  assert.equal(Object.values((await readMemoryState(root)).memories)[0].revision, finalSlot.revision);
+  assert.equal(Object.values((await readMemoryState(root)).memories)[0].revision, 2);
 });
 
-test("Pi persists a canonical-only lazy base as continuation references without duplicating Memory", async (t) => {
+test("Pi preserves a canonical-only lazy base within one run without duplicating Memory", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "afl-pi-canonical-base-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const faux = fauxProvider();
@@ -485,20 +452,17 @@ main():
   assert.ok(copyFile);
   assert.equal(JSON.stringify(copyFile.records).includes("seed context"), false);
 
-  faux.appendResponses([(context) => {
-    assert.equal(messageTexts(context.messages).filter((text) => text === "seed context").length, 1);
-    assert.equal(messageTexts(context.messages).includes("first review"), true);
-    return fauxAssistantMessage("second review");
-  }]);
-  const result = await AflVm.fromSource(source, { agentExecutor: backend() }).run(
-    "main",
-    [],
-    { runId: "canonical-base", executionRoot: root },
+  await assert.rejects(
+    AflVm.fromSource(source, { agentExecutor: backend() }).run(
+      "main",
+      [],
+      { runId: "canonical-base", executionRoot: root },
+    ),
+    { code: "RECOVERY_RUN_COMPLETED" },
   );
-  assert.equal(result.output.content, "second review");
 });
 
-test("a persisted Memory without continuation can switch from a stateless executor to Pi", async (t) => {
+test("a completed run cannot switch from a stateless executor to Pi", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "afl-pi-executor-switch-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const source = `
@@ -518,25 +482,18 @@ main():
   const faux = fauxProvider();
   const models = createModels();
   models.setProvider(faux.provider);
-  faux.setResponses([(context) => {
-    assert.equal(messageTexts(context.messages).includes("stateless output"), true);
-    return fauxAssistantMessage("pi output");
-  }]);
   const backend = new PiAgentExecutorBackend({
     models,
     defaultBinding: { model: faux.getModel() },
   });
-  const result = await AflVm.fromSource(source, { agentExecutor: backend }).run(
-    "main",
-    [],
-    { runId: "executor-switch", executionRoot: root },
+  await assert.rejects(
+    AflVm.fromSource(source, { agentExecutor: backend }).run(
+      "main",
+      [],
+      { runId: "executor-switch", executionRoot: root },
+    ),
+    { code: "RECOVERY_RUN_COMPLETED" },
   );
-  assert.equal(result.output.content, "pi output");
-
-  const state = await readMemoryState(root);
-  const memory = Object.values(state.memories)[0];
-  assert.equal(memory.continuation.state.backend, "pi");
-  assert.equal(memory.continuation.state.format, "pi.session/v0");
 });
 
 test("Pi appends thinking and tool calls before agent.do completes", async (t) => {
@@ -975,6 +932,60 @@ main():
   await assert.rejects(running, { code: "AGENT_CANCELLED" });
 });
 
+test("Pi imports an interrupted native session during explicit VM recovery", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "afl-pi-recovery-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  faux.setResponses([() => {
+    throw new Error("provider stream ended");
+  }]);
+  const source = `
+main():
+    entry:
+        worker = agent @agent.worker
+        result = worker.do "original task"
+        ret result
+`;
+  const interrupted = AflVm.fromSource(source, {
+    agentExecutor: new PiAgentExecutorBackend({
+      models,
+      defaultBinding: { model: faux.getModel() },
+    }),
+  });
+  await assert.rejects(
+    interrupted.run("main", [], { runId: "pi-native-recovery", executionRoot: root }),
+    (error) => error.code === "AGENT_EXECUTION_FAILED" && error.details?.interruption !== undefined,
+  );
+
+  let recoveryPrompt;
+  faux.setResponses([(context) => {
+    recoveryPrompt = messageTexts(context.messages).at(-1);
+    return fauxAssistantMessage("recovered result");
+  }]);
+  const resumed = AflVm.fromSource(source, {
+    agentExecutor: new PiAgentExecutorBackend({
+      models,
+      defaultBinding: { model: faux.getModel() },
+    }),
+  });
+  const result = await resumed.run("main", [], {
+    runId: "pi-native-recovery",
+    executionRoot: root,
+    resume: true,
+  });
+  assert.equal(result.output.content, "recovered result");
+  assert.match(recoveryPrompt, /Resume the interrupted task/u);
+
+  const state = await readMemoryState(root);
+  const memory = Object.values(state.memories)[0];
+  assert.deepEqual(memory.messages, [
+    { role: "user", content: "original task" },
+    { role: "assistant", content: "recovered result" },
+  ]);
+});
+
 test("Pi coding tools are created for each Agent primary Workspace", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "afl-pi-workspace-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -1397,6 +1408,10 @@ main():
   assert.equal(approvals[0].subject.toolName, "bash");
   assert.equal(approvals[0].subject.executionBoundary, "host");
   assert.match(approvals[0].reasons[0].reason, /outside bubblewrap mounts/u);
+  const recovery = await FileRecoveryStateStore.create(join(root, ".afl", "recovery"))
+    .loadRun(result.runId, new AbortController().signal);
+  assert.equal(recovery.some((record) =>
+    record.type === "operation.prepared" && record.operation.kind === "agent.tool"), false);
 });
 
 test("Pi soft policy block reaches approval only after the model actively requests elevation", async (t) => {

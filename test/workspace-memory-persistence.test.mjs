@@ -1,5 +1,16 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, mkdir, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  mkdtemp,
+  mkdir,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -22,34 +33,31 @@ main():
         ret result
 `;
 
-test("a repeated runId restores canonical Memory and starts the flow entry again", async (t) => {
+test("a completed runId is immutable and cannot start a second Memory generation", async (t) => {
   const root = await temporaryRoot(t);
   const firstAgents = new MockAgentAdapter().on("@agent.worker", () => "first-output");
   const first = AflVm.fromSource(SINGLE_AGENT_FLOW, { agents: firstAgents });
   await first.run("main", [], { runId: "restore-run", executionRoot: root });
 
-  let restoredMessages;
+  let called = false;
   const secondAgents = new MockAgentAdapter().on("@agent.worker", (request) => {
-    restoredMessages = request.messages.map((message) => ({ ...message }));
+    called = true;
     return "second-output";
   });
   const second = AflVm.fromSource(SINGLE_AGENT_FLOW, { agents: secondAgents });
-  const result = await second.run("main", [], { runId: "restore-run", executionRoot: root });
-
-  assert.equal(result.output.content, "second-output");
-  assert.deepEqual(restoredMessages, [
-    { role: "user", content: "turn" },
-    { role: "assistant", content: "first-output" },
-    { role: "user", content: "turn" },
-  ]);
+  await assert.rejects(
+    second.run("main", [], { runId: "restore-run", executionRoot: root }),
+    { code: "RECOVERY_RUN_COMPLETED" },
+  );
+  assert.equal(called, false);
 
   const state = await readOnlyState(root);
   assert.equal(state.format, "afl.memory-run");
   assert.match(state.rootModuleDigest, /^sha256:[a-f0-9]{64}$/u);
   const slots = Object.values(state.memories);
   assert.equal(slots.length, 1);
-  assert.equal(slots[0].revision, 4);
-  assert.equal(slots[0].messages.at(-1).content, "second-output");
+  assert.equal(slots[0].revision, 2);
+  assert.equal(slots[0].messages.at(-1).content, "first-output");
 });
 
 test("default persistence remains lazy until the first durable Memory allocation", async (t) => {
@@ -263,7 +271,7 @@ test("the same runId permits one active top-level run per store namespace", asyn
 
   await assert.rejects(
     vm.run("main", [], { runId: "active-run", executionRoot: root }),
-    { code: "MEMORY_RUN_ACTIVE" },
+    { code: "RECOVERY_RUN_ACTIVE" },
   );
   release();
   await running;
@@ -271,16 +279,21 @@ test("the same runId permits one active top-level run per store namespace", asyn
 
 test("a runId cannot restore Memory from a different root module", async (t) => {
   const root = await temporaryRoot(t);
-  const agents = new MockAgentAdapter().on("@agent.worker", () => "done");
-  await AflVm.fromSource(SINGLE_AGENT_FLOW, { agents }).run(
-    "main",
-    [],
-    { runId: "module-change", executionRoot: root },
+  const agents = new MockAgentAdapter().on("@agent.worker", () => {
+    throw new Error("provider unavailable");
+  });
+  await assert.rejects(
+    AflVm.fromSource(SINGLE_AGENT_FLOW, { agents }).run(
+      "main",
+      [],
+      { runId: "module-change", executionRoot: root },
+    ),
+    { code: "ADAPTER_ERROR" },
   );
   const changed = AflVm.fromSource(SINGLE_AGENT_FLOW.replace('"turn"', '"changed"'), { agents });
   await assert.rejects(
-    changed.run("main", [], { runId: "module-change", executionRoot: root }),
-    { code: "MEMORY_STATE_INVALID" },
+    changed.run("main", [], { runId: "module-change", executionRoot: root, resume: true }),
+    { code: "RECOVERY_RUN_INCOMPATIBLE" },
   );
 });
 
@@ -370,6 +383,63 @@ test("a failed Memory save prevents already-queued snapshots from reaching the s
   await assert.rejects(persistence.close(), { code: "MEMORY_STATE_SAVE_FAILED" });
 });
 
+test("a full-state Memory store does not see another slot before its queued save commits", async () => {
+  let releaseFirstSave;
+  let markFirstSaveEntered;
+  const firstSaveEntered = new Promise((resolve) => {
+    markFirstSaveEntered = resolve;
+  });
+  const firstSaveBlocked = new Promise((resolve) => {
+    releaseFirstSave = resolve;
+  });
+  const snapshots = [];
+  const store = {
+    async loadRun() {
+      return undefined;
+    },
+    async saveRun(state) {
+      snapshots.push(structuredClone(state));
+      if (snapshots.length === 1) {
+        markFirstSaveEntered();
+        await firstSaveBlocked;
+      }
+    },
+  };
+  const signal = new AbortController().signal;
+  const digest = canonicalModuleDigest(parseAfl("main():\n    entry:\n        ret\n"));
+  const persistence = await RunMemoryPersistence.open(
+    { store },
+    process.cwd(),
+    "committed-snapshots",
+    digest,
+    signal,
+  );
+  persistence.claim("first", digest);
+  persistence.claim("second", digest);
+  const first = persistence.save(
+    "first",
+    digest,
+    [{ role: "user", content: "first" }],
+    1,
+    undefined,
+    signal,
+  );
+  await firstSaveEntered;
+  const second = persistence.save(
+    "second",
+    digest,
+    [{ role: "user", content: "second" }],
+    1,
+    undefined,
+    signal,
+  );
+  assert.deepEqual(Object.keys(snapshots[0].memories), ["first"]);
+  releaseFirstSave();
+  await Promise.all([first, second]);
+  assert.deepEqual(Object.keys(snapshots[1].memories).sort(), ["first", "second"]);
+  await persistence.close();
+});
+
 test("invalid data in the middle of a Memory stream is rejected", async (t) => {
   const root = await temporaryRoot(t);
   const agents = new MockAgentAdapter().on("@agent.worker", () => "done");
@@ -383,7 +453,48 @@ test("invalid data in the middle of a Memory stream is rejected", async (t) => {
   await writeFile(path, `${JSON.stringify(records[0], null, 2)}\n\nnot-json\n\n${JSON.stringify(records[1], null, 2)}\n`);
 
   await assert.rejects(
-    vm.run("main", [], { runId: "corrupt-state", executionRoot: root }),
+    FileMemoryStateStore.create(directory).loadRun("corrupt-state", new AbortController().signal),
+    { code: "MEMORY_STATE_INVALID" },
+  );
+});
+
+test("deeply nested Memory continuation data is rejected before reconstruction", async (t) => {
+  const root = await temporaryRoot(t);
+  const agents = new MockAgentAdapter().on("@agent.worker", () => "done");
+  const vm = AflVm.fromSource(SINGLE_AGENT_FLOW, { agents });
+  await vm.run("main", [], { runId: "deep-memory-state", executionRoot: root });
+  const directory = join(root, ".afl", "memory");
+  const [runDirectory] = await readdir(directory);
+  const [filename] = (await readdir(join(directory, runDirectory))).filter((name) => name !== "program.jsons");
+  const path = join(directory, runDirectory, filename);
+  const records = parsePrettyJsonStream(await readFile(path, "utf8"));
+  let nested = "leaf";
+  for (let depth = 0; depth < 70; depth += 1) nested = { value: nested };
+  records.push({ type: "session.test", payload: nested });
+  await writeFile(path, records.map((record) => `${JSON.stringify(record, null, 2)}\n\n`).join(""));
+
+  await assert.rejects(
+    FileMemoryStateStore.create(directory).loadRun("deep-memory-state", new AbortController().signal),
+    { code: "MEMORY_STATE_INVALID" },
+  );
+});
+
+test("Memory persistence rejects a state file replaced by a symbolic link", async (t) => {
+  const root = await temporaryRoot(t);
+  const agents = new MockAgentAdapter().on("@agent.worker", () => "done");
+  const vm = AflVm.fromSource(SINGLE_AGENT_FLOW, { agents });
+  await vm.run("main", [], { runId: "linked-memory-state", executionRoot: root });
+  const directory = join(root, ".afl", "memory");
+  const [runDirectory] = await readdir(directory);
+  const runPath = join(directory, runDirectory);
+  const [filename] = (await readdir(runPath)).filter((name) => name !== "program.jsons");
+  const path = join(runPath, filename);
+  const target = join(root, "memory-target.jsons");
+  await rename(path, target);
+  await symlink(target, path);
+
+  await assert.rejects(
+    FileMemoryStateStore.create(directory).loadRun("linked-memory-state", new AbortController().signal),
     { code: "MEMORY_STATE_INVALID" },
   );
 });
@@ -403,10 +514,11 @@ test("a partial final object is truncated while complete records remain recovera
     .join("");
   await writeFile(path, `${complete}{\n  "type": "assistant",\n  "text": [\n`);
 
-  const result = await vm.run("main", [], { runId: "initial-crash", executionRoot: root });
-  assert.equal(result.output.content, "done");
-  const state = await readOnlyState(root);
-  assert.equal(Object.values(state.memories)[0].revision, 4);
+  const state = await FileMemoryStateStore.create(directory).loadRun(
+    "initial-crash",
+    new AbortController().signal,
+  );
+  assert.equal(Object.values(state.memories)[0].revision, 2);
 });
 
 test("an executor interruption preserves recovery context in Memory and Trace", async (t) => {

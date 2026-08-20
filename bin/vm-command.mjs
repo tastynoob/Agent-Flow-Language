@@ -38,6 +38,7 @@ export async function runVmCommand(argv, io = process) {
     const vmArgs = await readVmArgs(options);
     const result = await vm.run(options.entry ?? "main", vmArgs, {
       ...(options.runId === undefined ? {} : { runId: options.runId }),
+      ...(options.resume === true ? { resume: true } : {}),
       executionRoot: process.cwd(),
     });
     io.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
@@ -57,6 +58,7 @@ export function vmUsage() {
     "  afl-vm <bindings-module> <flow.afl>",
     "      [--entry <node>] [--args <json-array> | --args-file <file>]",
     "      [--trace <trace.json>] [--run-id <id>]",
+    "      [--resume]",
     "",
   ].join("\n");
 }
@@ -72,6 +74,10 @@ function parseVmOptions(args) {
   ]);
   for (let index = 0; index < args.length; index += 1) {
     const option = args[index];
+    if (option === "--resume") {
+      options.resume = true;
+      continue;
+    }
     const key = names.get(option);
     if (key === undefined) throw new Error(`unknown VM option '${option}'`);
     const value = args[index + 1];
@@ -81,6 +87,9 @@ function parseVmOptions(args) {
   }
   if (options.args !== undefined && options.argsFile !== undefined) {
     throw new Error("--args and --args-file are mutually exclusive");
+  }
+  if (options.resume === true && options.runId === undefined) {
+    throw new Error("--resume requires --run-id");
   }
   return options;
 }

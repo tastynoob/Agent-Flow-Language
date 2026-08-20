@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, open, readFile, readdir, realpath, truncate } from "node:fs/promises";
+import { constants as FS_CONSTANTS } from "node:fs";
+import { mkdir, open, readdir, realpath } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
@@ -27,6 +28,13 @@ import {
 const activeRuns = new Set<string>();
 const storeIds = new WeakMap<object, string>();
 let nextStoreId = 0;
+const MAX_MEMORY_VALUE_DEPTH = 64;
+const MAX_MEMORY_VALUE_NODES = 100_000;
+const MAX_MEMORY_STRING_BYTES = 16 * 1024 * 1024;
+const MAX_MEMORY_RECORD_BYTES = 32 * 1024 * 1024;
+const MAX_MEMORY_FILE_BYTES = 256 * 1024 * 1024;
+const MAX_MEMORY_RECORDS = 1_000_000;
+const MAX_MEMORY_FILES = 100_000;
 
 interface ProgramBeginRecord {
   readonly type: "program.begin";
@@ -117,25 +125,28 @@ export class FileMemoryStateStore implements MemoryStateStore {
     this.runDirectories.set(runId, runDirectory);
 
     const programPath = join(runDirectory, "program.jsons");
-    const programText = await readFile(programPath, "utf8");
+    const programText = await readMemoryFile(programPath, "Memory program");
     const programStream = parseJsonStream(programText, programPath);
     if (programStream.validBytes !== Buffer.byteLength(programText)) {
-      await truncate(programPath, programStream.validBytes);
+      await truncateMemoryFile(programPath, programStream.validBytes);
     }
     const program = parseProgram(programStream.values, runId, programPath);
 
     const names = (await readdir(runDirectory))
       .filter((name) => name !== "program.jsons" && name.endsWith(".jsons"))
       .sort();
+    if (names.length > MAX_MEMORY_FILES) {
+      throw invalidState(`Memory run '${runDirectory}' contains too many Memory files`);
+    }
     const loaded = new Map<string, LoadedMemoryFile>();
     const filenameToSlot = new Map<string, string>();
     const fileMap = new Map<string, string>();
     const headerMap = new Map<string, MemoryHeaderRecord>();
     for (const filename of names) {
       const path = join(runDirectory, filename);
-      const text = await readFile(path, "utf8");
+      const text = await readMemoryFile(path, "Memory file");
       const stream = parseJsonStream(text, path);
-      if (stream.validBytes !== Buffer.byteLength(text)) await truncate(path, stream.validBytes);
+      if (stream.validBytes !== Buffer.byteLength(text)) await truncateMemoryFile(path, stream.validBytes);
       const [rawHeader, ...records] = stream.values;
       const header = parseMemoryHeader(rawHeader, path);
       if (loaded.has(header.key)) throw invalidState(`Duplicate Memory key '${header.key}'`);
@@ -234,8 +245,13 @@ export class FileMemoryStateStore implements MemoryStateStore {
     const previous = this.previousSlot(request.runId, request.slot, next);
     assertAppendOnly(previous, next, request.slot);
     const added = next.messages.slice(previous.revision);
-    const input = added.at(-1);
+    const input = added.at(-1) ?? request.resumeInput;
     if (input === undefined) throw invalidState(`Memory slot '${request.slot}' do has no input Message`);
+    const durableInput = next.messages.at(-1);
+    if (added.length === 0 &&
+        (durableInput?.role !== input.role || durableInput.content !== input.content)) {
+      throw invalidState(`Memory slot '${request.slot}' resumed do input is not durable`);
+    }
     const header = await this.ensureMemoryFile(request.runId, request.slot, next, {
       agent: request.agent,
       executor: request.executor,
@@ -253,12 +269,16 @@ export class FileMemoryStateStore implements MemoryStateStore {
         ...(header.format === undefined ? { agent: request.agent, executor: request.executor } : {}),
         ...(header.format === undefined && request.format !== undefined ? { format: request.format } : {}),
       },
-      inputRecord(input),
+      ...(added.length === 0 ? [] : [inputRecord(input)]),
     ];
     await appendPretty(this.memoryPath(request.runId, request.slot), records);
     this.states.set(request.runId, cloneState(request.state));
     this.rememberSlot(request.runId, request.slot, next);
-    this.activeDos.set(key, { attemptId: request.attemptId, input: { ...input }, inputMirrored: false });
+    this.activeDos.set(key, {
+      attemptId: request.attemptId,
+      input: { ...input },
+      inputMirrored: added.length === 0,
+    });
   }
 
   async appendMemoryContinuation(
@@ -371,7 +391,7 @@ export class FileMemoryStateStore implements MemoryStateStore {
     for (const name of names) {
       const path = join(this.directory, name, "program.jsons");
       try {
-        const stream = parseJsonStream(await readFile(path, "utf8"), path);
+        const stream = parseJsonStream(await readMemoryFile(path, "Memory program"), path);
         const first = stream.values[0];
         if (isRecord(first) && first.type === "program.begin" && first.run_id === runId) {
           matches.push(join(this.directory, name));
@@ -540,10 +560,12 @@ export interface AgentDoPersistenceRequest {
   readonly executor: string;
   readonly format?: string;
   readonly location: string;
+  readonly resumeInput?: Message;
 }
 
 export class RunMemoryPersistence {
   private state: PersistedRunMemoryState;
+  private committedState: PersistedRunMemoryState;
   private readonly claimedSlots = new Set<string>();
   private readonly requestedBases = new Map<string, PersistedMemoryBase>();
   private readonly captures = new Map<string, Map<number, CapturedMemory>>();
@@ -560,6 +582,7 @@ export class RunMemoryPersistence {
     state: PersistedRunMemoryState,
   ) {
     this.state = state;
+    this.committedState = cloneState(state);
   }
 
   static async open(
@@ -650,11 +673,11 @@ export class RunMemoryPersistence {
   }
 
   isMaterialized(slot: string): boolean {
-    return this.state.memories[slot] !== undefined;
+    return this.committedState.memories[slot] !== undefined;
   }
 
   currentRevision(slot: string): number | undefined {
-    return this.state.memories[slot]?.revision;
+    return this.committedState.memories[slot]?.revision;
   }
 
   async beginAgentAttempt(
@@ -676,8 +699,9 @@ export class RunMemoryPersistence {
     const continuation = synchronizeCanonicalContinuation(request);
     this.setSlot(request.slot, request.moduleDigest, request.messages, request.revision, continuation);
     const attempt = { slot: request.slot, attemptId: randomUUID() };
-    const snapshot = cloneState(this.state);
+    const target = cloneSlot(this.state.memories[request.slot]!);
     await this.enqueue(async () => {
+      const snapshot = this.snapshotWithSlot(request.slot, target);
       if (this.store.beginMemoryDo !== undefined) {
         await this.store.beginMemoryDo({
           state: snapshot,
@@ -688,10 +712,12 @@ export class RunMemoryPersistence {
           ...(request.format === undefined ? {} : { format: request.format }),
           location: request.location,
           startedAt: new Date().toISOString(),
+          ...(request.resumeInput === undefined ? {} : { resumeInput: { ...request.resumeInput } }),
         }, signal);
       } else {
         await this.store.saveRun(snapshot, signal, { slot: request.slot, kind: "materialize" });
       }
+      this.committedState = cloneState(snapshot);
     }, signal);
     this.attempts.set(request.slot, attempt);
     return attempt;
@@ -707,22 +733,27 @@ export class RunMemoryPersistence {
     const current = this.state.memories[attempt.slot];
     if (current === undefined) throw new AflVmError("MEMORY_STATE_INVALID", "Agent Memory is not materialized");
     const continuation = applyJournalDelta(current.continuation, delta, attempt.slot);
+    let projected = cloneSlot(current);
+    for (const record of delta.records) projected = projectCanonicalRecord(projected, record, attempt.slot);
+    const target: PersistedMemorySlot = {
+      ...projected,
+      continuation: { ...continuation, memoryRevision: projected.revision },
+    };
     this.state = {
       ...this.state,
       memories: {
         ...this.state.memories,
-        [attempt.slot]: {
-          ...current,
-          continuation: { ...continuation, memoryRevision: current.revision },
-        },
+        [attempt.slot]: cloneSlot(target),
       },
     };
     await this.enqueue(async () => {
-      await this.store.appendMemoryContinuation?.({
+      if (this.store.appendMemoryContinuation === undefined) return;
+      await this.store.appendMemoryContinuation({
         runId: this.runId,
         ...attempt,
         delta: structuredClone(delta),
       }, signal);
+      this.committedState = this.snapshotWithSlot(attempt.slot, target);
     }, signal);
   }
 
@@ -732,10 +763,17 @@ export class RunMemoryPersistence {
   ): Promise<void> {
     if (this.attempts.get(attempt.slot)?.attemptId !== attempt.attemptId) return;
     const signal = new AbortController().signal;
+    const target = this.state.memories[attempt.slot] === undefined
+      ? undefined
+      : cloneSlot(this.state.memories[attempt.slot]!);
     try {
       await this.enqueue(async () => {
-        await this.store.endMemoryDo?.({
-          state: cloneState(this.state),
+        if (this.store.endMemoryDo === undefined) return;
+        const snapshot = target === undefined
+          ? cloneState(this.committedState)
+          : this.snapshotWithSlot(attempt.slot, target);
+        await this.store.endMemoryDo({
+          state: snapshot,
           runId: this.runId,
           ...attempt,
           status: outcome.status,
@@ -743,6 +781,7 @@ export class RunMemoryPersistence {
           ...(outcome.error === undefined ? {} : { error: outcome.error }),
           ...(outcome.interruption === undefined ? {} : { interruption: outcome.interruption }),
         }, signal);
+        this.committedState = cloneState(snapshot);
       }, signal);
     } finally {
       this.attempts.delete(attempt.slot);
@@ -754,8 +793,8 @@ export class RunMemoryPersistence {
     interruption: AgentInterruptionContext,
   ): Promise<void> {
     const signal = new AbortController().signal;
-    const snapshot = cloneState(this.state);
     await this.enqueue(async () => {
+      const snapshot = cloneState(this.committedState);
       await this.store.recordRunInterruption?.({
         state: snapshot,
         runId: this.runId,
@@ -785,8 +824,9 @@ export class RunMemoryPersistence {
     const wasMaterialized = this.state.memories[slot] !== undefined;
     if (!wasMaterialized) await this.ensureRequestedBase(slot, signal);
     this.setSlot(slot, moduleDigest, messages, revision, continuation);
-    const snapshot = cloneState(this.state);
+    const target = cloneSlot(this.state.memories[slot]!);
     await this.enqueue(async () => {
+      const snapshot = this.snapshotWithSlot(slot, target);
       if (attempt !== undefined && this.store.endMemoryDo !== undefined) {
         await this.store.endMemoryDo({
           state: snapshot,
@@ -801,6 +841,7 @@ export class RunMemoryPersistence {
           kind: wasMaterialized ? "append" : "materialize",
         });
       }
+      this.committedState = cloneState(snapshot);
     }, signal);
     if (attempt !== undefined) this.attempts.delete(slot);
   }
@@ -853,9 +894,13 @@ export class RunMemoryPersistence {
         },
       },
     };
-    const snapshot = cloneState(this.state);
+    const target = cloneSlot(this.state.memories[base.slot]!);
     await this.enqueue(
-      () => this.store.saveRun(snapshot, signal, { slot: base.slot, kind: "materialize" }),
+      async () => {
+        const snapshot = this.snapshotWithSlot(base.slot, target);
+        await this.store.saveRun(snapshot, signal, { slot: base.slot, kind: "materialize" });
+        this.committedState = cloneState(snapshot);
+      },
       signal,
     );
     resolving.delete(base.slot);
@@ -880,6 +925,16 @@ export class RunMemoryPersistence {
           ...(continuation === undefined ? {} : { continuation: cloneContinuation(continuation) }),
           ...(base === undefined ? {} : { base: structuredClone(base) }),
         },
+      },
+    };
+  }
+
+  private snapshotWithSlot(slot: string, value: PersistedMemorySlot): PersistedRunMemoryState {
+    return {
+      ...this.committedState,
+      memories: {
+        ...this.committedState.memories,
+        [slot]: cloneSlot(value),
       },
     };
   }
@@ -928,7 +983,9 @@ function synchronizeCanonicalContinuation(
 ): PersistedMemoryContinuation | undefined {
   if (request.format === undefined) return request.continuation;
   const synchronizedRevision = request.continuation?.memoryRevision ?? 0;
-  const targetRevision = Math.max(0, request.revision - 1);
+  const targetRevision = request.resumeInput === undefined
+    ? Math.max(0, request.revision - 1)
+    : request.revision;
   if (synchronizedRevision > targetRevision) {
     throw new AflVmError(
       "MEMORY_STATE_INVALID",
@@ -1015,7 +1072,9 @@ function parseMemoryStream(
       if (typeof role !== "string" || role.length === 0) {
         throw invalidState(`Memory '${header.key}' has an invalid input record`);
       }
-      slot = appendSlotMessage(slot, { role, content: decodeText(raw.text, header.key) });
+      if (raw.canonical !== false) {
+        slot = appendSlotMessage(slot, { role, content: decodeText(raw.text, header.key) });
+      }
       slot = appendContinuationRecord(slot, raw as BackendSessionRecord, executor, format, header.key);
       history.set(slot.revision, cloneSlot(slot));
       continue;
@@ -1340,9 +1399,16 @@ function parseJsonStream(text: string, path: string): { values: unknown[]; valid
         if (depth < 0) throw invalidState(`JSON stream '${path}' has unbalanced data`);
         if (depth === 0) {
           const end = index + 1;
+          if (Buffer.byteLength(text.slice(start, end)) > MAX_MEMORY_RECORD_BYTES) {
+            throw invalidState(`JSON stream '${path}' contains a record larger than the byte limit`);
+          }
           try {
             const value: unknown = JSON.parse(text.slice(start, end));
             if (!isRecord(value)) throw new TypeError("top-level value is not an object");
+            validateMemoryJsonValue(value, path);
+            if (values.length >= MAX_MEMORY_RECORDS) {
+              throw invalidState(`JSON stream '${path}' exceeds the record-count limit`);
+            }
             values.push(value);
           } catch (error) {
             throw invalidState(`JSON stream '${path}' contains invalid JSON`, error);
@@ -1364,7 +1430,14 @@ function prettyRecord(record: unknown): string {
 }
 
 async function writeExclusive(path: string, content: string): Promise<void> {
-  const handle = await open(path, "wx");
+  if (Buffer.byteLength(content) > MAX_MEMORY_RECORD_BYTES) {
+    throw invalidState(`Memory record '${path}' exceeds the byte limit`);
+  }
+  const handle = await open(
+    path,
+    FS_CONSTANTS.O_CREAT | FS_CONSTANTS.O_EXCL | FS_CONSTANTS.O_WRONLY | FS_CONSTANTS.O_NOFOLLOW,
+    0o600,
+  );
   try {
     await handle.writeFile(content, "utf8");
     await handle.sync();
@@ -1375,15 +1448,72 @@ async function writeExclusive(path: string, content: string): Promise<void> {
 
 async function appendPretty(path: string, records: readonly unknown[]): Promise<void> {
   if (records.length === 0) return;
-  for (const record of records) {
-    if (!isJsonValue(record)) throw invalidState(`Memory record for '${path}' is not JSON-safe`);
-  }
-  const handle = await open(path, "a");
+  const rendered = records.map((record) => {
+    validateMemoryJsonValue(record, path);
+    const content = prettyRecord(record);
+    if (Buffer.byteLength(content) > MAX_MEMORY_RECORD_BYTES) {
+      throw invalidState(`Memory record '${path}' exceeds the byte limit`);
+    }
+    return content;
+  });
+  const handle = await open(
+    path,
+    FS_CONSTANTS.O_APPEND | FS_CONSTANTS.O_WRONLY | FS_CONSTANTS.O_NOFOLLOW,
+  );
   try {
-    for (const record of records) {
-      await handle.writeFile(prettyRecord(record), "utf8");
+    const metadata = await handle.stat();
+    const addedBytes = rendered.reduce((total, content) => total + Buffer.byteLength(content), 0);
+    if (metadata.size + addedBytes > MAX_MEMORY_FILE_BYTES) {
+      throw invalidState(`Memory file '${path}' exceeds the byte limit`);
+    }
+    for (const content of rendered) {
+      await handle.writeFile(content, "utf8");
       await handle.sync();
     }
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readMemoryFile(path: string, label: string): Promise<string> {
+  let handle;
+  try {
+    handle = await open(path, FS_CONSTANTS.O_RDONLY | FS_CONSTANTS.O_NOFOLLOW);
+  } catch (error) {
+    if (isNodeError(error, "ENOENT")) throw error;
+    throw invalidState(`Cannot open ${label.toLowerCase()} '${path}'`, error);
+  }
+  try {
+    const metadata = await handle.stat();
+    if (!metadata.isFile()) throw invalidState(`${label} '${path}' is not a regular file`);
+    if (metadata.size > MAX_MEMORY_FILE_BYTES) {
+      throw invalidState(`${label} '${path}' exceeds the byte limit`);
+    }
+    const text = await handle.readFile("utf8");
+    if (Buffer.byteLength(text) > MAX_MEMORY_FILE_BYTES) {
+      throw invalidState(`${label} '${path}' exceeds the byte limit`);
+    }
+    return text;
+  } catch (error) {
+    if (error instanceof AflVmError) throw error;
+    throw invalidState(`Cannot read ${label.toLowerCase()} '${path}'`, error);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function truncateMemoryFile(path: string, length: number): Promise<void> {
+  let handle;
+  try {
+    handle = await open(path, FS_CONSTANTS.O_WRONLY | FS_CONSTANTS.O_NOFOLLOW);
+  } catch (error) {
+    throw invalidState(`Cannot open Memory file '${path}' for tail repair`, error);
+  }
+  try {
+    await handle.truncate(length);
+    await handle.sync();
+  } catch (error) {
+    throw invalidState(`Cannot repair Memory file '${path}'`, error);
   } finally {
     await handle.close();
   }
@@ -1582,6 +1712,50 @@ function isJsonValue(value: unknown): boolean {
   if (Array.isArray(value)) return value.every(isJsonValue);
   if (!isRecord(value)) return false;
   return Object.values(value).every((item) => item !== undefined && isJsonValue(item));
+}
+
+function validateMemoryJsonValue(value: unknown, path: string): void {
+  const seen = new Set<object>();
+  let nodes = 0;
+  const visit = (current: unknown, depth: number): void => {
+    nodes += 1;
+    if (nodes > MAX_MEMORY_VALUE_NODES) {
+      throw invalidState(`Memory record '${path}' contains too many values`);
+    }
+    if (depth > MAX_MEMORY_VALUE_DEPTH) {
+      throw invalidState(`Memory record '${path}' exceeds the nesting-depth limit`);
+    }
+    if (current === null || typeof current === "boolean" || typeof current === "number") {
+      if (typeof current === "number" && !Number.isFinite(current)) {
+        throw invalidState(`Memory record '${path}' contains a non-finite number`);
+      }
+      return;
+    }
+    if (typeof current === "string") {
+      if (Buffer.byteLength(current) > MAX_MEMORY_STRING_BYTES) {
+        throw invalidState(`Memory record '${path}' contains an oversized string`);
+      }
+      return;
+    }
+    if (!Array.isArray(current) && !isRecord(current)) {
+      throw invalidState(`Memory record '${path}' contains a non-JSON value`);
+    }
+    if (seen.has(current)) throw invalidState(`Memory record '${path}' contains a cyclic value`);
+    seen.add(current);
+    if (Array.isArray(current)) {
+      for (const item of current) visit(item, depth + 1);
+    } else {
+      const entries = Object.entries(current);
+      for (const [key, item] of entries) {
+        if (Buffer.byteLength(key) > MAX_MEMORY_STRING_BYTES) {
+          throw invalidState(`Memory record '${path}' contains an oversized key`);
+        }
+        visit(item, depth + 1);
+      }
+    }
+    seen.delete(current);
+  };
+  visit(value, 0);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

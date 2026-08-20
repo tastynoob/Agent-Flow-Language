@@ -758,7 +758,20 @@ function controlBackend(execute) {
       capabilities: { roleSchemas: [AFL_MESSAGE_ROLE_SCHEMA], importRoles: ["user", "assistant"] },
       validateImport() {},
     },
-    execute,
+    execute(request, host) {
+      return execute(request, {
+        ...host,
+        async executeControlTool(controlRequest) {
+          const result = await host.executeControlTool(controlRequest);
+          await host.completeControlTool({
+            id: controlRequest.id,
+            name: controlRequest.name,
+            ok: true,
+          });
+          return result;
+        },
+      });
+    },
   };
 }
 

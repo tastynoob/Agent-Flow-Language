@@ -73,6 +73,7 @@ import {
   type BackendSessionState,
   type Message,
 } from "./memory.js";
+import { recoveryValueDigest } from "./recovery.js";
 import { workspaceKey, type AgentWorkspaceSet } from "./workspace.js";
 
 export interface PiModelRef {
@@ -82,6 +83,8 @@ export interface PiModelRef {
 
 export interface PiAgentBinding<TContext extends object | undefined = undefined> {
   readonly model: Model<Api> | PiModelRef;
+  /** Extends Pi's automatic recovery fingerprint for custom tool/context semantics. */
+  readonly recoveryIdentity?: string;
   readonly systemPrompt?: string;
   readonly tools?: readonly AgentHarnessTool<TContext>[];
   readonly toolContext?: AgentHarnessToolContextSource<TContext>;
@@ -166,6 +169,7 @@ interface PiSessionRecord {
 interface PiHostRouter {
   readonly pendingSandboxActions: Map<string, PendingSandboxAction>;
   readonly elevationCandidates: ElevationCandidate[];
+  readonly recoveryControlCalls: Map<string, `afl.${string}`>;
   activation?: PiActivation;
 }
 
@@ -206,6 +210,13 @@ export function createPiCodingAgentBinding(options: PiCodingAgentBindingOptions)
   }
   return {
     model: options.model,
+    recoveryIdentity: recoveryValueDigest({
+      version: 0,
+      kind: "pi-coding-agent",
+      bash_timeout_seconds: bashTimeoutSeconds,
+      sandbox: sandbox === false ? false : sandbox.backend,
+      elevation: sandbox !== false && options.elevation !== false,
+    }),
     ...(options.systemPrompt === undefined ? {} : { systemPrompt: options.systemPrompt }),
     ...(options.activeToolNames === undefined ? {} : { activeToolNames: options.activeToolNames }),
     ...(options.thinkingLevel === undefined ? {} : { thinkingLevel: options.thinkingLevel }),
@@ -259,6 +270,7 @@ export function createPiCodingAgentBinding(options: PiCodingAgentBindingOptions)
 export class PiAgentExecutorBackend implements AgentExecutorBackend {
   readonly name = PI_BACKEND_NAME;
   readonly sessionFormat = PI_SESSION_FORMAT;
+  readonly recoveryIdentity: string;
   readonly capabilities: AgentExecutorCapabilities;
   readonly memory: AgentMemoryContract = Object.freeze({
     capabilities: Object.freeze({
@@ -287,8 +299,6 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
   private readonly defaultBinding: PiAgentBinding<any> | undefined;
   private readonly sessions = new Map<string, PiSessionRecord>();
   private readonly sessionRepo = new InMemorySessionRepo();
-  private toolRequestSequence = 0;
-
   constructor(options: PiAgentExecutorOptions) {
     this.models = options.models ?? builtinModels();
     this.agents = options.agents ?? {};
@@ -311,6 +321,17 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
       interactiveApproval: true,
       sandboxEnforcement: knownBindings.length > 0 &&
         knownBindings.every((binding) => binding.sandboxEnforcement === true),
+    });
+    this.recoveryIdentity = recoveryValueDigest({
+      version: 0,
+      backend: PI_BACKEND_NAME,
+      session_format: PI_SESSION_FORMAT,
+      agents: Object.fromEntries(
+        Object.entries(this.agents)
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([name, binding]) => [name, piBindingRecoveryIdentity(binding)]),
+      ),
+      default: this.defaultBinding === undefined ? null : piBindingRecoveryIdentity(this.defaultBinding),
     });
   }
 
@@ -356,7 +377,8 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
 
     const pending = request.memory.slice(synchronizedRevision);
     const prompt = pending.at(-1);
-    if (prompt === undefined || prompt.role !== "user") {
+    const resumeNativeSession = request.recovery !== undefined && request.session !== undefined && pending.length === 0;
+    if (!resumeNativeSession && (prompt === undefined || prompt.role !== "user")) {
       if (created) await this.deleteSession(record);
       throw new AgentExecutorError(
         "AGENT_MEMORY_ROLE_UNSUPPORTED",
@@ -366,7 +388,7 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
 
     const preExecutionLeaf = await record.session.getLeafId();
     try {
-      await this.importMessages(record, pending.slice(0, -1));
+      await this.importMessages(record, resumeNativeSession ? pending : pending.slice(0, -1));
       const unsubscribe = this.bindEvents(record, host);
       let restoreTools: (() => Promise<void>) | undefined;
       let removeAuthorization: (() => void) | undefined;
@@ -377,6 +399,7 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
       try {
         record.hostRouter.pendingSandboxActions.clear();
         record.hostRouter.elevationCandidates.splice(0);
+        record.hostRouter.recoveryControlCalls.clear();
         const activation: PiActivation = { host, request, formatRevision: 0 };
         record.hostRouter.activation = activation;
         restoreTools = await this.configureActivationTools(record, request, host);
@@ -384,7 +407,9 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
         request.signal.addEventListener("abort", abort, { once: true });
         result = request.signal.aborted
           ? await this.cancelledResult(record)
-          : await this.toResult(record, await record.harness.prompt(prompt.content), activation);
+          : await this.toResult(record, await record.harness.prompt(
+              resumeNativeSession ? recoveryContinuationPrompt(request.recovery!.operationId) : prompt!.content,
+            ), activation);
       } finally {
         delete record.hostRouter.activation;
         request.signal.removeEventListener("abort", abort);
@@ -604,6 +629,7 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     const hostRouter: PiHostRouter = {
       pendingSandboxActions: new Map(),
       elevationCandidates: [],
+      recoveryControlCalls: new Map(),
     };
     const configuredTools = executionContext.tools ?? binding.tools ?? [];
     const reservedNames = new Set([
@@ -728,6 +754,7 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
             input: params as Readonly<Record<string, unknown>>,
             signal: signal ?? request.signal,
           });
+          record.hostRouter.recoveryControlCalls.set(toolCallId, descriptor.name);
           return {
             content: [{ type: "text", text: result.content }],
             details: result.details ?? {},
@@ -844,9 +871,13 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
       if (isSessionDurabilityEvent(event)) {
         const entries = await record.session.getEntries({ afterEntrySeq: record.sourceEntryCount });
         if (entries.length > 0) {
-          const records = markFormattedOutputRecords(
-            sessionEntriesToRecords(entries),
-            record.hostRouter.activation?.formattedOutput !== undefined,
+          const activation = record.hostRouter.activation;
+          const records = markRecoveryInputRecords(
+            markFormattedOutputRecords(
+              sessionEntriesToRecords(entries),
+              activation?.formattedOutput !== undefined,
+            ),
+            activation?.request.recovery !== undefined,
           );
           if (records.length > 0) {
             await host.persistContinuation({
@@ -858,6 +889,17 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
             record.durableRecords.push(...structuredClone(records));
           }
           record.sourceEntryCount += entries.length;
+        }
+      }
+      if (event.type === "tool_execution_end") {
+        const controlName = record.hostRouter.recoveryControlCalls.get(event.toolCallId);
+        if (controlName !== undefined) {
+          record.hostRouter.recoveryControlCalls.delete(event.toolCallId);
+          await host.completeControlTool({
+            id: event.toolCallId,
+            name: controlName,
+            ok: !event.isError,
+          });
         }
       }
       const mapped = mapEvent(event);
@@ -875,7 +917,6 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     if (request.format !== undefined) controlNames.add(PI_FORMAT_OUTPUT_TOOL_NAME);
     if (record.executionContext.elevation !== undefined) controlNames.add(PI_ELEVATION_TOOL_NAME);
     return record.harness.on("tool_call", async (event) => {
-      this.toolRequestSequence += 1;
       if (controlNames.has(event.toolName)) {
         await host.emit({ type: "tool.started", id: event.toolCallId, name: event.toolName });
         return undefined;
@@ -891,7 +932,12 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
         request.signal,
       ) ?? input;
       const authorization = await host.authorizeTool({
-        requestId: `${request.runId}:pi-tool:${this.toolRequestSequence}`,
+        requestId: [
+          request.runId,
+          "agent-tool",
+          request.operationId ?? `${request.node}:${request.block}`,
+          event.toolCallId,
+        ].join(":"),
         runId: request.runId,
         node: request.node,
         block: request.block,
@@ -1214,8 +1260,8 @@ function createElevationTool(
         },
         signal: requestSignal,
       });
-      if (authorization.status === "denied") {
-        throw new Error(`Elevated execution denied [${authorization.code}]: ${authorization.reason}`);
+      if (authorization.status !== "allowed") {
+        throw new Error(`Elevated execution unavailable [${authorization.code}]: ${authorization.reason}`);
       }
       await activation.host.emit({ type: "tool.started", id: elevatedCallId, name: target.name });
       try {
@@ -1256,6 +1302,49 @@ function importedAssistantMessage(model: Model<Api>, content: string, timestamp:
   };
 }
 
+function piBindingRecoveryIdentity(binding: PiAgentBinding<any>): string {
+  const model = "api" in binding.model
+    ? {
+        provider: binding.model.provider,
+        id: binding.model.id,
+        api: binding.model.api,
+        base_url: binding.model.baseUrl,
+        reasoning: binding.model.reasoning,
+        input: [...binding.model.input],
+        context_window: binding.model.contextWindow,
+        max_tokens: binding.model.maxTokens,
+      }
+    : {
+        provider: binding.model.provider,
+        id: binding.model.id,
+      };
+  const stream = binding.streamOptions === undefined
+    ? null
+    : {
+        transport: binding.streamOptions.transport ?? "",
+        timeout_ms: binding.streamOptions.timeoutMs ?? null,
+        max_retries: binding.streamOptions.maxRetries ?? null,
+        max_retry_delay_ms: binding.streamOptions.maxRetryDelayMs ?? null,
+        cache_retention: binding.streamOptions.cacheRetention ?? null,
+      };
+  return recoveryValueDigest({
+    version: 0,
+    model,
+    system_prompt: binding.systemPrompt ?? "",
+    tools: binding.tools?.map((tool) => tool.name) ?? [],
+    active_tools: binding.activeToolNames === undefined ? null : [...binding.activeToolNames],
+    thinking_level: binding.thinkingLevel ?? "",
+    thinking_replay: binding.thinkingReplay ?? "include",
+    stream,
+    tool_boundaries: binding.toolBoundaries === undefined
+      ? null
+      : Object.fromEntries(Object.entries(binding.toolBoundaries).sort(([left], [right]) => left.localeCompare(right))),
+    sandbox_enforcement: binding.sandboxEnforcement ?? false,
+    dynamic_context: binding.createExecutionContext !== undefined,
+    extension: binding.recoveryIdentity ?? "",
+  });
+}
+
 function withoutHistoricalThinking(messages: readonly AgentMessage[]): AgentMessage[] {
   let currentTurnStart = -1;
   for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -1280,6 +1369,16 @@ function markFormattedOutputRecords(
 ): BackendSessionRecord[] {
   if (!outputSubmitted) return [...records];
   return records.map((record) => record.type === "assistant" && record.final !== false
+    ? { ...record, canonical: false }
+    : record);
+}
+
+function markRecoveryInputRecords(
+  records: readonly BackendSessionRecord[],
+  recovering: boolean,
+): BackendSessionRecord[] {
+  if (!recovering) return [...records];
+  return records.map((record) => record.type === "user"
     ? { ...record, canonical: false }
     : record);
 }
@@ -2065,6 +2164,11 @@ function piControlToolName(name: string): string {
 function joinPrompts(...prompts: readonly (string | undefined)[]): string | undefined {
   const parts = prompts.filter((value): value is string => value !== undefined && value.length > 0);
   return parts.length === 0 ? undefined : parts.join("\n\n");
+}
+
+function recoveryContinuationPrompt(operationId: string): string {
+  return `Resume the interrupted task (${operationId}). Continue from the durable session and Workspace state; ` +
+    "do not repeat completed tool effects. Return the originally requested result.";
 }
 
 function throwIfAborted(signal: AbortSignal): void {

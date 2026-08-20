@@ -59,7 +59,15 @@ export interface AgentExecutionRequest {
   readonly sessionMemoryRevision?: number;
   readonly format?: AgentOutputFormat;
   readonly control?: AgentControlActivation;
+  /** Stable VM operation identity used to resume this Agent activation and its VM-owned control effects. */
+  readonly operationId?: string;
+  readonly recovery?: AgentExecutionRecovery;
   readonly signal: AbortSignal;
+}
+
+export interface AgentExecutionRecovery {
+  readonly mode: "resume";
+  readonly operationId: string;
 }
 
 export interface AgentControlActivation {
@@ -76,6 +84,12 @@ export interface AgentControlToolRequest {
 export interface AgentControlToolResult {
   readonly content: string;
   readonly details?: ComputeValue;
+}
+
+export interface AgentControlToolCompletionRequest {
+  readonly id: string;
+  readonly name: `afl.${string}`;
+  readonly ok: boolean;
 }
 
 export interface AgentFormatOutputSubmissionRequest {
@@ -135,11 +149,14 @@ export type AgentExecutionEvent =
   | { readonly type: "warning"; readonly message: string };
 
 export interface AgentInputRequest {
+  /** Stable logical request identity within one Agent activation. */
+  readonly id: string;
   readonly runId: string;
   readonly node: string;
   readonly block: string;
   readonly agent: SymbolRef;
   readonly prompt: string;
+  readonly signal: AbortSignal;
 }
 
 export interface AgentTransactionRequest {
@@ -179,6 +196,8 @@ export interface AgentExecutionHost {
     request: AgentFormatOutputSubmissionRequest,
   ): Promise<AgentFormatOutputSubmissionResult>;
   executeControlTool(request: AgentControlToolRequest): Promise<AgentControlToolResult>;
+  /** Called after the executor has durably incorporated the control-tool result. */
+  completeControlTool(request: AgentControlToolCompletionRequest): void | Promise<void>;
 }
 
 export type AgentToolAuthorization =
@@ -199,6 +218,8 @@ export interface AgentInteractionHost {
 export interface AgentExecutorBackend {
   readonly name: string;
   readonly sessionFormat?: string;
+  /** Stable non-secret identity for model, tool, and backend semantics used by recovery. */
+  readonly recoveryIdentity?: string;
   readonly capabilities: AgentExecutorCapabilities;
   readonly memory: AgentMemoryContract;
 

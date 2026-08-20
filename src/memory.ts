@@ -104,6 +104,7 @@ export interface MemoryDoBeginRequest extends MemoryDoRequest {
   readonly format?: string;
   readonly location: string;
   readonly startedAt: string;
+  readonly resumeInput?: Message;
 }
 
 export interface MemoryContinuationAppendRequest extends MemoryDoRequest {

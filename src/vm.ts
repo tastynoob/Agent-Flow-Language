@@ -12,10 +12,12 @@ import { agentStandardTool } from "./agent-tools.js";
 import {
   AgentAdapterExecutorBackend,
   type AgentControlActivation,
+  type AgentControlToolCompletionRequest,
   type AgentControlToolRequest,
   type AgentControlToolResult,
   AgentExecutorError,
   type AgentExecutionHost,
+  type AgentInputRequest,
   type AgentExecutionRequest,
   type AgentExecutionStopReason,
   type AgentExecutorBackend,
@@ -83,6 +85,13 @@ import {
 } from "./ir.js";
 import { parseAfl } from "./parser.js";
 import {
+  RunRecoveryPersistence,
+  cloneRecoveryValue,
+  recoveryOperationId,
+  recoveryValueDigest,
+  type RecoveryOperationDescriptor,
+} from "./recovery.js";
+import {
   RunMemoryPersistence,
   type AgentAttemptEnd,
   type MemoryPersistenceAttempt,
@@ -117,6 +126,7 @@ import {
 
 export interface VmRunOptions {
   readonly runId?: string;
+  readonly resume?: boolean;
   readonly signal?: AbortSignal;
   readonly maxSteps?: number;
   readonly executionRoot?: string;
@@ -144,6 +154,7 @@ interface VmRunContext {
   readonly executionRoot: string;
   readonly rootModuleDigest: string;
   readonly persistence: RunMemoryPersistence;
+  readonly recovery: RunRecoveryPersistence;
   readonly counters: {
     steps: number;
     trace: number;
@@ -163,6 +174,8 @@ interface ActivationContext {
 interface FreedomRuntime {
   readonly activation: AgentControlActivation;
   execute(request: AgentControlToolRequest): Promise<AgentControlToolResult>;
+  snapshot(): ComputeValue;
+  restore(value: ComputeValue): void;
 }
 
 interface FreedomScope {
@@ -208,6 +221,15 @@ interface FreedomRouteTracker {
   readonly generatedNodes: ReadonlySet<string>;
 }
 
+interface AgentHostRuntime {
+  readonly host: AgentExecutionHost;
+}
+
+interface ControlDeliveryWaiter {
+  readonly promise: Promise<void>;
+  readonly resolve: () => void;
+}
+
 interface GeneratedIrValidation {
   readonly valid: boolean;
   readonly digest?: string;
@@ -221,6 +243,8 @@ interface TraceLocation {
   readonly block?: string;
   readonly instruction?: number;
 }
+
+type AgentRecoveryOperation = Omit<RecoveryOperationDescriptor, "details">;
 
 let runSequence = 0;
 
@@ -263,12 +287,41 @@ export class AflVm {
       linked.dispose();
       throw new AflVmError("VM_POLICY_INVALID", "maxConcurrency must be a positive integer");
     }
+    if (options.resume === true && options.runId === undefined) {
+      linked.dispose();
+      throw new AflVmError("RUN_OPTIONS_INVALID", "resume requires an explicit runId");
+    }
     const runId = options.runId ?? createRunId();
     const rootModuleDigest = canonicalModuleDigest(this.module);
     let persistence: RunMemoryPersistence | undefined;
+    let recovery: RunRecoveryPersistence | undefined;
     let executionRoot: string;
     try {
       executionRoot = await resolveExecutionRoot(options.executionRoot ?? process.cwd(), linked.controller.signal);
+      recovery = await RunRecoveryPersistence.open(
+        this.bindings.recoveryPersistence,
+        {
+          mode: options.resume === true ? "resume" : "start",
+          runId,
+          rootModuleDigest,
+          entry,
+          args,
+          executionRoot,
+          ...(this.bindings.recoveryIdentity === undefined
+            ? {}
+            : { bindingFingerprint: this.bindings.recoveryIdentity }),
+          ...(this.agentExecutor === undefined
+            ? {}
+            : { executorFingerprint: executorRecoveryFingerprint(this.agentExecutor) }),
+        },
+        linked.controller.signal,
+      );
+      const completed = recovery.completedOutput();
+      if (completed !== undefined) {
+        await recovery.close();
+        linked.dispose();
+        return { runId, output: completed };
+      }
       persistence = await RunMemoryPersistence.open(
         this.bindings.memoryPersistence,
         executionRoot,
@@ -277,8 +330,21 @@ export class AflVm {
         linked.controller.signal,
       );
     } catch (error) {
+      if (recovery !== undefined) {
+        const vmError = linked.controller.signal.aborted
+          ? cancelledRunError(linked.controller.signal, error)
+          : normalizeVmError(error);
+        if (options.resume === true || isRecoverableRunError(vmError, linked.controller.signal)) {
+          await recovery.markInterrupted(serializeRecoveryError(vmError)).catch(() => {});
+        } else {
+          await recovery.markFailed(serializeRecoveryError(vmError)).catch(() => {});
+        }
+        await recovery.close().catch(() => {});
+      }
       linked.dispose();
-      throw normalizeVmError(error);
+      throw linked.controller.signal.aborted
+        ? cancelledRunError(linked.controller.signal, error)
+        : normalizeVmError(error);
     }
     const context: VmRunContext = {
       runId,
@@ -290,20 +356,33 @@ export class AflVm {
       executionRoot,
       rootModuleDigest,
       persistence,
+      recovery,
       counters: { steps: 0, trace: 0, handles: 0 },
     };
     try {
       await this.trace(context, "run.started", {}, { entry });
       const output = await this.executeNode(this.module, entry, [...args], context, context.signal, "root");
       await persistence.close();
-      await this.trace(context, "run.completed", {}, { entry });
+      await recovery.markCompleted(toRecoveryOutput(output), context.signal);
+      await this.trace(context, "run.completed", {}, { entry }).catch(() => {});
       return { runId: context.runId, output };
     } catch (error) {
       let vmError = normalizeVmError(error);
+      if (context.signal.aborted && vmError.code !== "AGENT_CANCELLED") {
+        vmError = cancelledRunError(context.signal, error);
+      }
       const interruption = interruptionContext(vmError);
-      if (interruption === undefined) {
-        await this.trace(context, "run.failed", {}, undefined, vmError);
-      } else {
+      const ambiguous = vmError.code === "RECOVERY_OPERATION_AMBIGUOUS";
+      const recoverable = interruption !== undefined || ambiguous ||
+        isRecoverableRunError(vmError, context.signal);
+      if (!recoverable) {
+        try {
+          await recovery.markFailed(serializeRecoveryError(vmError));
+        } catch (recoveryError) {
+          vmError = withRecoveryPersistenceError(vmError, recoveryError);
+        }
+        await this.trace(context, "run.failed", {}, undefined, vmError).catch(() => {});
+      } else if (interruption !== undefined) {
         linked.controller.abort(vmError);
         let shutdownError: unknown;
         try {
@@ -322,14 +401,31 @@ export class AflVm {
         if (shutdownError !== undefined) {
           vmError = withInterruptionShutdownError(vmError, shutdownError);
         }
+        try {
+          await recovery.markInterrupted(serializeRecoveryError(vmError));
+        } catch (recoveryError) {
+          vmError = withRecoveryPersistenceError(vmError, recoveryError);
+        }
         await this.trace(context, "run.interrupted", {}, {
           entry,
           interruption: interruptionDetails(interruption),
+        }, vmError).catch(() => {});
+      } else {
+        linked.controller.abort(vmError);
+        try {
+          await recovery.markInterrupted(serializeRecoveryError(vmError));
+        } catch (recoveryError) {
+          vmError = withRecoveryPersistenceError(vmError, recoveryError);
+        }
+        await this.trace(context, "run.interrupted", {}, {
+          entry,
+          ...(ambiguous ? { ambiguous: true } : { infrastructure: true }),
         }, vmError).catch(() => {});
       }
       throw vmError;
     } finally {
       await persistence.close().catch(() => {});
+      await recovery.close().catch(() => {});
       linked.controller.abort(new AflVmError("RUN_CLOSED", "AFL run has closed"));
       linked.dispose();
     }
@@ -609,7 +705,18 @@ export class AflVm {
       }
       case "agent.system_prompt": {
         const agent = asAgent(evaluateValue(instruction.agent, frame), instruction.agent.span);
-        const prompt = await this.renderPrompt(instruction.prompt, [], frame, signal);
+        const prompt = instruction.prompt.kind === "symbol"
+          ? await this.runPortableRecoveryOperation(
+              context,
+              activation,
+              blockVisit,
+              location,
+              "agent.system_prompt.render",
+              { prompt: instruction.prompt.name },
+              signal,
+              () => this.renderPrompt(instruction.prompt, [], frame, signal),
+            )
+          : await this.renderPrompt(instruction.prompt, [], frame, signal);
         const retiredSession = await context.locks.use([
           { key: agent.id, mode: "write" },
           { key: agent.memory.id, mode: "write" },
@@ -641,42 +748,94 @@ export class AflVm {
       case "agent.do": {
         const agent = asAgent(evaluateValue(instruction.agent, frame), instruction.agent.span);
         const input = asFrag(evaluateValue(instruction.input, frame), instruction.input.span, "Agent input");
+        const role = instruction.role ?? "user";
         return this.runAgent(
           agent,
-          instruction.role ?? "user",
+          role,
           input,
           instruction.format,
           context,
           location,
           signal,
+          this.agentRecoveryOperation(
+            agent,
+            role,
+            input,
+            instruction.format,
+            context,
+            activation,
+            blockVisit,
+            location,
+            "agent.do",
+          ),
           undefined,
           activation.forbiddenWriterWorkspace,
         );
       }
-      case "prompt":
-        return this.renderPrompt(instruction.source, instruction.args, frame, signal);
+      case "prompt": {
+        if (instruction.source.kind !== "symbol") {
+          return this.renderPrompt(instruction.source, instruction.args, frame, signal);
+        }
+        const promptArgs = instruction.args.map((argument) =>
+          this.toPromptArgument(evaluateValue(argument, frame), argument.span));
+        return this.runPortableRecoveryOperation(
+          context,
+          activation,
+          blockVisit,
+          location,
+          "prompt.render",
+          { prompt: instruction.source.name, args: promptArgs },
+          signal,
+          () => this.renderPrompt(instruction.source, instruction.args, frame, signal),
+        );
+      }
       case "input": {
         if (this.bindings.input === undefined) {
           throw new AflVmError("INPUT_ADAPTER_MISSING", "input requires an Input binding", {
             span: instruction.span,
           });
         }
-        const prompt = await this.renderPrompt(instruction.prompt, [], frame, signal);
-        const content = await this.bindings.input.read({
-          runId: context.runId,
-          node: location.node,
-          block: location.block,
-          prompt: prompt.content,
-          ...(instruction.schema === undefined ? {} : { schema: toSymbol(instruction.schema) }),
+        const prompt = instruction.prompt.kind === "symbol"
+          ? await this.runPortableRecoveryOperation(
+              context,
+              activation,
+              blockVisit,
+              location,
+              "input.prompt.render",
+              { prompt: instruction.prompt.name },
+              signal,
+              () => this.renderPrompt(instruction.prompt, [], frame, signal),
+            )
+          : await this.renderPrompt(instruction.prompt, [], frame, signal);
+        return this.runPortableRecoveryOperation(
+          context,
+          activation,
+          blockVisit,
+          location,
+          "input.read",
+          {
+            prompt: prompt.content,
+            ...(instruction.schema === undefined ? {} : { schema: instruction.schema.name }),
+          },
           signal,
-        });
-        if (typeof content !== "string") {
-          throw new AflVmError("INPUT_RESULT_INVALID", "Input binding returned a non-string value", {
-            span: instruction.span,
-          });
-        }
-        await this.validateSchema(content, instruction.schema, signal);
-        return frag(content, instruction.schema === undefined ? "reasoning" : "formatted");
+          async () => {
+            const content = await this.bindings.input!.read({
+              runId: context.runId,
+              node: location.node,
+              block: location.block,
+              prompt: prompt.content,
+              ...(instruction.schema === undefined ? {} : { schema: toSymbol(instruction.schema) }),
+              signal,
+            });
+            if (typeof content !== "string") {
+              throw new AflVmError("INPUT_RESULT_INVALID", "Input binding returned a non-string value", {
+                span: instruction.span,
+              });
+            }
+            await this.validateSchema(content, instruction.schema, signal);
+            return frag(content, instruction.schema === undefined ? "reasoning" : "formatted");
+          },
+        );
       }
       case "oper":
         return evaluateOper(instruction.expression, frame);
@@ -712,8 +871,7 @@ export class AflVm {
       case "call": {
         const args = instruction.args.map((argument) => evaluateValue(argument, frame));
         this.reserveGeneratedFreedomRoute(frame.node.name, instruction.target, activation);
-        return normalizeFlowResult(
-          await this.invokeFlow(
+        const invoke = () => this.invokeFlow(
             frame.module,
             instruction.target,
             args,
@@ -723,9 +881,9 @@ export class AflVm {
             activation.forbiddenWriterWorkspace,
             activation.freedomDepth,
             activation.freedomRouteTracker,
-          ),
-          instruction.span,
-        );
+          );
+        const result = await invoke();
+        return normalizeFlowResult(result, instruction.span);
       }
       case "dispatch": {
         const calls = instruction.calls.map((call) => ({
@@ -766,11 +924,28 @@ export class AflVm {
         const values = settled.map((item) => (item as PromiseFulfilledResult<Frag>).value);
         const content = instruction.formatter === undefined
           ? JSON.stringify(values.map((value) => value.content))
-          : await this.requireFormatter().format({
-              formatter: toSymbol(instruction.formatter),
-              values,
+          : (await this.runPortableRecoveryOperation(
+              context,
+              activation,
+              blockVisit,
+              location,
+              "formatter.format",
+              { formatter: instruction.formatter.name, values },
               signal,
-            });
+              async () => {
+                const formatted = await this.requireFormatter().format({
+                  formatter: toSymbol(instruction.formatter!),
+                  values,
+                  signal,
+                });
+                if (typeof formatted !== "string") {
+                  throw new AflVmError("FORMATTER_RESULT_INVALID", "Formatter binding returned a non-string value", {
+                    span: instruction.span,
+                  });
+                }
+                return frag(formatted, "formatted");
+              },
+            )).content;
         if (typeof content !== "string") {
           throw new AflVmError("FORMATTER_RESULT_INVALID", "Formatter binding returned a non-string value", {
             span: instruction.span,
@@ -824,14 +999,26 @@ export class AflVm {
         memory.owner = branch.id;
         if (snapshot.systemPrompt !== undefined) branch.systemPrompt = snapshot.systemPrompt;
         const input = asFrag(evaluateValue(instruction.action.input, frame), instruction.action.input.span, "fork input");
+        const role = instruction.action.role ?? "user";
         await this.runAgent(
           branch,
-          instruction.action.role ?? "user",
+          role,
           input,
           instruction.action.format,
           context,
           location,
           signal,
+          this.agentRecoveryOperation(
+            branch,
+            role,
+            input,
+            instruction.action.format,
+            context,
+            activation,
+            blockVisit,
+            location,
+            "fork.do",
+          ),
           undefined,
           activation.forbiddenWriterWorkspace,
         );
@@ -874,9 +1061,51 @@ export class AflVm {
         const memory = asMemory(evaluateValue(instruction.memory, frame), instruction.memory.span);
         const value = asFrag(evaluateValue(instruction.frag, frame), instruction.frag.span, "memory.append value");
         await context.locks.use([{ key: memory.id, mode: "write" }], signal, async () => {
-          appendMemoryMessage(memory, { role: instruction.role, content: value.content });
-          if (context.persistence.isMaterialized(memory.slot)) {
+          const base = this.recoveryOperation(
+            context,
+            activation,
+            blockVisit,
+            location,
+            "memory.append",
+            { memory_slot: memory.slot, role: instruction.role, content: value.content },
+          );
+          const existing = context.recovery.operation(base.id);
+          const revisionBefore = existing === undefined
+            ? memory.revision
+            : operationMemoryRevisionBefore(existing.descriptor);
+          const operation = await context.recovery.prepareOperation({
+            ...base,
+            details: {
+              memory_slot: memory.slot,
+              memory_revision_before: revisionBefore,
+            },
+          }, signal);
+          const durable = memory.messages[revisionBefore];
+          if (durable === undefined) {
+            if (memory.revision !== revisionBefore) {
+              throw new AflVmError(
+                "RECOVERY_STATE_INVALID",
+                `Memory append '${base.id}' is missing its durable revision`,
+              );
+            }
+            appendMemoryMessage(memory, { role: instruction.role, content: value.content });
+          } else if (durable.role !== instruction.role || durable.content !== value.content) {
+            throw new AflVmError(
+              "RECOVERY_STATE_INVALID",
+              `Memory append '${base.id}' conflicts with durable Memory`,
+            );
+          }
+          if (durable === undefined && context.persistence.isMaterialized(memory.slot)) {
             await this.persistMemory(context, memory, signal);
+          }
+          if (operation.status !== "completed") {
+            await context.recovery.completeOperation(
+              base.id,
+              base.inputDigest,
+              null,
+              signal,
+              { memory_revision: revisionBefore + 1 },
+            );
           }
         });
         return undefined;
@@ -952,6 +1181,7 @@ export class AflVm {
     context: VmRunContext,
     location: Required<TraceLocation>,
     signal: AbortSignal,
+    recoveryOperation: AgentRecoveryOperation,
     control?: FreedomRuntime,
     forbiddenWriterWorkspace?: AgentWorkspaceSet,
   ): Promise<Frag> {
@@ -1016,10 +1246,92 @@ export class AflVm {
           let returnedSession: BackendSessionRef | undefined;
           let persistenceAttempt: MemoryPersistenceAttempt | undefined;
           let executorRunning = false;
+          let operationPrepared = false;
           try {
             this.validateWorkspaceCapabilities(agent.workspace, executor);
             this.validateContinuationBackend(agent, executor);
-            appendMemoryMessage(agent.memory, { role, content: input.content });
+            const existingOperation = context.recovery.operation(recoveryOperation.id);
+            const memoryRevisionBefore = existingOperation === undefined
+              ? agent.memory.revision
+              : operationMemoryRevisionBefore(existingOperation.descriptor);
+            const operation = await context.recovery.prepareOperation({
+              ...recoveryOperation,
+              details: {
+                memory_slot: agent.memory.slot,
+                memory_revision_before: memoryRevisionBefore,
+                output: fragOutput,
+              },
+            }, signal);
+            operationPrepared = true;
+            if (control !== undefined) {
+              const completedControl = isComputeRecord(operation.completedDetails)
+                ? operation.completedDetails.control
+                : undefined;
+              if (completedControl !== undefined) control.restore(completedControl);
+              else this.restoreAgentControlProgress(context, recoveryOperation, control);
+            }
+            if (operation.status === "completed") {
+              const recovered = operation.result;
+              if (!isFrag(recovered) || recovered.output !== fragOutput) {
+                throw new AflVmError(
+                  "RECOVERY_STATE_INVALID",
+                  `Completed Agent operation '${recoveryOperation.id}' has an invalid result`,
+                );
+              }
+              await this.trace(context, "agent.completed", location, {
+                agent: agent.id,
+                recovery: "replayed",
+              });
+              return cloneRecoveryValue(recovered) as Frag;
+            }
+
+            const inputMessage = { role, content: input.content } as const;
+            let resumeInput: Message | undefined;
+            if (agent.memory.revision === memoryRevisionBefore) {
+              appendMemoryMessage(agent.memory, inputMessage);
+            } else {
+              if (agent.memory.revision < memoryRevisionBefore + 1) {
+                throw new AflVmError(
+                  "RECOVERY_STATE_INVALID",
+                  `Agent operation '${recoveryOperation.id}' Memory is behind its prepared revision`,
+                );
+              }
+              const durableInput = agent.memory.messages[memoryRevisionBefore];
+              if (durableInput?.role !== role || durableInput.content !== input.content) {
+                throw new AflVmError(
+                  "RECOVERY_STATE_INVALID",
+                  `Agent operation '${recoveryOperation.id}' has a different durable input`,
+                );
+              }
+              const durableOutput = agent.memory.messages[memoryRevisionBefore + 1];
+              if (durableOutput !== undefined) {
+                if (durableOutput.role !== "assistant" || agent.memory.revision !== memoryRevisionBefore + 2) {
+                  throw new AflVmError(
+                    "RECOVERY_STATE_INVALID",
+                    `Agent operation '${recoveryOperation.id}' has an invalid durable output boundary`,
+                  );
+                }
+                await this.finalizeAgentNestedEffects(context, recoveryOperation);
+                const recovered = frag(durableOutput.content, fragOutput);
+                await context.recovery.completeOperation(
+                  recoveryOperation.id,
+                  recoveryOperation.inputDigest,
+                  recovered,
+                  signal,
+                  {
+                    memory_revision: agent.memory.revision,
+                    reconciled: true,
+                    ...(control === undefined ? {} : { control: control.snapshot() }),
+                  },
+                );
+                await this.trace(context, "agent.completed", location, {
+                  agent: agent.id,
+                  recovery: "reconciled",
+                });
+                return recovered;
+              }
+              resumeInput = { ...inputMessage };
+            }
             await this.validateExecutorMemory(executor, agent, signal);
             await this.restoreAgentSession(agent, executor, context, signal);
             const policyRequest: AgentRunRequest = {
@@ -1057,6 +1369,10 @@ export class AflVm {
                 : { sessionMemoryRevision: agent.sessionMemoryRevision }),
               ...(format === undefined ? {} : { format }),
               ...(control === undefined ? {} : { control: control.activation }),
+              operationId: recoveryOperation.id,
+              ...(resumeInput === undefined ? {} : {
+                recovery: { mode: "resume", operationId: recoveryOperation.id } as const,
+              }),
               signal,
             };
             const continuation = persistedContinuation(agent.memory.checkpoint);
@@ -1070,9 +1386,10 @@ export class AflVm {
               executor: executor.name,
               ...(executor.sessionFormat === undefined ? {} : { format: executor.sessionFormat }),
               location: `${location.node}:${location.block}:${location.instruction}`,
+              ...(resumeInput === undefined ? {} : { resumeInput }),
             }, signal);
             externalLease = await SuspendableSemaphoreLease.open(context.external, signal);
-            const host = this.createAgentHost(
+            const hostRuntime = this.createAgentHost(
               context,
               location,
               persistenceAttempt,
@@ -1081,6 +1398,7 @@ export class AflVm {
               executor.name,
               format,
               control,
+              recoveryOperation,
             );
             await this.trace(context, "agent.started", location, {
               agent: agent.id,
@@ -1093,8 +1411,9 @@ export class AflVm {
               },
             });
             executorRunning = true;
-            const result = await executor.execute(request, host);
+            const result = await executor.execute(request, hostRuntime.host);
             executorRunning = false;
+            await this.finalizeAgentNestedEffects(context, recoveryOperation);
             await externalLease.close();
             externalLease = undefined;
             returnedSession = result.session;
@@ -1107,8 +1426,19 @@ export class AflVm {
             await this.updateAgentSession(agent, executor, result.session, context, signal);
             await this.persistMemory(context, agent.memory, signal, persistenceAttempt);
             persistenceAttempt = undefined;
+            const output = frag(result.output, fragOutput);
+            await context.recovery.completeOperation(
+              recoveryOperation.id,
+              recoveryOperation.inputDigest,
+              output,
+              signal,
+              {
+                memory_revision: agent.memory.revision,
+                ...(control === undefined ? {} : { control: control.snapshot() }),
+              },
+            );
             await this.trace(context, "agent.completed", location, { agent: agent.id });
-            return frag(result.output, fragOutput);
+            return output;
           } catch (error) {
             let vmError = error instanceof AgentExecutorError
               ? new AflVmError(error.code, error.message, { cause: error })
@@ -1136,6 +1466,13 @@ export class AflVm {
               };
               await context.persistence.abortAgentAttempt(persistenceAttempt, outcome).catch(() => {});
             }
+            if (interruption !== undefined && operationPrepared) {
+              await context.recovery.interruptOperation(
+                recoveryOperation.id,
+                recoveryOperation.inputDigest,
+                serializeRecoveryError(vmError),
+              ).catch(() => {});
+            }
             await this.invalidateAgentSession(agent, executor, returnedSession);
             const failureTrace = this.trace(
               context,
@@ -1158,6 +1495,115 @@ export class AflVm {
         },
       ),
     );
+  }
+
+  private agentRecoveryOperation(
+    agent: AgentHandle,
+    role: string,
+    input: Frag,
+    format: AgentOutputFormat | undefined,
+    context: VmRunContext,
+    activation: ActivationContext,
+    blockVisit: number,
+    location: Required<TraceLocation>,
+    kind: string,
+  ): AgentRecoveryOperation {
+    const semanticInput: Record<string, ComputeValue> = {
+      agent: agent.agent.name,
+      role,
+      input: input.content,
+      memory_slot: agent.memory.slot,
+      workspace: workspaceKey(agent.workspace),
+      tools: agent.tools === undefined ? [] : [...agent.tools],
+      executor: this.agentExecutor?.name ?? "",
+      executor_format: this.agentExecutor?.sessionFormat ?? "",
+      ...(agent.systemPrompt === undefined ? {} : { system_prompt: agent.systemPrompt }),
+      ...(format === undefined ? {} : { format: structuredClone(format) as unknown as ComputeValue }),
+    };
+    return this.recoveryOperation(
+      context,
+      activation,
+      blockVisit,
+      location,
+      kind,
+      semanticInput,
+    );
+  }
+
+  private async runPortableRecoveryOperation<T extends VmArgument>(
+    context: VmRunContext,
+    activation: ActivationContext,
+    blockVisit: number,
+    location: Required<TraceLocation>,
+    kind: string,
+    input: unknown,
+    signal: AbortSignal,
+    execute: () => T | Promise<T>,
+  ): Promise<T> {
+    const descriptor = this.recoveryOperation(
+      context,
+      activation,
+      blockVisit,
+      location,
+      kind,
+      input,
+    );
+    const existing = context.recovery.operation(descriptor.id);
+    const operation = await context.recovery.prepareOperation(descriptor, signal);
+    if (operation.status === "completed") {
+      return cloneRecoveryValue(operation.result) as T;
+    }
+    if (existing !== undefined) {
+      const error = new AflVmError(
+        "RECOVERY_OPERATION_AMBIGUOUS",
+        `Operation '${kind}' may have crossed an external boundary before interruption`,
+        { details: { operation: descriptor.id, kind } },
+      );
+      await context.recovery.markOperationAmbiguous(
+        descriptor.id,
+        descriptor.inputDigest,
+        serializeRecoveryError(error),
+        signal,
+      );
+      throw error;
+    }
+    const result = cloneRecoveryValue(await execute()) as T;
+    await context.recovery.completeOperation(
+      descriptor.id,
+      descriptor.inputDigest,
+      result,
+      signal,
+    );
+    return result;
+  }
+
+  private recoveryOperation(
+    context: VmRunContext,
+    activation: ActivationContext,
+    blockVisit: number,
+    location: Required<TraceLocation>,
+    kind: string,
+    input: unknown,
+  ): AgentRecoveryOperation {
+    return {
+      id: recoveryOperationId(
+        context.recovery.generation,
+        activation.moduleDigest,
+        activation.path,
+        location.node,
+        location.block,
+        location.instruction,
+        blockVisit,
+        kind,
+      ),
+      kind,
+      inputDigest: recoveryValueDigest(input),
+      activation: activation.path,
+      node: location.node,
+      block: location.block,
+      instruction: location.instruction,
+      blockVisit,
+    };
   }
 
   private validateWorkspaceCapabilities(
@@ -1345,25 +1791,33 @@ export class AflVm {
     executionRequest: AgentExecutionRequest,
     backend: string,
     format: AgentOutputFormat | undefined,
-    control?: FreedomRuntime,
-  ): AgentExecutionHost {
+    control: FreedomRuntime | undefined,
+    parentOperation: AgentRecoveryOperation,
+  ): AgentHostRuntime {
+    const controlOperations = new Map<string, RecoveryOperationDescriptor>();
+    const controlSignals = new Map<string, AbortSignal>();
+    const controlDeliveryWaiters = new Map<number, ControlDeliveryWaiter>();
     const emit = async (event: Parameters<AgentExecutionHost["emit"]>[0]) => {
       await this.trace(context, "agent.event", location, structuredClone(event) as ComputeValue);
       await this.bindings.agentHost?.emit?.(event);
     };
-    return {
+    const host: AgentExecutionHost = {
       emit,
       persistContinuation: (delta) => context.persistence.appendContinuation(
         persistenceAttempt,
         delta,
         new AbortController().signal,
       ),
-      authorizeTool: async (action) => this.authorizeAgentTool(
-        action,
-        executionRequest,
-        backend,
-        emit,
-      ),
+      authorizeTool: async (action) => {
+        const authorization = await this.authorizeAgentTool(
+          action,
+          executionRequest,
+          backend,
+          emit,
+        );
+        if (authorization.status !== "allowed") return authorization;
+        return authorization;
+      },
       requestElevation: async (request) => this.requestAgentElevation(
         request,
         executionRequest,
@@ -1371,7 +1825,9 @@ export class AflVm {
         emit,
         (operation) => externalLease.suspend(operation),
       ),
-      requestTransaction: async (request) => externalLease.suspend(() => this.requestAgentTransaction(
+      requestTransaction: async (request) => externalLease.suspend(() => this.executeAgentTransactionEffect(
+        context,
+        parentOperation,
         request,
         executionRequest,
         backend,
@@ -1384,7 +1840,12 @@ export class AflVm {
             "Agent executor requested interactive input, but no Agent host is configured",
           );
         }
-        return this.bindings.agentHost.requestInput(request);
+        return externalLease.suspend(() => this.executeAgentInputEffect(
+          context,
+          parentOperation,
+          request,
+          (input) => this.bindings.agentHost!.requestInput!(input),
+        ));
       },
       submitFormattedOutput: async (request) => externalLease.suspend(async () => {
         throwIfAborted(request.signal);
@@ -1416,10 +1877,501 @@ export class AflVm {
         }
         return externalLease.suspend(async () => {
           await this.trace(context, "freedom.tool", location, { tool: request.name });
-          return control.execute(request);
+          return this.executeAgentControlEffect(
+            context,
+            parentOperation,
+            control,
+            request,
+            controlOperations,
+            controlSignals,
+          );
         });
       },
+      completeControlTool: (request) => this.completeAgentControlEffect(
+        context,
+        parentOperation,
+        request,
+        controlOperations,
+        controlSignals,
+        controlDeliveryWaiters,
+        control ?? (() => {
+          throw new AgentExecutorError(
+            "AGENT_CAPABILITY_UNSUPPORTED",
+            "AFL control result was completed outside a Freedom activation",
+          );
+        })(),
+      ),
     };
+    return { host };
+  }
+
+  private bindAgentToolAction(
+    action: AgentToolAction,
+    executionRequest: AgentExecutionRequest,
+    backend: string,
+  ): AgentToolAction {
+    return snapshotAgentToolAction({
+      ...action,
+      runId: executionRequest.runId,
+      node: executionRequest.node,
+      block: executionRequest.block,
+      agent: executionRequest.agent,
+      backend,
+      workspace: executionRequest.workspace,
+      signal: action.signal,
+    });
+  }
+
+  private async executeAgentTransactionEffect(
+    context: VmRunContext,
+    parent: AgentRecoveryOperation,
+    request: AgentTransactionRequest,
+    executionRequest: AgentExecutionRequest,
+    backend: string,
+    emit: AgentExecutionHost["emit"],
+  ): Promise<AgentTransactionResult> {
+    const input = {
+      title: request.title,
+      request: request.request,
+      reason: request.reason,
+      ...(request.resumeWhen === undefined ? {} : { resumeWhen: request.resumeWhen }),
+    };
+    const prepared = await this.prepareAgentNestedOperation(
+      context,
+      parent,
+      "agent.transaction",
+      request.id,
+      input,
+      { parent_operation: parent.id, request_id: request.id, tool_name: "afl.transaction.request" },
+      request.signal,
+    );
+    if (prepared.operation.status === "completed") {
+      return decodeTransactionRecoveryResult(prepared.operation.result, prepared.descriptor.id);
+    }
+    if (prepared.existing) {
+      const error = new AflVmError(
+        "RECOVERY_OPERATION_AMBIGUOUS",
+        `Agent transaction '${request.id}' may have been presented before interruption`,
+        { details: { operation: prepared.descriptor.id, kind: prepared.descriptor.kind } },
+      );
+      await context.recovery.markOperationAmbiguous(
+        prepared.descriptor.id,
+        prepared.descriptor.inputDigest,
+        serializeRecoveryError(error),
+        new AbortController().signal,
+      );
+      throw error;
+    }
+    let result: AgentTransactionResult;
+    try {
+      result = await this.requestAgentTransaction(request, executionRequest, backend, emit);
+    } catch (error) {
+      const vmError = normalizeVmError(error);
+      await context.recovery.markOperationAmbiguous(
+        prepared.descriptor.id,
+        prepared.descriptor.inputDigest,
+        serializeRecoveryError(vmError),
+        new AbortController().signal,
+      ).catch(() => {});
+      throw error;
+    }
+    await context.recovery.completeOperation(
+      prepared.descriptor.id,
+      prepared.descriptor.inputDigest,
+      encodeTransactionRecoveryResult(result),
+      new AbortController().signal,
+      { parent_operation: parent.id, durable_human_result: true },
+    );
+    return result;
+  }
+
+  private async executeAgentInputEffect(
+    context: VmRunContext,
+    parent: AgentRecoveryOperation,
+    request: AgentInputRequest,
+    execute: (request: AgentInputRequest) => Promise<string>,
+  ): Promise<string> {
+    const prepared = await this.prepareAgentNestedOperation(
+      context,
+      parent,
+      "agent.input",
+      request.id,
+      { prompt: request.prompt },
+      { parent_operation: parent.id, request_id: request.id, tool_name: "afl.input" },
+      request.signal,
+    );
+    if (prepared.operation.status === "completed") {
+      return decodeInputRecoveryResult(prepared.operation.result, prepared.descriptor.id);
+    }
+    if (prepared.existing) {
+      const error = new AflVmError(
+        "RECOVERY_OPERATION_AMBIGUOUS",
+        `Agent input '${request.id}' may have been requested before interruption`,
+        { details: { operation: prepared.descriptor.id, kind: prepared.descriptor.kind } },
+      );
+      await context.recovery.markOperationAmbiguous(
+        prepared.descriptor.id,
+        prepared.descriptor.inputDigest,
+        serializeRecoveryError(error),
+        new AbortController().signal,
+      );
+      throw error;
+    }
+    let value: string;
+    try {
+      value = await execute(request);
+    } catch (error) {
+      const vmError = normalizeVmError(error);
+      await context.recovery.markOperationAmbiguous(
+        prepared.descriptor.id,
+        prepared.descriptor.inputDigest,
+        serializeRecoveryError(vmError),
+        new AbortController().signal,
+      ).catch(() => {});
+      throw error;
+    }
+    if (typeof value !== "string") {
+      const error = new AflVmError("INPUT_RESULT_INVALID", "Agent host input returned a non-string value");
+      await context.recovery.markOperationAmbiguous(
+        prepared.descriptor.id,
+        prepared.descriptor.inputDigest,
+        serializeRecoveryError(error),
+        new AbortController().signal,
+      ).catch(() => {});
+      throw error;
+    }
+    await context.recovery.completeOperation(
+      prepared.descriptor.id,
+      prepared.descriptor.inputDigest,
+      { value },
+      new AbortController().signal,
+      { parent_operation: parent.id, durable_human_result: true },
+    );
+    return value;
+  }
+
+  private async prepareAgentNestedOperation(
+    context: VmRunContext,
+    parent: AgentRecoveryOperation,
+    kind: "agent.transaction" | "agent.input",
+    requestId: string,
+    input: ComputeValue,
+    details: ComputeValue,
+    signal: AbortSignal,
+  ): Promise<{
+    readonly descriptor: RecoveryOperationDescriptor;
+    readonly operation: Awaited<ReturnType<RunRecoveryPersistence["prepareOperation"]>>;
+    readonly existing: boolean;
+  }> {
+    const inputDigest = recoveryValueDigest(input);
+    const directId = `${kind}:${recoveryValueDigest([parent.id, requestId]).slice("sha256:".length)}`;
+    const direct = context.recovery.operation(directId);
+    let descriptor: RecoveryOperationDescriptor;
+    let existing = direct !== undefined;
+    if (direct !== undefined) {
+      descriptor = direct.descriptor;
+    } else {
+      const candidates = context.recovery.operations().filter((candidate) =>
+        candidate.descriptor.kind === kind &&
+        isComputeRecord(candidate.descriptor.details) &&
+        candidate.descriptor.details.parent_operation === parent.id,
+      );
+      const matching = candidates.filter((candidate) => candidate.descriptor.inputDigest === inputDigest);
+      if (matching.length === 1 && matching[0]!.status === "completed") {
+        descriptor = matching[0]!.descriptor;
+        existing = true;
+      } else if (candidates.some((candidate) => candidate.status !== "completed")) {
+        const unresolved = candidates.find((candidate) => candidate.status !== "completed")!;
+        const error = new AflVmError(
+          "RECOVERY_OPERATION_AMBIGUOUS",
+          `Agent ${kind === "agent.transaction" ? "transaction" : "input"} cannot bypass unresolved operation '${unresolved.descriptor.id}'`,
+          { details: { operation: unresolved.descriptor.id, kind } },
+        );
+        await context.recovery.markOperationAmbiguous(
+          unresolved.descriptor.id,
+          unresolved.descriptor.inputDigest,
+          serializeRecoveryError(error),
+          new AbortController().signal,
+        );
+        throw error;
+      } else if (matching.length > 1) {
+        throw new AflVmError(
+          "RECOVERY_OPERATION_AMBIGUOUS",
+          `Agent ${kind === "agent.transaction" ? "transaction" : "input"} matches multiple durable operations`,
+          { details: { parent: parent.id, kind, request: requestId } },
+        );
+      } else {
+        descriptor = {
+          id: directId,
+          kind,
+          inputDigest,
+          activation: parent.activation,
+          node: parent.node,
+          block: parent.block,
+          instruction: parent.instruction,
+          blockVisit: parent.blockVisit,
+          details,
+        };
+      }
+    }
+    const operation = await context.recovery.prepareOperation(descriptor, signal);
+    return { descriptor, operation, existing };
+  }
+
+  private async finalizeAgentNestedEffects(
+    context: VmRunContext,
+    parent: AgentRecoveryOperation,
+  ): Promise<void> {
+    const deliveredControlCount = agentControlDeliveryCount(
+      context.recovery.operation(parent.id)?.progressDetails,
+    );
+    const unsettled = context.recovery.operations().filter((operation) => {
+      if (!isComputeRecord(operation.descriptor.details) ||
+          operation.descriptor.details.parent_operation !== parent.id) return false;
+      if (operation.descriptor.kind === "agent.transaction" ||
+          operation.descriptor.kind === "agent.input") {
+        return operation.status !== "completed";
+      }
+      if (operation.descriptor.kind !== "agent.control") return false;
+      if (operation.status !== "completed") return true;
+      return agentControlCompletionIndex(operation.completedDetails, operation.descriptor.id) > deliveredControlCount;
+    });
+    if (unsettled.length === 0) return;
+    const operation = unsettled[0]!;
+    const error = new AflVmError(
+      "RECOVERY_OPERATION_AMBIGUOUS",
+      `Agent nested operation '${operation.descriptor.id}' has no durably delivered result`,
+      { details: { operation: operation.descriptor.id, kind: operation.descriptor.kind } },
+    );
+    if (operation.status !== "completed") {
+      await context.recovery.markOperationAmbiguous(
+        operation.descriptor.id,
+        operation.descriptor.inputDigest,
+        serializeRecoveryError(error),
+        new AbortController().signal,
+      );
+    }
+    throw error;
+  }
+
+  private restoreAgentControlProgress(
+    context: VmRunContext,
+    parent: AgentRecoveryOperation,
+    control: FreedomRuntime,
+  ): void {
+    const delivered = agentControlDeliveryCount(context.recovery.operation(parent.id)?.progressDetails);
+    if (delivered === 0) return;
+    const snapshots = new Map<number, ComputeValue>();
+    for (const operation of context.recovery.operations()) {
+      if (operation.descriptor.kind !== "agent.control" || operation.status !== "completed" ||
+          !isComputeRecord(operation.descriptor.details) ||
+          operation.descriptor.details.parent_operation !== parent.id) continue;
+      const index = agentControlCompletionIndex(operation.completedDetails, operation.descriptor.id);
+      const details = operation.completedDetails!;
+      if (snapshots.has(index)) {
+        throw new AflVmError(
+          "RECOVERY_STATE_INVALID",
+          `Agent control delivery index ${index} is duplicated for '${parent.id}'`,
+        );
+      }
+      snapshots.set(index, (details as { readonly [key: string]: ComputeValue }).control!);
+    }
+    for (let index = 1; index <= delivered; index += 1) {
+      if (!snapshots.has(index)) {
+        throw new AflVmError(
+          "RECOVERY_STATE_INVALID",
+          `Agent control delivery '${parent.id}' is missing result ${index}`,
+        );
+      }
+    }
+    control.restore(snapshots.get(delivered)!);
+  }
+
+  private async executeAgentControlEffect(
+    context: VmRunContext,
+    parent: AgentRecoveryOperation,
+    control: FreedomRuntime,
+    request: AgentControlToolRequest,
+    current: Map<string, RecoveryOperationDescriptor>,
+    signals: Map<string, AbortSignal>,
+  ): Promise<AgentControlToolResult> {
+    const inputDigest = recoveryValueDigest({ name: request.name, input: request.input });
+    const directId = `agent.control:${recoveryValueDigest([parent.id, request.id]).slice("sha256:".length)}`;
+    const delivered = agentControlDeliveryCount(context.recovery.operation(parent.id)?.progressDetails);
+    const activeOperationIds = new Set([...current.values()].map((operation) => operation.id));
+    const direct = context.recovery.operation(directId);
+    const pending = context.recovery.operations().filter((candidate) => {
+      if (candidate.descriptor.kind !== "agent.control" ||
+          !isComputeRecord(candidate.descriptor.details) ||
+          candidate.descriptor.details.parent_operation !== parent.id) return false;
+      if (activeOperationIds.has(candidate.descriptor.id)) return false;
+      if (candidate.status !== "completed") return true;
+      return agentControlCompletionIndex(candidate.completedDetails, candidate.descriptor.id) > delivered;
+    });
+    let descriptor: RecoveryOperationDescriptor;
+    if (direct !== undefined) {
+      descriptor = direct.descriptor;
+    } else if (pending.length > 0) {
+      const matching = pending.filter((candidate) =>
+        candidate.descriptor.inputDigest === inputDigest &&
+        isComputeRecord(candidate.descriptor.details) &&
+        candidate.descriptor.details.tool_name === request.name);
+      if (matching.length !== 1) {
+        throw new AflVmError(
+          "RECOVERY_OPERATION_AMBIGUOUS",
+          `Agent control call '${request.name}' cannot be matched to the undelivered durable result`,
+          { details: { parent: parent.id, request: request.id, pending: pending.length } },
+        );
+      }
+      descriptor = matching[0]!.descriptor;
+    } else {
+      const controlIndex = freedomControlSnapshotCount(control.snapshot()) + 1;
+      descriptor = {
+        id: directId,
+        kind: "agent.control",
+        inputDigest,
+        activation: parent.activation,
+        node: parent.node,
+        block: parent.block,
+        instruction: parent.instruction,
+        blockVisit: parent.blockVisit,
+        details: {
+          parent_operation: parent.id,
+          tool_call_id: request.id,
+          tool_name: request.name,
+          control_index: controlIndex,
+        },
+      };
+    }
+    const operation = await context.recovery.prepareOperation(descriptor, request.signal);
+    if (operation.status === "ambiguous") {
+      throw new AflVmError(
+        "RECOVERY_OPERATION_AMBIGUOUS",
+        `Agent control operation '${descriptor.id}' is ambiguous`,
+      );
+    }
+    current.set(request.id, descriptor);
+    signals.set(request.id, request.signal);
+    if (operation.status === "completed") {
+      const completed = operation.completedDetails;
+      if (!isComputeRecord(completed) || completed.parent_operation !== parent.id ||
+          completed.control === undefined) {
+        throw new AflVmError(
+          "RECOVERY_STATE_INVALID",
+          `Completed control operation '${descriptor.id}' has no valid scope snapshot`,
+        );
+      }
+      const index = agentControlCompletionIndex(completed, descriptor.id);
+      if (index <= delivered) {
+        throw new AflVmError(
+          "AGENT_SESSION_INVALID",
+          `Executor repeated Agent control operation '${descriptor.id}' after its result was already durable`,
+        );
+      }
+      if (index === delivered + 1) control.restore(completed.control);
+      return decodeControlRecoveryResult(operation.result, descriptor.id);
+    }
+
+    let result: AgentControlToolResult;
+    try {
+      result = await control.execute(request);
+    } catch (error) {
+      current.delete(request.id);
+      signals.delete(request.id);
+      throw error;
+    }
+    const snapshot = control.snapshot();
+    const index = agentControlDescriptorIndex(descriptor);
+    if (freedomControlSnapshotIndex(snapshot) < index) {
+      throw new AflVmError(
+        "RECOVERY_STATE_INVALID",
+        `Agent control operation '${descriptor.id}' completed without its scope transition`,
+      );
+    }
+    const durableResult: ComputeValue = {
+      content: result.content,
+      ...(result.details === undefined ? {} : { details: structuredClone(result.details) }),
+    };
+    await context.recovery.completeOperation(
+      descriptor.id,
+      descriptor.inputDigest,
+      durableResult,
+      new AbortController().signal,
+      { parent_operation: parent.id, control_index: index, control: snapshot },
+    );
+    return result;
+  }
+
+  private async completeAgentControlEffect(
+    context: VmRunContext,
+    parent: AgentRecoveryOperation,
+    request: AgentControlToolCompletionRequest,
+    current: Map<string, RecoveryOperationDescriptor>,
+    signals: Map<string, AbortSignal>,
+    waiters: Map<number, ControlDeliveryWaiter>,
+    control: FreedomRuntime,
+  ): Promise<void> {
+    const descriptor = current.get(request.id);
+    if (descriptor === undefined) {
+      throw new AflVmError(
+        "RECOVERY_STATE_INVALID",
+        `Executor completed Agent control call '${request.id}' without a matching result`,
+      );
+    }
+    const operation = context.recovery.operation(descriptor.id);
+    if (operation?.status !== "completed" || !isComputeRecord(descriptor.details) ||
+        descriptor.details.parent_operation !== parent.id || descriptor.details.tool_name !== request.name) {
+      throw new AflVmError(
+        "RECOVERY_STATE_INVALID",
+        `Executor completed Agent control call '${request.id}' with a different identity`,
+      );
+    }
+    const index = agentControlCompletionIndex(operation.completedDetails, descriptor.id);
+    let delivered = agentControlDeliveryCount(context.recovery.operation(parent.id)?.progressDetails);
+    if (index <= delivered) {
+      throw new AflVmError(
+        "RECOVERY_STATE_INVALID",
+        `Executor delivered Agent control call '${request.id}' more than once`,
+      );
+    }
+    while (index > delivered + 1) {
+      let waiter = waiters.get(delivered + 1);
+      if (waiter === undefined) {
+        let resolveWaiter!: () => void;
+        const promise = new Promise<void>((resolve) => {
+          resolveWaiter = resolve;
+        });
+        waiter = { promise, resolve: resolveWaiter };
+        waiters.set(delivered + 1, waiter);
+      }
+      const signal = signals.get(request.id) ?? context.signal;
+      try {
+        await waitForSignal(waiter.promise, signal);
+      } catch (error) {
+        if (waiters.get(delivered + 1) === waiter) waiters.delete(delivered + 1);
+        throw error;
+      }
+      delivered = agentControlDeliveryCount(context.recovery.operation(parent.id)?.progressDetails);
+    }
+    const completed = operation.completedDetails;
+    if (!isComputeRecord(completed) || completed.control === undefined) {
+      throw new AflVmError(
+        "RECOVERY_STATE_INVALID",
+        `Agent control operation '${descriptor.id}' has no scope snapshot for delivery`,
+      );
+    }
+    control.restore(completed.control);
+    await context.recovery.updateOperationProgress(
+      parent.id,
+      parent.inputDigest,
+      { version: 0, delivered_control_count: index },
+      new AbortController().signal,
+    );
+    current.delete(request.id);
+    signals.delete(request.id);
+    const waiter = waiters.get(index);
+    waiters.delete(index);
+    waiter?.resolve();
   }
 
   private async authorizeAgentTool(
@@ -1434,16 +2386,7 @@ export class AflVm {
   ): Promise<AgentToolAuthorization> {
     let bound: AgentToolAction;
     try {
-      bound = snapshotAgentToolAction({
-        ...action,
-        runId: executionRequest.runId,
-        node: executionRequest.node,
-        block: executionRequest.block,
-        agent: executionRequest.agent,
-        backend,
-        workspace: executionRequest.workspace,
-        signal: action.signal,
-      });
+      bound = this.bindAgentToolAction(action, executionRequest, backend);
     } catch {
       const requestId = typeof action.requestId === "string" ? action.requestId : "invalid-tool-request";
       const id = typeof action.toolCallId === "string" ? action.toolCallId : "invalid-tool-call";
@@ -1787,17 +2730,21 @@ export class AflVm {
       frame,
       calls.map((call): TaskGroupWork => ({
         span: call.span,
-        execute: (signal, index) => this.invokeFlow(
-          frame.module,
-          call.target,
-          call.args,
-          context,
-          signal,
-          `${this.childActivationPath(activation, location, blockVisit, "dispatch")}:${index}`,
-          activation.forbiddenWriterWorkspace,
-          activation.freedomDepth,
-          activation.freedomRouteTracker,
-        ),
+        execute: async (signal, index) => {
+          const childPath = `${this.childActivationPath(activation, location, blockVisit, "dispatch")}:${index}`;
+          const invoke = () => this.invokeFlow(
+            frame.module,
+            call.target,
+            call.args,
+            context,
+            signal,
+            childPath,
+            activation.forbiddenWriterWorkspace,
+            activation.freedomDepth,
+            activation.freedomRouteTracker,
+          );
+          return invoke();
+        },
       })),
       context,
       location,
@@ -2038,6 +2985,27 @@ export class AflVm {
         result: 0,
       },
     };
+    const plannerOperationBase = this.agentRecoveryOperation(
+      planner,
+      "user",
+      prompt,
+      undefined,
+      context,
+      activation,
+      blockVisit,
+      location,
+      instruction.op,
+    );
+    const plannerOperation: AgentRecoveryOperation = {
+      ...plannerOperationBase,
+      inputDigest: recoveryValueDigest({
+        agent_input: plannerOperationBase.inputDigest,
+        constraint,
+        nodes: [...nodes.keys()],
+        agents: agents.map((agent) => agent.name),
+        refs: [...refs].map(([ref, value]) => ({ ref, value: clonePortable(value) })),
+      }),
+    };
     try {
       await this.trace(context, "freedom.started", location, {
         mode,
@@ -2051,6 +3019,7 @@ export class AflVm {
         context,
         location,
         linked.controller.signal,
+        plannerOperation,
         this.createFreedomRuntime(scope),
       );
       if (scope.counts.route < scope.limits.minRoutes) {
@@ -2117,13 +3086,111 @@ export class AflVm {
     );
   }
 
-  private createFreedomRuntime(scope: FreedomScope): FreedomRuntime {
+  private createFreedomRuntime(
+    scope: FreedomScope,
+  ): FreedomRuntime {
     return {
       activation: {
         tools: freedomControlTools(freedomInstructionMode(scope.instruction)),
       },
       execute: (request) => this.executeFreedomTool(scope, request),
+      snapshot: () => this.freedomSnapshot(scope),
+      restore: (value) => this.restoreFreedomSnapshot(scope, value),
     };
+  }
+
+  private freedomSnapshot(scope: FreedomScope): ComputeValue {
+    return {
+      version: 0,
+      mode: freedomInstructionMode(scope.instruction),
+      next_route_order: scope.nextRouteOrder,
+      counts: {
+        control: scope.counts.control,
+        route: scope.counts.route,
+        completed_node: scope.counts.completedNode,
+        completed_ir: scope.counts.completedIr,
+        validation: scope.counts.validation,
+        execution: scope.counts.execution,
+        result: scope.counts.result,
+      },
+      routes: scope.routes.map((route) => ({
+        order: route.order,
+        request_id: route.requestId,
+        node: route.target.name,
+        args: route.args.map((argument) => clonePortable(argument) as unknown as ComputeValue),
+      })),
+      refs: [...scope.refs].map(([ref, value]) => ({
+        ref,
+        value: clonePortable(value) as unknown as ComputeValue,
+      })),
+    };
+  }
+
+  private restoreFreedomSnapshot(scope: FreedomScope, value: ComputeValue): void {
+    if (!isComputeRecord(value) || value.version !== 0 ||
+        value.mode !== freedomInstructionMode(scope.instruction) ||
+        !Number.isInteger(value.next_route_order) || (value.next_route_order as number) < 0 ||
+        !isComputeRecord(value.counts) || !Array.isArray(value.routes) || !Array.isArray(value.refs)) {
+      throw new AflVmError("RECOVERY_STATE_INVALID", "Freedom recovery progress is invalid");
+    }
+    const count = (name: string): number => {
+      const current = (value.counts as Record<string, ComputeValue>)[name];
+      if (!Number.isInteger(current) || (current as number) < 0) {
+        throw new AflVmError("RECOVERY_STATE_INVALID", `Freedom recovery count '${name}' is invalid`);
+      }
+      return current as number;
+    };
+    const control = count("control");
+    const route = count("route");
+    const completedNode = count("completed_node");
+    const completedIr = count("completed_ir");
+    const validation = count("validation");
+    const execution = count("execution");
+    const result = count("result");
+    if (control > scope.limits.maxControlCalls || route > scope.limits.maxRoutes ||
+        validation > scope.limits.maxIrValidations || execution > scope.limits.maxIrExecutions) {
+      throw new AflVmError("RECOVERY_STATE_INVALID", "Freedom recovery progress exceeds its durable limits");
+    }
+
+    const routes: QueuedFreedomRoute[] = value.routes.map((item) => {
+      if (!isComputeRecord(item) || !Number.isInteger(item.order) || (item.order as number) < 0 ||
+          typeof item.request_id !== "string" || typeof item.node !== "string" || !Array.isArray(item.args)) {
+        throw new AflVmError("RECOVERY_STATE_INVALID", "Freedom recovery route is invalid");
+      }
+      const node = scope.nodes.get(item.node);
+      if (node === undefined || item.args.length !== node.parameters.length) {
+        throw new AflVmError("RECOVERY_STATE_INVALID", `Freedom recovery route '${item.node}' is unavailable`);
+      }
+      return {
+        order: item.order as number,
+        requestId: item.request_id,
+        target: { kind: "local", name: item.node, span: node.span },
+        args: item.args.map((argument) => cloneRecoveryValue(argument)),
+      };
+    });
+    const refs = new Map<string, VmArgument>();
+    for (const item of value.refs) {
+      if (!isComputeRecord(item) || typeof item.ref !== "string" || refs.has(item.ref)) {
+        throw new AflVmError("RECOVERY_STATE_INVALID", "Freedom recovery reference is invalid");
+      }
+      refs.set(item.ref, cloneRecoveryValue(item.value));
+    }
+    const nextRouteOrder = value.next_route_order as number;
+    if (routes.some((item) => item.order >= nextRouteOrder) || routes.length > route || result > refs.size) {
+      throw new AflVmError("RECOVERY_STATE_INVALID", "Freedom recovery progress is inconsistent");
+    }
+
+    scope.routes.splice(0, scope.routes.length, ...routes);
+    scope.refs.clear();
+    for (const [ref, refValue] of refs) scope.refs.set(ref, refValue);
+    scope.nextRouteOrder = nextRouteOrder;
+    scope.counts.control = control;
+    scope.counts.route = route;
+    scope.counts.completedNode = completedNode;
+    scope.counts.completedIr = completedIr;
+    scope.counts.validation = validation;
+    scope.counts.execution = execution;
+    scope.counts.result = result;
   }
 
   private reserveFreedomRoutes(scope: FreedomScope, count: number): void {
@@ -2347,7 +3414,7 @@ export class AflVm {
       args,
       scope.context,
       scope.signal,
-      `${scope.origin.activationPath}/freedom-node:${encodeURIComponent(request.id)}`,
+      `${scope.origin.activationPath}/freedom-node:${scope.counts.control}`,
       scope.planner.workspace,
       scope.freedomDepth,
     );
@@ -2424,7 +3491,7 @@ export class AflVm {
       args,
       scope.context,
       scope.signal,
-      `${scope.origin.activationPath}/freedom-ir:${encodeURIComponent(request.id)}`,
+      `${scope.origin.activationPath}/freedom-ir:${scope.counts.control}`,
       scope.planner.workspace,
       scope.freedomDepth,
       {
@@ -3080,6 +4147,67 @@ function controlResult(payload: ComputeValue): AgentControlToolResult {
   };
 }
 
+function decodeControlRecoveryResult(value: VmArgument | undefined, operationId: string): AgentControlToolResult {
+  if (!isComputeValue(value) || !isComputeRecord(value) || typeof value.content !== "string" ||
+      !(value.details === undefined || isComputeValue(value.details))) {
+    throw new AflVmError(
+      "RECOVERY_STATE_INVALID",
+      `Control operation '${operationId}' has an invalid durable result`,
+    );
+  }
+  return {
+    content: value.content,
+    ...(value.details === undefined ? {} : { details: structuredClone(value.details) }),
+  };
+}
+
+function agentControlDeliveryCount(value: ComputeValue | undefined): number {
+  if (value === undefined) return 0;
+  if (!isComputeRecord(value) || value.version !== 0 ||
+      !Number.isInteger(value.delivered_control_count) ||
+      (value.delivered_control_count as number) < 0) {
+    throw new AflVmError("RECOVERY_STATE_INVALID", "Agent control delivery progress is invalid");
+  }
+  return value.delivered_control_count as number;
+}
+
+function agentControlCompletionIndex(value: ComputeValue | undefined, operationId: string): number {
+  if (!isComputeRecord(value) || value.parent_operation === undefined || value.control === undefined ||
+      !Number.isInteger(value.control_index) || (value.control_index as number) <= 0) {
+    throw new AflVmError(
+      "RECOVERY_STATE_INVALID",
+      `Agent control operation '${operationId}' has invalid completion details`,
+    );
+  }
+  return value.control_index as number;
+}
+
+function agentControlDescriptorIndex(operation: RecoveryOperationDescriptor): number {
+  const details = operation.details;
+  if (!isComputeRecord(details) || !Number.isInteger(details.control_index) ||
+      (details.control_index as number) <= 0) {
+    throw new AflVmError(
+      "RECOVERY_STATE_INVALID",
+      `Agent control operation '${operation.id}' has no valid control index`,
+    );
+  }
+  return details.control_index as number;
+}
+
+function freedomControlSnapshotIndex(value: ComputeValue): number {
+  const count = freedomControlSnapshotCount(value);
+  if (count <= 0) throw new AflVmError("RECOVERY_STATE_INVALID", "Freedom control snapshot has no valid call index");
+  return count;
+}
+
+function freedomControlSnapshotCount(value: ComputeValue): number {
+  if (!isComputeRecord(value) || !isComputeRecord(value.counts) ||
+      !Number.isInteger(value.counts.control) || (value.counts.control as number) < 0) {
+    throw new AflVmError("RECOVERY_STATE_INVALID", "Freedom control snapshot has no valid call count");
+  }
+  return value.counts.control as number;
+}
+
 function assertObjectInput(
   input: Readonly<Record<string, unknown>>,
   allowedFields: readonly string[],
@@ -3267,6 +4395,41 @@ const INTERRUPTING_AGENT_ERROR_CODES = new Set([
   "AGENT_EXECUTION_FAILED",
 ]);
 
+const RECOVERABLE_RUN_ERROR_CODES = new Set([
+  "ADAPTER_ERROR",
+  "UNKNOWN_ERROR",
+  "AGENT_EXECUTOR_UNAVAILABLE",
+  "AGENT_SANDBOX_INIT_FAILED",
+  "AGENT_SANDBOX_TERMINATED",
+  "AGENT_EXECUTION_FAILED",
+  "MEMORY_STATE_LOAD_FAILED",
+  "MEMORY_STATE_SAVE_FAILED",
+  "RECOVERY_STATE_LOAD_FAILED",
+  "RECOVERY_STATE_SAVE_FAILED",
+]);
+
+function isRecoverableRunError(error: AflVmError, signal: AbortSignal): boolean {
+  return signal.aborted || RECOVERABLE_RUN_ERROR_CODES.has(error.code);
+}
+
+function cancelledRunError(signal: AbortSignal, cause: unknown): AflVmError {
+  const reason = signal.reason;
+  if (reason instanceof AflVmError && reason.code === "AGENT_CANCELLED") return reason;
+  return new AflVmError("AGENT_CANCELLED", "AFL run was cancelled", {
+    cause: reason ?? cause,
+  });
+}
+
+function executorRecoveryFingerprint(executor: AgentExecutorBackend): string {
+  return recoveryValueDigest({
+    version: 0,
+    name: executor.name,
+    session_format: executor.sessionFormat ?? "",
+    recovery_identity: executor.recoveryIdentity ?? "",
+    capabilities: { ...executor.capabilities },
+  });
+}
+
 function agentAttemptStatus(
   error: unknown,
   vmError: AflVmError,
@@ -3368,6 +4531,44 @@ function withInterruptionShutdownError(error: AflVmError, shutdownError: unknown
   });
 }
 
+function withRecoveryPersistenceError(error: AflVmError, persistenceError: unknown): AflVmError {
+  const normalized = normalizeVmError(persistenceError);
+  return new AflVmError(error.code, error.message, {
+    ...(error.span === undefined ? {} : { span: error.span }),
+    details: mergeErrorDetails(error.details, {
+      recoveryPersistenceError: {
+        code: normalized.code,
+        message: normalized.message,
+      },
+    }),
+    cause: error,
+  });
+}
+
+function serializeRecoveryError(error: AflVmError): { readonly code: string; readonly message: string } {
+  return { code: error.code, message: error.message };
+}
+
+function toRecoveryOutput(value: VmValue): VmArgument {
+  if (isFrag(value) || isComputeValue(value) || isSymbolRef(value)) return cloneRecoveryValue(value);
+  throw new AflVmError(
+    "RECOVERY_VALUE_UNSUPPORTED",
+    "A top-level recoverable run must return Frag, compute data, or a Symbol",
+  );
+}
+
+function operationMemoryRevisionBefore(operation: RecoveryOperationDescriptor): number {
+  const details = operation.details;
+  if (!isComputeRecord(details) || !Number.isInteger(details.memory_revision_before) ||
+      (details.memory_revision_before as number) < 0) {
+    throw new AflVmError(
+      "RECOVERY_STATE_INVALID",
+      `Agent operation '${operation.id}' has no valid Memory revision`,
+    );
+  }
+  return details.memory_revision_before as number;
+}
+
 function mergeErrorDetails(
   details: ComputeValue | undefined,
   additions: { readonly [key: string]: ComputeValue },
@@ -3375,6 +4576,73 @@ function mergeErrorDetails(
   if (details === undefined) return additions;
   if (isComputeRecord(details)) return { ...details, ...additions };
   return { originalDetails: details, ...additions };
+}
+
+function waitForSignal(promise: Promise<void>, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(signal.reason ?? new AflVmError("AGENT_CANCELLED", "Agent execution was cancelled"));
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = (): void => {
+      cleanup();
+      reject(signal.reason ?? new AflVmError("AGENT_CANCELLED", "Agent execution was cancelled"));
+    };
+    const cleanup = (): void => signal.removeEventListener("abort", onAbort);
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      () => {
+        cleanup();
+        resolve();
+      },
+      (error) => {
+        cleanup();
+        reject(error);
+      },
+    );
+  });
+}
+
+function encodeTransactionRecoveryResult(result: AgentTransactionResult): ComputeValue {
+  return result.status === "completed"
+    ? { status: "completed" }
+    : result.status === "denied"
+    ? { status: "denied", message: result.message }
+    : { status: "unavailable", code: result.code, message: result.message };
+}
+
+function decodeTransactionRecoveryResult(value: VmArgument | undefined, operationId: string): AgentTransactionResult {
+  const record = isComputeValue(value) ? value : undefined;
+  if (!isComputeRecord(record) ||
+      (record.status !== "completed" && record.status !== "denied" && record.status !== "unavailable")) {
+    throw new AflVmError(
+      "RECOVERY_STATE_INVALID",
+      `Completed Agent transaction '${operationId}' has an invalid result`,
+    );
+  }
+  if (record.status === "completed") return { status: "completed" };
+  if (typeof record.message !== "string") {
+    throw new AflVmError(
+      "RECOVERY_STATE_INVALID",
+      `Completed Agent transaction '${operationId}' has no message`,
+    );
+  }
+  if (record.status === "denied") return { status: "denied", message: record.message };
+  if (typeof record.code !== "string") {
+    throw new AflVmError(
+      "RECOVERY_STATE_INVALID",
+      `Completed Agent transaction '${operationId}' has no error code`,
+    );
+  }
+  return { status: "unavailable", code: record.code, message: record.message };
+}
+
+function decodeInputRecoveryResult(value: VmArgument | undefined, operationId: string): string {
+  const record = isComputeValue(value) ? value : undefined;
+  if (!isComputeRecord(record) || typeof record.value !== "string") {
+    throw new AflVmError(
+      "RECOVERY_STATE_INVALID",
+      `Completed Agent input '${operationId}' has an invalid result`,
+    );
+  }
+  return record.value;
 }
 
 function isComputeRecord(value: ComputeValue | undefined): value is { readonly [key: string]: ComputeValue } {

@@ -13,6 +13,7 @@ import type { AgentApprovalQueue } from "./approval-queue.js";
 import type { AgentPreToolPolicyConfig } from "./agent-tool-policy.js";
 import type { FreedomPolicyLimits } from "./freedom.js";
 import type { AgentMemoryContract, MemoryPersistenceBinding, Message } from "./memory.js";
+import type { RecoveryPersistenceBinding } from "./recovery.js";
 import type { AgentWorkspaceSet } from "./workspace.js";
 
 export interface AgentRunRequest {
@@ -201,6 +202,7 @@ export interface TraceSink {
 export type VmArgument = Frag | ComputeValue | SymbolRef;
 
 export interface VmBindings {
+  readonly recoveryIdentity?: string;
   readonly agents?: AgentAdapter;
   readonly agentExecutor?: AgentExecutorBackend;
   readonly agentHost?: AgentInteractionHost;
@@ -218,4 +220,5 @@ export interface VmBindings {
   readonly policy?: VmPolicy;
   readonly trace?: TraceSink;
   readonly memoryPersistence?: MemoryPersistenceBinding;
+  readonly recoveryPersistence?: RecoveryPersistenceBinding;
 }
