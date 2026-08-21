@@ -119,10 +119,12 @@ node_name(arg_a, arg_b):
 
 ### `prompt`
 
-形式：`request = prompt "Review this change", diff, criteria`；`request = prompt @prompt.review, diff, criteria`。
+形式：`request = prompt "Review this change", diff, criteria`；`request = prompt "Review this change", [planner_handoff: plan, reviewer_handoff: review], criteria`；`request = prompt @prompt.review, diff, criteria`。
 
-- 让字符串、Frag 或 compute source 成为基础文本；把后续参数格式化后以两个换行分隔。
-- 让 symbol source 调用 `prompts.render`，并把后续 Frag、compute 或 symbol 作为参数原样交给 binding。
+- 让字符串、Frag 或 compute source 成为基础文本；普通参数格式化后以两个换行分隔。
+- 字典参数表示带层次的上下文 section：字段渲染为 `* field:`；除嵌套字典继续展开为子 section 外，字段 value 的每一行都放入缩进后的 `> ` 引用块，使 value 可以安全包含标题、列表、引用、代码块或看似 section 的文本。普通参数和字典参数可以混用，只有字典字段产生标签。
+- 纯 compute list 仍渲染为 JSON；包含 Frag 或嵌套 section 的 list 使用 `> -` 项目格式。
+- 让 symbol source 调用 `prompts.render`；字典参数先按同一规则渲染为 Frag，再交给 binding。
 - 不传 Agent、Memory 或 TaskGroup handle。
 - 返回 Frag。
 

@@ -142,7 +142,7 @@ reviewer = agent @agent.reviewer, [memory: review_memory]
 
 ### 7.3 `prompt`
 
-Prompt source 是 symbol 时，VM 调用 Prompt binding 的 `render`。Source 是 literal、Frag 或 compute value 时，VM 将 source 与格式化后的参数用两个换行符连接。两种形式都返回 Frag。
+Prompt source 是 symbol 时，VM 调用 Prompt binding 的 `render`。Source 是 literal、Frag 或 compute value 时，VM 将 source 与格式化后的参数用两个换行符连接。字典参数会渲染为带 `* field:` 标签的 Markdown section；除嵌套字典继续展开为子 section 外，每个 value 都整体放入缩进后的 `> ` 引用块，因此 value 可以包含任意普通 Markdown 而不会污染外层结构。普通参数和字典参数可以混用。两种形式都返回 Frag。
 
 `prompt` 返回的 Frag 没有 role。它被传给 `agent.do` 或 `memory.append` 时才形成带 role 的 Message。
 

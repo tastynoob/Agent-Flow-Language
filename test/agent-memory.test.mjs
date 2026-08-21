@@ -101,6 +101,85 @@ main():
   assert.deepEqual(last.messages.map((message) => message.content).slice(-3), ["one", "one", "two"]);
 });
 
+test("labeled Prompt sections preserve Agent handoff boundaries in Memory", async () => {
+  const agents = new MockAgentAdapter();
+  const seen = [];
+  agents.on("@agent.planner", () => [
+    "plan line 1",
+    "* fake_section:",
+    "> original quote",
+    "## content heading",
+    "",
+    "```text",
+    "free-form value",
+    "```",
+  ].join("\n"));
+  agents.on("@agent.reviewer", (request) => {
+    seen.push(request.messages.at(-1).content);
+    return "reviewed";
+  });
+  const vm = AflVm.fromSource(`
+main():
+    entry:
+        planner = agent @agent.planner
+        reviewer = agent @agent.reviewer
+        plan = planner.do "Prepare a plan"
+        review_prompt = prompt "Review the plan",
+            [
+                planner_handoff: plan,
+                constraints: [
+                    must_preserve: "the public API",
+                    evidence: [plan, "manual note"]
+                ]
+            ],
+            "Return findings"
+        result = reviewer.do review_prompt
+        ret result
+`, { agents });
+
+  await vm.run();
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0], [
+    "Review the plan",
+    "",
+    "* planner_handoff:",
+    "  > plan line 1",
+    "  > * fake_section:",
+    "  > > original quote",
+    "  > ## content heading",
+    "  > ",
+    "  > ```text",
+    "  > free-form value",
+    "  > ```",
+    "",
+    "* constraints:",
+    "  * must_preserve:",
+    "    > the public API",
+    "",
+    "  * evidence:",
+    "    > - plan line 1",
+    "    >   * fake_section:",
+    "    >   > original quote",
+    "    >   ## content heading",
+    "    >   ",
+    "    >   ```text",
+    "    >   free-form value",
+    "    >   ```",
+    "    > - manual note",
+    "",
+    "Return findings",
+  ].join("\n"));
+  assert.equal(seen[0].includes("\n* constraints:\n"), true);
+  assert.equal(seen[0].includes("\n  * must_preserve:\n"), true);
+  assert.equal(seen[0].includes([
+    "* planner_handoff:",
+    "  > plan line 1",
+    "  > * fake_section:",
+    "  > > original quote",
+    "  > ## content heading",
+  ].join("\n")), true);
+});
+
 test("fork snapshots source Memory and isolates branches in one inherited Workspace", async () => {
   const calls = [];
   let branchActive = 0;

@@ -767,11 +767,12 @@ export class PiAgentExecutorBackend implements AgentExecutorBackend {
     let activeNames = [...baselineActiveNames];
     if (request.control !== undefined) {
       activeNames = [
+        ...baselineActiveNames,
         PI_TRANSACTION_TOOL_NAME,
         ...(request.format === undefined ? [] : [PI_FORMAT_OUTPUT_TOOL_NAME]),
         ...(record.executionContext.elevation === undefined ? [] : [PI_ELEVATION_TOOL_NAME]),
         ...controlTools.map((tool) => tool.name),
-      ];
+      ].filter((name, index, names) => names.indexOf(name) === index);
     } else if (request.tools !== undefined) {
       const availableNames = new Set(baselineTools.map((tool) => tool.name));
       const requestedNames = request.tools.map((tool) => piStandardToolName(tool.name));

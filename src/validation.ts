@@ -399,6 +399,12 @@ function validateInstructionKinds(
       expectNameKind(module, instruction.agent, kinds, ["agent", "unknown"], "Agent work receiver", diagnostics);
       if (instruction.format !== undefined) validateAgentOutputFormat(module, instruction.format, instruction.span, diagnostics);
       break;
+    case "prompt":
+      validatePromptExpression(module, instruction.source, kinds, "prompt source", diagnostics);
+      instruction.args.forEach((argument, index) => {
+        validatePromptExpression(module, argument, kinds, `prompt argument ${index + 1}`, diagnostics);
+      });
+      break;
     case "repeat":
       expectKind(module, instruction.count, kinds, ["compute", "unknown"], "repeat count", diagnostics);
       break;
@@ -452,6 +458,36 @@ function validateInstructionKinds(
     default:
       break;
   }
+}
+
+function validatePromptExpression(
+  module: AflModule,
+  expression: ValueExpr,
+  kinds: ReadonlyMap<string, ValueKind>,
+  label: string,
+  diagnostics: AflDiagnostic[],
+): void {
+  if (expression.kind === "list") {
+    expression.items.forEach((item) => validatePromptExpression(module, item, kinds, label, diagnostics));
+    return;
+  }
+  if (expression.kind === "record") {
+    Object.entries(expression.entries).forEach(([section, item]) => {
+      if (section.length === 0 || section !== section.trim() || /[\r\n]/u.test(section)) {
+        add(
+          diagnostics,
+          module,
+          item.span,
+          "PROMPT_SECTION_LABEL_INVALID",
+          "Prompt section labels must be non-empty single-line text without surrounding whitespace",
+        );
+      }
+      validatePromptExpression(module, item, kinds, label, diagnostics);
+    });
+    return;
+  }
+  if (expression.kind === "symbol") return;
+  expectKind(module, expression, kinds, ["frag", "compute", "unknown"], label, diagnostics);
 }
 
 function validateAgentOutputFormat(

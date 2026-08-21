@@ -300,9 +300,36 @@ Agent 输出在其自身 memory 中使用 `assistant` role，但指令返回的 
 ```text
 task_prompt = prompt "Implement the task", task
 fix_prompt = prompt @prompt.fix_bugs, review_result, artifact
+review_prompt = prompt "Review the plan",
+    [
+        planner_handoff: plan,
+        reviewer_handoff: review,
+        shared: [requirements: requirements]
+    ],
+    constraints
 ```
 
-第一个 operand 是文本或 prompt symbol，其余 operand 由对应 formatter 转换为字符串。返回的 Frag 不带 role。
+第一个 operand 是文本、Frag、compute value 或 prompt symbol，其余 operand 由对应 formatter 转换为字符串。普通 operand 以两个换行分隔。字典 operand 表示分层上下文：字段渲染为 `* field:`；除嵌套字典继续展开为子字段外，字段 value 的每一行都放入缩进后的 `> ` 引用块，因此 value 可以包含标题、列表、引用、代码块或看似字段的文本而不污染外层结构。普通 operand 和字典 operand 可以混用；只有字典字段产生标签。返回的 Frag 不带 role。
+
+例如上面的 `review_prompt` 会产生类似以下内容：
+
+```text
+Review the plan
+
+* planner_handoff:
+  > ...
+
+* reviewer_handoff:
+  > ...
+
+* shared:
+  * requirements:
+    > ...
+
+constraints
+```
+
+section 标签是 VM 的 Markdown 渲染约定，不是新的 AFL 指令。字段内容仍是普通业务文本，用户需要在 Prompt 中说明哪些 handoff 是参考资料、哪些要求需要执行。纯 compute list 保持 JSON 文本；包含 Frag 或嵌套 section 的 list 采用 `> -` 项目格式。
 
 `input` 把 prompt Frag 交给 Input binding，等待其返回字符串，并将结果包装为 role-free Frag：
 

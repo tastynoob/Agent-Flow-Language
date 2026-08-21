@@ -144,6 +144,17 @@ interface MutableFrame {
   readonly taskGroups: Set<TaskGroupHandle>;
 }
 
+type PromptContent =
+  | { readonly kind: "value"; readonly value: PromptArgument }
+  | { readonly kind: "list"; readonly items: readonly PromptContent[] }
+  | {
+      readonly kind: "record";
+      readonly entries: readonly {
+        readonly label: string;
+        readonly value: PromptContent;
+      }[];
+    };
+
 interface VmRunContext {
   readonly runId: string;
   readonly signal: AbortSignal;
@@ -777,7 +788,7 @@ export class AflVm {
           return this.renderPrompt(instruction.source, instruction.args, frame, signal);
         }
         const promptArgs = instruction.args.map((argument) =>
-          this.toPromptArgument(evaluateValue(argument, frame), argument.span));
+          this.toPromptBindingArgument(argument, frame));
         return this.runPortableRecoveryOperation(
           context,
           activation,
@@ -2652,14 +2663,16 @@ export class AflVm {
     frame: MutableFrame,
     signal: AbortSignal,
   ): Promise<Frag> {
-    const sourceValue = evaluateValue(source, frame);
-    const values = args.map((argument) => this.toPromptArgument(evaluateValue(argument, frame), argument.span));
+    const sourceValue = source.kind === "record" || source.kind === "list"
+      ? undefined
+      : evaluateValue(source, frame);
     if (isSymbolRef(sourceValue)) {
       if (this.bindings.prompts === undefined) {
         throw new AflVmError("PROMPT_ADAPTER_MISSING", `prompt '${sourceValue.name}' requires a Prompt binding`, {
           span: source.span,
         });
       }
+      const values = args.map((argument) => this.toPromptBindingArgument(argument, frame));
       throwIfAborted(signal);
       const rendered = await this.bindings.prompts.render({ prompt: sourceValue, args: values, signal });
       if (typeof rendered !== "string") {
@@ -2669,17 +2682,41 @@ export class AflVm {
       }
       return frag(rendered);
     }
-    const base = isFrag(sourceValue)
-      ? sourceValue.content
-      : isComputeValue(sourceValue)
-        ? formatCompute(sourceValue)
-        : undefined;
-    if (base === undefined) {
-      throw new AflVmError("PROMPT_SOURCE_INVALID", "prompt source cannot be a VM handle", {
-        span: source.span,
-      });
+    const parts = [source, ...args].map((expression) =>
+      this.evaluatePromptContent(expression, frame));
+    return frag(parts.map((part) => formatPromptContent(part)).join("\n\n"));
+  }
+
+  private evaluatePromptContent(expression: ValueExpr, frame: MutableFrame): PromptContent {
+    if (expression.kind === "record") {
+      return {
+        kind: "record",
+        entries: Object.entries(expression.entries).map(([label, value]) => ({
+          label,
+          value: this.evaluatePromptContent(value, frame),
+        })),
+      };
     }
-    return frag([base, ...values.map(formatPromptArgument)].join("\n\n"));
+    if (expression.kind === "list") {
+      return {
+        kind: "list",
+        items: expression.items.map((item) => this.evaluatePromptContent(item, frame)),
+      };
+    }
+    return {
+      kind: "value",
+      value: this.toPromptArgument(evaluateValue(expression, frame), expression.span),
+    };
+  }
+
+  private toPromptBindingArgument(expression: ValueExpr, frame: MutableFrame): PromptArgument {
+    const content = this.evaluatePromptContent(expression, frame);
+    if (content.kind === "value") return content.value;
+    if (content.kind === "list") {
+      const compute = promptListComputeValue(content);
+      if (compute !== undefined) return compute;
+    }
+    return frag(formatPromptContent(content));
   }
 
   private async invokeFlow(
@@ -4018,6 +4055,71 @@ function formatPromptArgument(value: PromptArgument): string {
   if (isFrag(value)) return value.content;
   if (isSymbolRef(value)) return value.name;
   return formatCompute(value);
+}
+
+function formatPromptContent(content: PromptContent, depth = 0): string {
+  if (content.kind === "value") return formatPromptArgument(content.value);
+  if (content.kind === "list") {
+    const compute = promptListComputeValue(content);
+    if (compute !== undefined) return formatCompute(compute);
+    return formatPromptList(content, depth);
+  }
+  return content.entries.map(({ label, value }) =>
+    `${"  ".repeat(depth)}* ${label}:\n${formatPromptSection(value, depth)}`
+  ).join("\n\n");
+}
+
+function formatPromptList(content: Extract<PromptContent, { readonly kind: "list" }>, depth: number): string {
+  return content.items.map((item) => {
+    const indentation = "  ".repeat(depth);
+    if (item.kind === "value") {
+      return prefixPromptContinuation(formatPromptArgument(item.value), `${indentation}- `, `${indentation}  `);
+    }
+    if (item.kind === "list") {
+      const compute = promptListComputeValue(item);
+      if (compute !== undefined) return `${indentation}- ${formatCompute(compute)}`;
+      return `${indentation}-\n${formatPromptList(item, depth + 1)}`;
+    }
+    return `${indentation}-\n${formatPromptContent(item, depth + 1)}`;
+  }).join("\n");
+}
+
+function formatPromptSection(content: PromptContent, depth: number): string {
+  if (content.kind === "value") return quotePromptText(formatPromptArgument(content.value), depth);
+  if (content.kind === "list") {
+    const compute = promptListComputeValue(content);
+    if (compute !== undefined) return quotePromptText(formatCompute(compute), depth);
+    return quotePromptText(formatPromptList(content, 0), depth);
+  }
+  return formatPromptContent(content, depth + 1);
+}
+
+function quotePromptText(text: string, depth: number): string {
+  const prefix = `${"  ".repeat(depth + 1)}> `;
+  return text.split("\n").map((line) => `${prefix}${line}`).join("\n");
+}
+
+function prefixPromptContinuation(text: string, first: string, rest: string): string {
+  return text.split("\n").map((line, index) => `${index === 0 ? first : rest}${line}`).join("\n");
+}
+
+function promptListComputeValue(content: Extract<PromptContent, { readonly kind: "list" }>): ComputeValue[] | undefined {
+  const result: ComputeValue[] = [];
+  for (const item of content.items) {
+    if (item.kind === "value") {
+      if (!isComputeValue(item.value)) return undefined;
+      result.push(item.value);
+      continue;
+    }
+    if (item.kind === "list") {
+      const nested = promptListComputeValue(item);
+      if (nested === undefined) return undefined;
+      result.push(nested);
+      continue;
+    }
+    return undefined;
+  }
+  return result;
 }
 
 function clonePortable<T extends VmArgument>(value: T): T {

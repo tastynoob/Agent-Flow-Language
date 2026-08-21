@@ -254,15 +254,16 @@ test("Pi scopes AFL control tools to one Freedom activation and restores binding
     (context) => {
       contexts.push({ tools: context.tools.map((tool) => tool.name), messages: context.messages.length });
       assert.deepEqual(context.tools.map((tool) => tool.name), [
+        "lookup",
         "afl_transaction_request",
         "afl_environment_get",
         "afl_route_add",
       ]);
-      assert.match(context.tools[1].description, /Canonical AFL name: afl\.environment\.get/u);
-      assert.match(context.tools[1].description, /every active AFL tool includes its own usage instructions/u);
-      assert.match(context.tools[2].description, /args are positional/u);
-      assert.match(context.tools[2].description, /not a business object/u);
-      assert.match(context.tools[2].description, /never the child result/u);
+      assert.match(context.tools[2].description, /Canonical AFL name: afl\.environment\.get/u);
+      assert.match(context.tools[2].description, /every active AFL tool includes its own usage instructions/u);
+      assert.match(context.tools[3].description, /args are positional/u);
+      assert.match(context.tools[3].description, /not a business object/u);
+      assert.match(context.tools[3].description, /never the child result/u);
       assert.doesNotMatch(context.systemPrompt ?? "", /AFL Freedom Route activation/u);
       assert.equal(messageTexts(context.messages).includes("seed"), true);
       assert.equal(messageTexts(context.messages).includes("seed-complete"), true);
@@ -275,11 +276,12 @@ test("Pi scopes AFL control tools to one Freedom activation and restores binding
       contexts.push({ tools: context.tools.map((tool) => tool.name), messages: context.messages.length });
       assert.equal(context.messages.some((message) => message.role === "toolResult"), true);
       assert.deepEqual(context.tools.map((tool) => tool.name), [
+        "lookup",
         "afl_transaction_request",
         "afl_environment_get",
         "afl_route_add",
       ]);
-      assert.match(context.tools[2].description, /Canonical AFL name: afl\.route\.add/u);
+      assert.match(context.tools[3].description, /Canonical AFL name: afl\.route\.add/u);
       assert.doesNotMatch(context.systemPrompt ?? "", /AFL Freedom Route activation/u);
       assert.equal(messageTexts(context.messages).includes("seed-complete"), true);
       return fauxAssistantMessage("route-complete");

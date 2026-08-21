@@ -103,6 +103,76 @@ main():
   assert.equal(module.nodes[0].blocks[0].instructions[2].expression.kind, "binary");
 });
 
+test("prompt records render labeled Markdown sections without confusing content Markdown", async () => {
+  const vm = AflVm.fromSource(`
+main():
+    entry:
+        result = prompt "user prompt",
+            [
+                "A handoff": "first line / second line",
+                nested: [
+                    "B handoff": "quoted line",
+                    deeper: [
+                        "C handoff": "deep result"
+                    ],
+                    records: [
+                        [name: "first", value: "one"],
+                        [name: "second", value: "two"]
+                    ]
+                ]
+            ],
+            [1, 2]
+        ret result
+`, {});
+
+  const result = await vm.run();
+  assert.equal(result.output.content, [
+    "user prompt",
+    "",
+    "* A handoff:",
+    "  > first line / second line",
+    "",
+    "* nested:",
+    "  * B handoff:",
+    "    > quoted line",
+    "",
+    "  * deeper:",
+    "    * C handoff:",
+    "      > deep result",
+    "",
+    "  * records:",
+    "    > -",
+    "    >   * name:",
+    "    >     > first",
+    "    > ",
+    "    >   * value:",
+    "    >     > one",
+    "    > -",
+    "    >   * name:",
+    "    >     > second",
+    "    > ",
+    "    >   * value:",
+    "    >     > two",
+    "",
+    "[1,2]",
+  ].join("\n"));
+  assert.match(result.output.content, /\* A handoff:\n  > first line \/ second line/u);
+  assert.doesNotMatch(result.output.content, /\* first line \/ second line/u);
+  assert.match(result.output.content, /\* nested:\n  \* B handoff:\n    > quoted line/u);
+
+  const invalidLabel = validateModule(parseAfl(`
+main():
+    entry:
+        result = prompt ["bad\\nlabel": "content"]
+        ret result
+`));
+  assert.equal(invalidLabel.ok, false);
+  assert.equal(
+    invalidLabel.diagnostics.some((item) => item.code === "PROMPT_SECTION_LABEL_INVALID"),
+    true,
+  );
+});
+
 test("tabs are rejected even inside triple-quoted strings", () => {
   assert.throws(() => parseAfl(`
 main():
